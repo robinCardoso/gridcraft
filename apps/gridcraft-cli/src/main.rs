@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage:
   gridcraft-cli info <file> [--json]                      sheets, used ranges, tables, charts, names
-  gridcraft-cli convert <in> <out> [--sheet NAME]         xlsx/csv/tsv/json/html by extension
+  gridcraft-cli convert <in> <out> [--sheet NAME]         xlsx/csv/tsv/json/html/db by extension
   gridcraft-cli eval <formula> [--in FILE] [--sheet S] [--cell A1] [--json]
   gridcraft-cli cat <file> [--range A1:D20] [--sheet S] [--formulas] [--csv]
   gridcraft-cli check <file-or-dir>... [--json] [--tolerance 1e-9] [--max-report N]
@@ -271,8 +271,32 @@ fn convert(args: &[String]) -> Result<(), String> {
     let input = a.pos(0, "<in>")?;
     let out = a.pos(1, "<out>")?;
     a.no_extra(2)?;
-    if gridcraft_engine::io::FileKind::from_path(out).is_none() {
-        return Err(format!("{out}: unknown output format (use .xlsx, .csv, .tsv, .json or .html)"));
+    let out_is_db = gridcraft_engine::dbfile::is_db_path(out);
+    if gridcraft_engine::io::FileKind::from_path(out).is_none() && !out_is_db {
+        return Err(format!("{out}: unknown output format (use .xlsx, .csv, .tsv, .json, .html or .db)"));
+    }
+    if out_is_db {
+        let in_ext = std::path::Path::new(input).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+        if matches!(in_ext.as_deref(), Some("xlsx" | "xlsm" | "xltx" | "xltm")) {
+            let mut s = Session::new();
+            let v = exec(&mut s, "file.importXlsxToDb", json!({"path": input, "out": out, "open": false}))?;
+            if let Some(tables) = v.get("tables").and_then(Value::as_array) {
+                for t in tables {
+                    eprintln!(
+                        "table {}: {} rows, {} columns",
+                        t["sheet"].as_str().unwrap_or("?"),
+                        t["rows"].as_u64().unwrap_or(0),
+                        t["columns"].as_u64().unwrap_or(0)
+                    );
+                }
+            }
+            eprintln!("converted {input} -> {out}");
+            return Ok(());
+        }
+        let mut s = open(input)?;
+        exec(&mut s, "file.saveAs", json!({"path": out}))?;
+        eprintln!("wrote {out}");
+        return Ok(());
     }
     let mut s = open(input)?;
     activate_sheet(&mut s, a.opt("sheet"))?;

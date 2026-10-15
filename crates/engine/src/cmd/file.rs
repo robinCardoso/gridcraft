@@ -8,13 +8,14 @@ use crate::DocState;
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(noundo "file.new", "New Workbook", ["File"], Some("Cmd+N"), "{sample?: \"budget\"|\"sales\"|\"grades\"}", always, new_workbook),
-        cmd!(noundo "file.open", "Open…", ["File"], Some("Cmd+O"), "{path} | {name, base64}, plus {password} for a password-protected workbook (xlsx, xlsm, xls import, xlsb and ods data import, csv, tsv, txt, json)", always, open),
+        cmd!(noundo "file.open", "Open…", ["File"], Some("Cmd+O"), "{path} | {name, base64}, plus {password} for a password-protected workbook (xlsx, xlsm, xls import, xlsb and ods data import, csv, tsv, txt, json, SQLite .db: every table is a sheet)", always, open),
         cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?} (xlsx by default; .csv/.tsv/.json/.html/.pdf by extension)", has_doc, save),
         cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet)", has_doc, save_as),
         cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html} → {base64}", has_doc, save_bytes),
         cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
         cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
+        cmd!(noundo "file.importXlsxToDb", "Convert Workbook to Database", ["File", "Export"], None, "{path, out?, open?: bool (default true)} streams an .xlsx into a SQLite .db (one table per sheet, row 1 = column names) without loading it in memory → {out, tables: [{sheet, rows, columns}], warnings}", always, import_xlsx_to_db),
         cmd!("file.properties", "Properties", ["File"], None, "{title?, subject?, author?, company?, keywords?, description?}", has_doc, properties),
         cmd!(
             query "file.options",
@@ -50,13 +51,19 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
             s.set_active(i);
             return Ok(json!({"index": i, "alreadyOpen": true}));
         }
-        (path.to_string(), crate::io::read_file(path)?)
+        let path_is_db = crate::dbfile::is_db_path(path);
+        // A database is opened by path (SQLite needs the file, not its bytes).
+        (path.to_string(), if path_is_db { Vec::new() } else { crate::io::read_file(path)? })
     } else {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
     let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
-    let (mut wb, warnings) = crate::io::open_bytes_with_password(&name, &bytes, str_param(p, "password"))?;
+    let db_path = str_param(p, "path").filter(|path| crate::dbfile::is_db_path(path));
+    let (mut wb, warnings) = match db_path {
+        Some(path) => crate::dbfile::open(path)?,
+        None => crate::io::open_bytes_with_password(&name, &bytes, str_param(p, "password"))?,
+    };
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
     let imported =
         matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb | crate::io::FileKind::Xls))
@@ -110,6 +117,16 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         return super::print::export_pdf(s, &json!({"path": path}));
     }
     let d = s.doc_mut()?;
+    // A database stores values and formulas only (no formatting, charts...), so saving to another
+    // path is a copy that leaves the document and its unsaved changes alone, like a PDF export.
+    // Saving a document opened from that very database writes it back and clears the changes.
+    if crate::dbfile::is_db_path(&path) {
+        crate::dbfile::save(&d.wb, &path)?;
+        if d.path.as_deref() == Some(path.as_str()) {
+            d.saved = d.wb.clone();
+        }
+        return Ok(json!({"path": path, "database": true}));
+    }
     // The document's own file keeps the format its content had when opened; any other path
     // goes by its extension. Relative paths to linked workbooks are rewritten for the new folder.
     let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
@@ -202,6 +219,35 @@ fn options(s: &mut Session, _: &Json) -> Result<Json> {
         json!({"mode": mode, "iterative": c.iterative, "maxIterations": c.max_iterations, "maxChange": c.max_change})
     });
     Ok(json!({"calculation": calculation}))
+}
+
+/// File › Export › Convert Workbook to Database: streams an `.xlsx` into a SQLite `.db` (the sheets
+/// never need to fit in memory as a workbook) and, unless `open` is false, opens the result.
+fn import_xlsx_to_db(s: &mut Session, p: &Json) -> Result<Json> {
+    let path = str_param(p, "path").ok_or_else(|| bad("file.importXlsxToDb", "missing `path`"))?.to_string();
+    let out = match str_param(p, "out") {
+        Some(o) => o.to_string(),
+        None => std::path::Path::new(&path).with_extension("db").to_string_lossy().into_owned(),
+    };
+    if !crate::dbfile::is_db_path(&out) {
+        return Err(bad("file.importXlsxToDb", "`out` must end in .db, .sqlite or .sqlite3"));
+    }
+    if std::path::Path::new(&out) == std::path::Path::new(&path) {
+        return Err(bad("file.importXlsxToDb", "`out` must be a different file than `path`"));
+    }
+    let (tables, warnings) = crate::dbfile::import_xlsx(&path, &out)?;
+    let mut result = json!({
+        "out": out,
+        "tables": tables.iter().map(|(sheet, rows, columns)| json!({"sheet": sheet, "rows": rows, "columns": columns})).collect::<Vec<_>>(),
+        "warnings": warnings,
+    });
+    if bool_param(p, "open").unwrap_or(true) {
+        let opened = open(s, &json!({"path": out}))?;
+        if let Some(map) = result.as_object_mut() {
+            map.insert("opened".into(), opened);
+        }
+    }
+    Ok(result)
 }
 
 fn activate_window(s: &mut Session, p: &Json) -> Result<Json> {
