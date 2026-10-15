@@ -52,17 +52,44 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
             return Ok(json!({"index": i, "alreadyOpen": true}));
         }
         let path_is_db = crate::dbfile::is_db_path(path);
+        let companion_db = if !path_is_db {
+            let p = std::path::Path::new(path);
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext.eq_ignore_ascii_case("xlsx") || ext.eq_ignore_ascii_case("xlsm") {
+                let db_cand = p.with_extension("db");
+                if db_cand.exists() {
+                    Some(db_cand.to_string_lossy().into_owned())
+                } else if let Ok(meta) = std::fs::metadata(path)
+                    && meta.len() > 3 * 1024 * 1024
+                {
+                    let db_str = db_cand.to_string_lossy().into_owned();
+                    if crate::dbfile::import_xlsx(path, &db_str).is_ok() { Some(db_str) } else { None }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // A database is opened by path (SQLite needs the file, not its bytes).
-        (path.to_string(), if path_is_db { Vec::new() } else { crate::io::read_file(path)? })
+        let effective_path = companion_db.as_deref().unwrap_or(path);
+        let is_db = path_is_db || companion_db.is_some();
+        (effective_path.to_string(), if is_db { Vec::new() } else { crate::io::read_file(path)? })
     } else {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
     let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
-    let db_path = str_param(p, "path").filter(|path| crate::dbfile::is_db_path(path));
-    let (mut wb, warnings) = match db_path {
-        Some(path) => crate::dbfile::open(path)?,
-        None => crate::io::open_bytes_with_password(&name, &bytes, str_param(p, "password"))?,
+    let (mut wb, warnings) = if crate::dbfile::is_db_path(&name) {
+        let (w, mut warns) = crate::dbfile::open(&name)?;
+        if str_param(p, "path").is_some_and(|p| !crate::dbfile::is_db_path(p)) {
+            warns.push("Workbook opened via high-performance SQLite database (.db).".into());
+        }
+        (w, warns)
+    } else {
+        crate::io::open_bytes_with_password(&name, &bytes, str_param(p, "password"))?
     };
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
     let imported =
@@ -76,7 +103,11 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     // An import has no save target: ordinary Save must ask for a new destination. Neither does a
     // workbook decrypted with its password, so Save never replaces the encrypted original with
     // an unprotected copy.
-    let path = str_param(p, "path").filter(|_| !imported && !encrypted).map(str::to_string);
+    let path = if crate::dbfile::is_db_path(&name) {
+        Some(name.clone())
+    } else {
+        str_param(p, "path").filter(|_| !imported && !encrypted).map(str::to_string)
+    };
     // Replace an untouched blank Book1 like Excel does.
     if s.documents().len() == 1
         && s.active().is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
