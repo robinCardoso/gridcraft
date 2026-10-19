@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use gridcraft_core::{CellRef, Value};
+use gridcraft_core::{CellRef, RangeRef, Value};
 use gridcraft_model::{Cell, Formula, Sheet, StyleId, Workbook};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
@@ -70,11 +70,139 @@ fn list_sheets(conn: &Connection) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Opens a SQLite database as a workbook: each table or view becomes a sheet, the column names
-/// are row 1 and the data follows. At most `max_rows` rows are loaded per sheet. The second value
-/// holds warnings (truncated tables, ...). Formulas saved by [`write_workbook`] come back.
+/// Reads a workbook directly from `_gc_cells` preserving exact cell positions, formulas and values.
+fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workbook, Vec<String>)> {
+    let mut wb = Workbook::new();
+    wb.sheets.clear();
+    let mut warnings = vec![];
+
+    let mut sheet_list: Vec<(String, String)> = vec![];
+    let has_sheets_table: bool = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = '_gc_sheets'", [], |r| r.get::<_, i64>(0))? > 0;
+    if has_sheets_table {
+        let mut stmt = conn.prepare("SELECT sheet, COALESCE(table_name, sheet) FROM _gc_sheets ORDER BY position")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for r in rows {
+            sheet_list.push(r?);
+        }
+    }
+    if sheet_list.is_empty() {
+        let mut dist = conn.prepare("SELECT DISTINCT sheet FROM _gc_cells ORDER BY sheet")?;
+        let rows = dist.query_map([], |r| r.get::<_, String>(0))?;
+        for r in rows {
+            let s = r?;
+            sheet_list.push((s.clone(), s));
+        }
+    }
+
+    let has_tables: bool = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = '_gc_tables'", [], |r| r.get::<_, i64>(0))? > 0;
+    let has_columns: bool = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = '_gc_columns'", [], |r| r.get::<_, i64>(0))? > 0;
+
+    for (name, table_name) in sheet_list {
+        let max_r: Option<i64> = conn
+            .query_row("SELECT MAX(row) FROM _gc_cells WHERE sheet = ?1", [&name], |r| r.get(0))
+            .ok()
+            .flatten();
+
+        let Some(max_row) = max_r else {
+            continue;
+        };
+
+        if max_row >= i64::from(max_rows) {
+            warnings.push(format!("'{table_name}' has more than {max_rows} rows; loaded up to row {max_rows}"));
+        }
+
+        let mut sh = Sheet::new(sheet_name(&wb, &name));
+
+        let mut cell_stmt = conn.prepare(
+            "SELECT row, col, val_type, val_num, val_text, formula FROM _gc_cells WHERE sheet = ?1 AND row <= ?2 ORDER BY row, col",
+        )?;
+        let mut rows = cell_stmt.query(rusqlite::params![name, max_rows])?;
+        while let Some(r) = rows.next()? {
+            let row: u32 = r.get(0)?;
+            let col: u32 = r.get(1)?;
+            let val_type: Option<String> = r.get(2)?;
+            let val_num: Option<f64> = r.get(3)?;
+            let val_text: Option<String> = r.get(4)?;
+            let formula_text: Option<String> = r.get(5)?;
+
+            let value = match val_type.as_deref() {
+                Some("n") => val_num.map(Value::number).unwrap_or(Value::Empty),
+                Some("s") => val_text.map(Value::text).unwrap_or(Value::Empty),
+                Some("b") => val_num.map(|n| Value::Bool(n != 0.0)).unwrap_or(Value::Empty),
+                Some("e") => val_text.as_deref().and_then(gridcraft_core::CellError::parse).map(Value::Error).unwrap_or(Value::Empty),
+                _ => Value::Empty,
+            };
+            let formula = formula_text.as_deref().filter(|s| !s.is_empty()).map(|s| std::sync::Arc::new(Formula::new(s)));
+            let at = CellRef::new(row, col);
+            if at.is_valid() {
+                sh.set_cell(at, Cell { value, formula, style: StyleId::DEFAULT });
+            }
+        }
+
+        // Reconstruct tables if stored
+        if has_tables {
+            let mut tbl_stmt = conn.prepare("SELECT table_name, range_ref FROM _gc_tables WHERE sheet = ?1")?;
+            let mut tbl_rows = tbl_stmt.query([&name])?;
+            while let Some(tr) = tbl_rows.next()? {
+                let t_name: String = tr.get(0)?;
+                let range_str: String = tr.get(1)?;
+                if let Some(range) = RangeRef::parse(&range_str) {
+                    let mut cols = vec![];
+                    if has_columns {
+                        let mut col_stmt =
+                            conn.prepare("SELECT position, name, formula FROM _gc_columns WHERE table_name = ?1 ORDER BY position")?;
+                        let mut c_rows = col_stmt.query([&t_name])?;
+                        while let Some(cr) = c_rows.next()? {
+                            let c_name: String = cr.get(1)?;
+                            let c_formula: Option<String> = cr.get(2)?;
+                            cols.push(gridcraft_model::TableColumn {
+                                name: c_name,
+                                totals: gridcraft_model::TotalsFn::None,
+                                totals_label: None,
+                                formula: c_formula,
+                                unique_name: None,
+                                xml: None,
+                            });
+                        }
+                    }
+                    sh.tables.push(gridcraft_model::Table {
+                        id: (sh.tables.len() + 1) as u32,
+                        name: t_name,
+                        range,
+                        header_row: true,
+                        totals_row: false,
+                        columns: cols,
+                        style: "TableStyleMedium2".into(),
+                        banded_rows: true,
+                        banded_cols: false,
+                        first_col: false,
+                        last_col: false,
+                        filter_button: true,
+                        filter: vec![],
+                        table_type: None,
+                        connection_id: None,
+                    });
+                }
+            }
+        }
+
+        wb.sheets.push(Arc::new(sh));
+    }
+
+    Ok((wb, warnings))
+}
+
+/// Opens a SQLite database as a workbook:
+/// When `_gc_cells` is present, loads full cell coordinates, formulas, and values.
+/// Otherwise, each table or view becomes a sheet with columns at row 1.
 pub fn read_workbook(path: &Path, max_rows: u32) -> Result<(Workbook, Vec<String>)> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+
+    let has_gc_cells: bool = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = '_gc_cells'", [], |r| r.get::<_, i64>(0))? > 0;
+    if has_gc_cells {
+        return read_workbook_from_cells(&conn, max_rows);
+    }
+
     let sheets = list_sheets(&conn)?;
     if sheets.is_empty() {
         return Err(DbError::Other("this database has no tables".into()));
@@ -153,9 +281,8 @@ fn to_sql(v: &Value) -> rusqlite::types::Value {
 }
 
 /// Saves a workbook as a SQLite database at `path` (replaced if it exists; the old file survives
-/// a failed save). Each sheet becomes a table: row 1 gives the column names (empty cells become
-/// `COL_n`), later rows the data. Formulas go to `_gc_formulas` with their calculated values in
-/// the table. Formatting, charts and other sheet features are not stored.
+/// a failed save). All cells and formulas are preserved in `_gc_cells` and `_gc_formulas`, and
+/// relational tables are created for SQL querying.
 pub fn write_workbook(wb: &Workbook, path: &Path) -> Result<()> {
     let tmp = path.with_extension("gcsave.tmp");
     let _ = std::fs::remove_file(&tmp);
@@ -175,26 +302,65 @@ pub fn write_workbook(wb: &Workbook, path: &Path) -> Result<()> {
 
 fn write_into(wb: &Workbook, path: &Path) -> Result<()> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")?;
+    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;")?;
     conn.execute_batch(
-        "CREATE TABLE _gc_sheets (position INTEGER, sheet TEXT, table_name TEXT, source_ref TEXT, formula_cells INTEGER);
-         CREATE TABLE _gc_columns (table_name TEXT, position INTEGER, name TEXT, formula TEXT);
-         CREATE TABLE _gc_formulas (sheet TEXT, row INTEGER, col INTEGER, formula TEXT);
+        "CREATE TABLE IF NOT EXISTS _gc_sheets (position INTEGER, sheet TEXT, table_name TEXT, source_ref TEXT, formula_cells INTEGER);
+         CREATE TABLE IF NOT EXISTS _gc_columns (table_name TEXT, position INTEGER, name TEXT, formula TEXT);
+         CREATE TABLE IF NOT EXISTS _gc_formulas (sheet TEXT, row INTEGER, col INTEGER, formula TEXT);
+         CREATE TABLE IF NOT EXISTS _gc_cells (sheet TEXT, row INTEGER, col INTEGER, val_type TEXT, val_num REAL, val_text TEXT, formula TEXT, PRIMARY KEY (sheet, row, col));
+         CREATE TABLE IF NOT EXISTS _gc_tables (table_name TEXT PRIMARY KEY, sheet TEXT, display_name TEXT, range_ref TEXT, header_rows INTEGER, totals_rows INTEGER);
          BEGIN;",
     )?;
     for (position, sh) in wb.sheets.iter().enumerate() {
         let mut by_row: BTreeMap<u32, Vec<(u32, Value)>> = BTreeMap::new();
         let mut formulas: Vec<(CellRef, String)> = vec![];
         let mut ncols = 0u32;
-        for (at, cell) in sh.cells.iter() {
-            if let Some(f) = &cell.formula {
-                formulas.push((at, f.text.clone()));
-            }
-            if !cell.value.is_empty() {
-                ncols = ncols.max(at.col + 1);
-                by_row.entry(at.row).or_default().push((at.col, cell.value.clone()));
+
+        {
+            let mut insert_cell = conn.prepare_cached(
+                "INSERT OR REPLACE INTO _gc_cells (sheet, row, col, val_type, val_num, val_text, formula) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (at, cell) in sh.cells.iter() {
+                if let Some(f) = &cell.formula {
+                    formulas.push((at, f.text.clone()));
+                }
+                if !cell.value.is_empty() {
+                    ncols = ncols.max(at.col + 1);
+                    by_row.entry(at.row).or_default().push((at.col, cell.value.clone()));
+                }
+                let (v_type, v_num, v_text) = match &cell.value {
+                    Value::Number(n) => (Some("n"), Some(*n), None),
+                    Value::Text(t) => (Some("s"), None, Some(t.to_string())),
+                    Value::Bool(b) => (Some("b"), Some(if *b { 1.0 } else { 0.0 }), None),
+                    Value::Error(e) => (Some("e"), None, Some(e.as_str().to_string())),
+                    _ => (None, None, None),
+                };
+                let f_text = cell.formula.as_ref().map(|f| f.text.as_str());
+                insert_cell.execute(rusqlite::params![
+                    sh.name,
+                    at.row as i64,
+                    at.col as i64,
+                    v_type,
+                    v_num,
+                    v_text,
+                    f_text,
+                ])?;
             }
         }
+
+        for t in &sh.tables {
+            conn.execute(
+                "INSERT OR REPLACE INTO _gc_tables (table_name, sheet, display_name, range_ref, header_rows, totals_rows) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![t.name, sh.name, t.name, t.range.to_string(), t.header_row as i64, t.totals_row as i64],
+            )?;
+            for (i, c) in t.columns.iter().enumerate() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO _gc_columns (table_name, position, name, formula) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![t.name, i as i64, c.name, c.formula.as_deref()],
+                )?;
+            }
+        }
+
         if ncols == 0 {
             conn.execute(
                 "INSERT INTO _gc_sheets (position, sheet, table_name, source_ref, formula_cells) VALUES (?1, ?2, NULL, '', 0)",
@@ -202,6 +368,7 @@ fn write_into(wb: &Workbook, path: &Path) -> Result<()> {
             )?;
             continue;
         }
+
         let header = by_row.remove(&0).unwrap_or_default();
         let header_cells: Vec<(usize, rusqlite::types::Value)> = header.iter().map(|(c, v)| (*c as usize, to_sql(v))).collect();
         let names = {
@@ -251,7 +418,7 @@ fn write_into(wb: &Workbook, path: &Path) -> Result<()> {
             }
         }
         for (i, n) in names.iter().enumerate() {
-            conn.execute("INSERT INTO _gc_columns (table_name, position, name, formula) VALUES (?1, ?2, ?3, NULL)", rusqlite::params![sh.name, i as i64, n])?;
+            conn.execute("INSERT OR REPLACE INTO _gc_columns (table_name, position, name, formula) VALUES (?1, ?2, ?3, NULL)", rusqlite::params![sh.name, i as i64, n])?;
         }
         for (at, text) in &formulas {
             conn.execute(

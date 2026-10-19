@@ -1578,6 +1578,7 @@ name = "gridcraft-db"
 version = "0.7.0"
 dependencies = [
  "gridcraft-core",
+ "gridcraft-formula",
  "gridcraft-model",
  "quick-xml",
  "rusqlite",

@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 gridcraft-core = { workspace = true }
 gridcraft-model = { workspace = true }
+gridcraft-formula = { workspace = true }
 thiserror = { workspace = true }
 quick-xml = { workspace = true }
 zip = { workspace = true }

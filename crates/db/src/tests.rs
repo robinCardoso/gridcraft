@@ -149,3 +149,16 @@ fn db_paths() {
     assert!(is_db_path("a.sqlite3"));
     assert!(!is_db_path("a.xlsx"));
 }
+
+#[test]
+fn preserves_formulas_on_imported_cells() {
+    let xlsx = temp("formulas.xlsx");
+    let db = temp("formulas.db");
+    sample_xlsx(&xlsx);
+    import_xlsx(&xlsx, &db, &mut |_, _| {}).expect("import");
+    let (wb, _) = read_workbook(&db, DEFAULT_MAX_ROWS).expect("read");
+    let sh = &wb.sheets[0];
+    let cell_e2 = sh.cell(CellRef::new(1, 4)).expect("cell E2");
+    assert!(cell_e2.formula.is_some(), "E2 must preserve formula C2*2");
+    assert_eq!(cell_e2.formula.as_ref().unwrap().text, "C2*2");
+}

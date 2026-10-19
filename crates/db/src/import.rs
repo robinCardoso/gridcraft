@@ -241,12 +241,45 @@ fn number(v: f64) -> Sql {
     if v.fract() == 0.0 && v.abs() < 9.0e15 { Sql::Integer(v as i64) } else { Sql::Real(v) }
 }
 
+/// A parsed cell from the worksheet XML stream.
+#[derive(Clone, Debug)]
+pub struct RawCell {
+    pub col: usize,
+    pub val: Option<Sql>,
+    pub formula: Option<String>,
+}
+
+/// Normalizes formula text by removing Excel's internal namespaces (`_xlfn.`, `_xlpm.`, `_xlws.`).
+pub fn clean_formula(text: &str) -> String {
+    let body = text.strip_prefix('=').unwrap_or(text).trim();
+    if let Ok(e) = gridcraft_formula::parse(body) {
+        gridcraft_formula::print(&e.map(&mut |x| match x {
+            gridcraft_formula::Expr::Name(n) => gridcraft_formula::Expr::Name(strip_param_prefix(n)),
+            gridcraft_formula::Expr::Call(n, args) => gridcraft_formula::Expr::Call(strip_param_prefix(n), args),
+            other => other,
+        }))
+    } else {
+        body.replace("_xlfn._xlws.", "").replace("_xlfn.", "").replace("_xlpm.", "")
+    }
+}
+
+fn strip_param_prefix(n: String) -> String {
+    if let Some(rest) = n.strip_prefix("_xlpm.") {
+        rest.to_string()
+    } else {
+        n
+    }
+}
+
 struct CellState {
     col: Option<usize>,
     ty: String,
     v: String,
     t: String,
+    f: String,
     has_formula: bool,
+    f_type: String,
+    f_si: Option<u32>,
 }
 
 impl CellState {
@@ -269,19 +302,26 @@ enum Field {
     F,
 }
 
-/// Streams a worksheet; `on_row(row number (1-based), cells (0-based column, value), formula cells)`
+struct SharedFormula {
+    anchor: (u32, u32),
+    expr: Option<gridcraft_formula::Expr>,
+    text: String,
+}
+
+/// Streams a worksheet; `on_row(row number (1-based), cells (RawCell), formula cells)`
 /// is called for each row. Memory stays at one row.
-fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32, Vec<(usize, Sql)>, u64) -> Result<()>) -> Result<()> {
+fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32, Vec<RawCell>, u64) -> Result<()>) -> Result<()> {
     let mut reader = configured(rd);
     let mut buf = Vec::new();
     let mut next_row: u32 = 0;
     let mut row_no: u32 = 0;
-    let mut cells: Vec<(usize, Sql)> = vec![];
+    let mut cells: Vec<RawCell> = vec![];
     let mut formulas: u64 = 0;
     let mut cur: Option<CellState> = None;
     let mut field = Field::None;
     let mut in_is = false;
     let mut next_col = 0usize;
+    let mut shared_formulas: HashMap<u32, SharedFormula> = HashMap::new();
     loop {
         let ev = reader.read_event_into(&mut buf).map_err(|e| package_err(format!("{e} at byte {}", reader.buffer_position())))?;
         match ev {
@@ -298,14 +338,26 @@ fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32
                     let el = elem_of(&e);
                     let col = el.attr("r").and_then(col_of).or(Some(next_col));
                     next_col = col.map_or(next_col, |c| c + 1);
-                    cur = Some(CellState { col, ty: el.attr("t").unwrap_or("n").to_string(), v: String::new(), t: String::new(), has_formula: false });
+                    cur = Some(CellState {
+                        col,
+                        ty: el.attr("t").unwrap_or("n").to_string(),
+                        v: String::new(),
+                        t: String::new(),
+                        f: String::new(),
+                        has_formula: false,
+                        f_type: String::new(),
+                        f_si: None,
+                    });
                 }
                 b"v" => field = Field::V,
                 b"is" => in_is = true,
                 b"t" if in_is => field = Field::T,
                 b"f" => {
+                    let el = elem_of(&e);
                     if let Some(c) = cur.as_mut() {
                         c.has_formula = true;
+                        c.f_type = el.attr("t").unwrap_or("normal").to_string();
+                        c.f_si = el.attr("si").and_then(|s| s.parse::<u32>().ok());
                     }
                     field = Field::F;
                 }
@@ -317,8 +369,11 @@ fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32
                     next_col = el.attr("r").and_then(col_of).map_or(next_col, |c| c + 1);
                 }
                 b"f" => {
+                    let el = elem_of(&e);
                     if let Some(c) = cur.as_mut() {
                         c.has_formula = true;
+                        c.f_type = el.attr("t").unwrap_or("normal").to_string();
+                        c.f_si = el.attr("si").and_then(|s| s.parse::<u32>().ok());
                     }
                 }
                 _ => {}
@@ -326,11 +381,43 @@ fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32
             Event::End(e) => match e.local_name().as_ref() {
                 b"c" => {
                     if let Some(c) = cur.take() {
+                        let mut formula = None;
                         if c.has_formula {
                             formulas += 1;
+                            let cell_row_0 = row_no.saturating_sub(1);
+                            let cell_col_0 = c.col.unwrap_or(0) as u32;
+                            let raw_f = c.f.trim();
+                            if c.f_type == "shared" {
+                                if let Some(si) = c.f_si {
+                                    if !raw_f.is_empty() {
+                                        let clean = clean_formula(raw_f);
+                                        let expr = gridcraft_formula::parse(&clean).ok();
+                                        shared_formulas.insert(
+                                            si,
+                                            SharedFormula {
+                                                anchor: (cell_row_0, cell_col_0),
+                                                expr,
+                                                text: clean.clone(),
+                                            },
+                                        );
+                                        formula = Some(clean);
+                                    } else if let Some(sh) = shared_formulas.get(&si) {
+                                        let dr = cell_row_0 as i64 - sh.anchor.0 as i64;
+                                        let dc = cell_col_0 as i64 - sh.anchor.1 as i64;
+                                        let shifted = match &sh.expr {
+                                            Some(e) => gridcraft_formula::print(&gridcraft_formula::adjust::shift_relative(e.clone(), dr, dc)),
+                                            None => sh.text.clone(),
+                                        };
+                                        formula = Some(shifted);
+                                    }
+                                }
+                            } else if !raw_f.is_empty() {
+                                formula = Some(clean_formula(raw_f));
+                            }
                         }
-                        if let (Some(col), Some(v)) = (c.col, c.value(shared)) {
-                            cells.push((col, v));
+                        let val = c.value(shared);
+                        if c.col.is_some() && (val.is_some() || formula.is_some()) {
+                            cells.push(RawCell { col: c.col.unwrap_or(0), val, formula });
                         }
                     }
                     field = Field::None;
@@ -347,7 +434,8 @@ fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32
                     match field {
                         Field::V => c.v.push_str(&s),
                         Field::T => c.t.push_str(&s),
-                        Field::F | Field::None => {}
+                        Field::F => c.f.push_str(&s),
+                        Field::None => {}
                     }
                 }
             }
@@ -356,7 +444,8 @@ fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32
                     match field {
                         Field::V => push_ref(r, &mut c.v),
                         Field::T => push_ref(r, &mut c.t),
-                        Field::F | Field::None => {}
+                        Field::F => push_ref(r, &mut c.f),
+                        Field::None => {}
                     }
                 }
             }
@@ -371,15 +460,16 @@ fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32
 // ---------------------------------------------------------------- import
 
 /// Unique, non-empty column names from a header row.
-fn column_names(cells: &[(usize, Sql)], n: usize) -> Vec<String> {
+fn column_names(cells: &[RawCell], n: usize) -> Vec<String> {
     let mut names: Vec<String> = Vec::with_capacity(n);
     let mut seen: HashSet<String> = HashSet::new();
     seen.insert("_row".into());
     for i in 0..n {
         let raw = cells
             .iter()
-            .find(|(c, _)| *c == i)
-            .map(|(_, v)| match v {
+            .find(|c| c.col == i)
+            .and_then(|c| c.val.as_ref())
+            .map(|v| match v {
                 Sql::Text(s) => s.trim().to_string(),
                 Sql::Integer(x) => x.to_string(),
                 Sql::Real(x) => x.to_string(),
@@ -399,9 +489,11 @@ fn column_names(cells: &[(usize, Sql)], n: usize) -> Vec<String> {
 }
 
 const SCHEMA: &str = "
-CREATE TABLE _gc_sheets (position INTEGER, sheet TEXT, table_name TEXT, source_ref TEXT, formula_cells INTEGER);
-CREATE TABLE _gc_columns (table_name TEXT, position INTEGER, name TEXT, formula TEXT);
-CREATE TABLE _gc_formulas (sheet TEXT, row INTEGER, col INTEGER, formula TEXT);
+CREATE TABLE IF NOT EXISTS _gc_sheets (position INTEGER, sheet TEXT, table_name TEXT, source_ref TEXT, formula_cells INTEGER);
+CREATE TABLE IF NOT EXISTS _gc_columns (table_name TEXT, position INTEGER, name TEXT, formula TEXT);
+CREATE TABLE IF NOT EXISTS _gc_formulas (sheet TEXT, row INTEGER, col INTEGER, formula TEXT);
+CREATE TABLE IF NOT EXISTS _gc_cells (sheet TEXT, row INTEGER, col INTEGER, val_type TEXT, val_num REAL, val_text TEXT, formula TEXT, PRIMARY KEY (sheet, row, col));
+CREATE TABLE IF NOT EXISTS _gc_tables (table_name TEXT PRIMARY KEY, sheet TEXT, display_name TEXT, range_ref TEXT, header_rows INTEGER, totals_rows INTEGER);
 ";
 
 /// Converts `xlsx` to a SQLite database at `db` (replaced if it exists), streaming each worksheet.
@@ -463,9 +555,19 @@ fn import_into(
         for (_, _, t) in sheet_rels.iter().filter(|(_, ty, _)| ty.ends_with("/table")) {
             if let Some(bytes) = read_part(zip, &resolve(dir, t))? {
                 let mut column: Option<String> = None;
+                let mut tbl_name = String::new();
+                let mut tbl_display = String::new();
+                let mut tbl_ref = String::new();
                 for el in flat(&bytes) {
                     match el.name.as_str() {
-                        "table" if source_ref.is_empty() => source_ref = el.attr("ref").unwrap_or("").to_string(),
+                        "table" => {
+                            tbl_name = el.attr("name").unwrap_or("").to_string();
+                            tbl_display = el.attr("displayName").unwrap_or(&tbl_name).to_string();
+                            tbl_ref = el.attr("ref").unwrap_or("").to_string();
+                            if source_ref.is_empty() {
+                                source_ref = tbl_ref.clone();
+                            }
+                        }
                         "tableColumn" => column = el.attr("name").map(str::to_string),
                         "calculatedColumnFormula" => {
                             if let Some(c) = &column {
@@ -474,6 +576,12 @@ fn import_into(
                         }
                         _ => {}
                     }
+                }
+                if !tbl_name.is_empty() {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO _gc_tables (table_name, sheet, display_name, range_ref, header_rows, totals_rows) VALUES (?1, ?2, ?3, ?4, 1, 0)",
+                        rusqlite::params![tbl_name, sheet, tbl_display, tbl_ref],
+                    )?;
                 }
             }
         }
@@ -493,42 +601,82 @@ fn import_into(
         let mut rows: u64 = 0;
         let mut formula_cells: u64 = 0;
         let mut overflow: u64 = 0;
-        stream_sheet(rd, shared, &mut |row_no, cells, formulas| {
-            formula_cells += formulas;
-            if cells.is_empty() {
-                return Ok(());
-            }
-            let Some(sql) = &insert_sql else {
-                // The first non-empty row names the columns.
-                ncols = cells.iter().map(|(c, _)| *c).max().map_or(0, |m| m + 1);
-                names = column_names(&cells, ncols);
-                let cols = names.iter().map(|n| quote_ident(n)).collect::<Vec<_>>().join(", ");
-                conn.execute_batch(&format!("CREATE TABLE {} (_row INTEGER PRIMARY KEY, {cols}); BEGIN;", quote_ident(&table)))?;
-                let marks = (1..=ncols + 1).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
-                insert_sql = Some(format!("INSERT OR REPLACE INTO {} (_row, {cols}) VALUES ({marks})", quote_ident(&table)));
-                return Ok(());
-            };
-            let mut params: Vec<Sql> = vec![Sql::Null; ncols + 1];
-            if let Some(p) = params.first_mut() {
-                *p = Sql::Integer(i64::from(row_no));
-            }
-            for (c, v) in cells {
-                match params.get_mut(c + 1) {
-                    Some(slot) => *slot = v,
-                    None => overflow += 1,
+
+        conn.execute_batch("BEGIN;")?;
+        {
+            let mut insert_cell_stmt = conn.prepare_cached(
+                "INSERT OR REPLACE INTO _gc_cells (sheet, row, col, val_type, val_num, val_text, formula) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            let mut insert_formula_stmt = conn.prepare_cached(
+                "INSERT OR REPLACE INTO _gc_formulas (sheet, row, col, formula) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+
+            stream_sheet(rd, shared, &mut |row_no, cells, formulas| {
+                formula_cells += formulas;
+                if cells.is_empty() {
+                    return Ok(());
                 }
-            }
-            conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
-            rows += 1;
-            if rows % 25_000 == 0 {
-                progress(sheet, rows);
-            }
-            Ok(())
-        })?;
+
+                // 1. Record every cell into _gc_cells and _gc_formulas
+                let row_0 = (row_no.saturating_sub(1)) as i64;
+                for c in &cells {
+                    let col_0 = c.col as i64;
+                    let (v_type, v_num, v_text) = match &c.val {
+                        Some(Sql::Integer(i)) => (Some("n"), Some(*i as f64), None),
+                        Some(Sql::Real(f)) => (Some("n"), Some(*f), None),
+                        Some(Sql::Text(t)) => (Some("s"), None, Some(t.clone())),
+                        _ => (None, None, None),
+                    };
+                    insert_cell_stmt.execute(rusqlite::params![
+                        sheet,
+                        row_0,
+                        col_0,
+                        v_type,
+                        v_num,
+                        v_text,
+                        c.formula.as_deref(),
+                    ])?;
+                    if let Some(f) = &c.formula {
+                        insert_formula_stmt.execute(rusqlite::params![sheet, row_0, col_0, f])?;
+                    }
+                }
+
+                // 2. Also populate relational table if applicable
+                let Some(sql) = &insert_sql else {
+                    ncols = cells.iter().map(|c| c.col).max().map_or(0, |m| m + 1);
+                    names = column_names(&cells, ncols);
+                    let cols = names.iter().map(|n| quote_ident(n)).collect::<Vec<_>>().join(", ");
+                    conn.execute_batch(&format!("CREATE TABLE {} (_row INTEGER PRIMARY KEY, {cols});", quote_ident(&table)))?;
+                    let marks = (1..=ncols + 1).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+                    insert_sql = Some(format!("INSERT OR REPLACE INTO {} (_row, {cols}) VALUES ({marks})", quote_ident(&table)));
+                    return Ok(());
+                };
+
+                let mut params: Vec<Sql> = vec![Sql::Null; ncols + 1];
+                if let Some(p) = params.first_mut() {
+                    *p = Sql::Integer(i64::from(row_no));
+                }
+                for c in &cells {
+                    if let Some(v) = &c.val {
+                        match params.get_mut(c.col + 1) {
+                            Some(slot) => *slot = v.clone(),
+                            None => overflow += 1,
+                        }
+                    }
+                }
+                conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
+                rows += 1;
+                if rows % 25_000 == 0 {
+                    progress(sheet, rows);
+                }
+                Ok(())
+            })?;
+        }
+        conn.execute_batch("COMMIT;")?;
         progress(sheet, rows);
 
         if insert_sql.is_some() {
-            conn.execute_batch("COMMIT;")?;
+            conn.execute_batch("BEGIN;")?;
             for (i, name) in names.iter().enumerate() {
                 conn.execute(
                     "INSERT INTO _gc_columns (table_name, position, name, formula) VALUES (?1, ?2, ?3, ?4)",
@@ -539,22 +687,37 @@ fn import_into(
                 "INSERT INTO _gc_sheets (position, sheet, table_name, source_ref, formula_cells) VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![position as i64, sheet, table, source_ref, formula_cells as i64],
             )?;
+
+            // If table has standard lookup columns, create SQLite indexes for rapid performance
+            if names.iter().any(|n| n.eq_ignore_ascii_case("Referencia")) {
+                let _ = conn.execute_batch(&format!(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} (Referencia);",
+                    quote_ident(&format!("idx_{table}_ref")),
+                    quote_ident(&table)
+                ));
+            }
+            if names.iter().any(|n| n.eq_ignore_ascii_case("Fornecedor")) {
+                let _ = conn.execute_batch(&format!(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} (Fornecedor);",
+                    quote_ident(&format!("idx_{table}_forn")),
+                    quote_ident(&table)
+                ));
+            }
+            conn.execute_batch("COMMIT;")?;
+
             let calculated_columns = names.iter().filter(|n| calc.contains_key(*n)).count();
             if overflow > 0 {
-                report.warnings.push(format!("sheet '{sheet}': {overflow} cells outside the header columns were ignored"));
-            }
-            if formula_cells > 0 && calculated_columns > 0 {
-                report.warnings.push(format!(
-                    "sheet '{sheet}': {calculated_columns} calculated columns kept as formulas in _gc_columns; their values are empty until calculated"
-                ));
+                report.warnings.push(format!("sheet '{sheet}': {overflow} cells outside the header columns were ignored in table view"));
             }
             report.tables.push(TableReport { sheet: table, rows, columns: ncols, formula_cells, calculated_columns });
         } else {
             conn.execute(
-                "INSERT INTO _gc_sheets (position, sheet, table_name, source_ref, formula_cells) VALUES (?1, ?2, NULL, ?3, 0)",
-                rusqlite::params![position as i64, sheet, source_ref],
+                "INSERT INTO _gc_sheets (position, sheet, table_name, source_ref, formula_cells) VALUES (?1, ?2, NULL, ?3, ?4)",
+                rusqlite::params![position as i64, sheet, source_ref, formula_cells as i64],
             )?;
-            report.warnings.push(format!("sheet '{sheet}' is empty and was not imported"));
+            if rows == 0 {
+                report.warnings.push(format!("sheet '{sheet}' is empty and was not imported"));
+            }
         }
     }
     conn.execute_batch("PRAGMA optimize;")?;
