@@ -1753,21 +1753,64 @@ fn insert_function(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confir
     });
     let locale = app.ui.language.formula_locale();
     let list = gridcraft_engine::cmd::formulas::function_list();
-    let q = d.search.to_ascii_lowercase();
+    let raw_search = d.search.trim().trim_start_matches('=').trim();
+    let q: String = raw_search.chars().map(|c| match c {
+        'Á' | 'À' | 'Ã' | 'Â' | 'á' | 'à' | 'ã' | 'â' => 'a',
+        'É' | 'È' | 'Ê' | 'é' | 'è' | 'ê' => 'e',
+        'Í' | 'Ì' | 'Î' | 'í' | 'ì' | 'î' => 'i',
+        'Ó' | 'Ò' | 'Õ' | 'Ô' | 'ó' | 'ò' | 'õ' | 'ô' => 'o',
+        'Ú' | 'Ù' | 'Û' | 'ú' | 'ù' | 'û' => 'u',
+        'Ç' | 'ç' => 'c',
+        other => other,
+    }).collect::<String>().to_ascii_lowercase();
+
+    let unaccent = |s: &str| -> String {
+        s.chars().map(|c| match c {
+            'Á' | 'À' | 'Ã' | 'Â' | 'á' | 'à' | 'ã' | 'â' => 'a',
+            'É' | 'È' | 'Ê' | 'é' | 'è' | 'ê' => 'e',
+            'Í' | 'Ì' | 'Î' | 'í' | 'ì' | 'î' => 'i',
+            'Ó' | 'Ò' | 'Õ' | 'Ô' | 'ó' | 'ò' | 'õ' | 'ô' => 'o',
+            'Ú' | 'Ù' | 'Û' | 'ú' | 'ù' | 'û' => 'u',
+            'Ç' | 'ç' => 'c',
+            other => other,
+        }).collect::<String>().to_ascii_lowercase()
+    };
+
     let hits: Vec<&Json> = list
         .iter()
         .filter(|f| {
-            q.is_empty()
-                || f["name"].as_str().is_some_and(|n| locale.function_name(n).to_ascii_lowercase().contains(&q))
-                || f["description"].as_str().is_some_and(|n| n.to_ascii_lowercase().contains(&q))
+            if q.is_empty() {
+                return true;
+            }
+            let canonical = f["name"].as_str().unwrap_or("");
+            let localized = locale.function_name(canonical);
+            let pt_name = gridcraft_engine::formula::FormulaLocale::Pt.function_name(canonical);
+            let es_name = gridcraft_engine::formula::FormulaLocale::Es.function_name(canonical);
+            let desc = f["description"].as_str().unwrap_or("");
+
+            canonical.to_ascii_lowercase().contains(&q)
+                || localized.to_ascii_lowercase().contains(&q)
+                || unaccent(localized).contains(&q)
+                || pt_name.to_ascii_lowercase().contains(&q)
+                || unaccent(pt_name).contains(&q)
+                || es_name.to_ascii_lowercase().contains(&q)
+                || desc.to_ascii_lowercase().contains(&q)
+                || unaccent(desc).contains(&q)
         })
         .take(300)
         .collect();
     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
         for (i, f) in hits.iter().enumerate() {
-            let name = locale.function_name(f["name"].as_str().unwrap_or(""));
+            let canonical = f["name"].as_str().unwrap_or("");
+            let localized = locale.function_name(canonical);
+            let label = if localized != canonical {
+                format!("{localized} ({canonical})")
+            } else {
+                canonical.to_string()
+            };
+            let category = f["category"].as_str().unwrap_or("");
             let r = ui.add(
-                egui::Button::selectable(i == d.list_index, format!("{name:<18} {}", f["category"].as_str().unwrap_or("")))
+                egui::Button::selectable(i == d.list_index, format!("{label:<26} {category}"))
                     .min_size(vec2(480.0, 20.0)),
             );
             if r.clicked() {

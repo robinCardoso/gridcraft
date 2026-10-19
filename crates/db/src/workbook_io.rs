@@ -113,6 +113,14 @@ fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workboo
 
         let mut sh = Sheet::new(sheet_name(&wb, &name));
 
+        let formula_count: i64 = conn
+            .query_row("SELECT COUNT(formula) FROM _gc_cells WHERE sheet = ?1", [&name], |r| r.get(0))
+            .unwrap_or(0);
+        // Sheets with massive formula counts (e.g. catalog tables with > 50,000 repeated formulas)
+        // load cached values to keep memory responsive and avoid locking the UI thread.
+        // The formulas remain permanently preserved in the SQLite database.
+        let load_formulas = formula_count < 50_000;
+
         let mut cell_stmt = conn.prepare(
             "SELECT row, col, val_type, val_num, val_text, formula FROM _gc_cells WHERE sheet = ?1 AND row <= ?2 ORDER BY row, col",
         )?;
@@ -132,7 +140,11 @@ fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workboo
                 Some("e") => val_text.as_deref().and_then(gridcraft_core::CellError::parse).map(Value::Error).unwrap_or(Value::Empty),
                 _ => Value::Empty,
             };
-            let formula = formula_text.as_deref().filter(|s| !s.is_empty()).map(|s| std::sync::Arc::new(Formula::new(s)));
+            let formula = if load_formulas {
+                formula_text.as_deref().filter(|s| !s.is_empty()).map(|s| std::sync::Arc::new(Formula::new(s)))
+            } else {
+                None
+            };
             let at = CellRef::new(row, col);
             if at.is_valid() {
                 sh.set_cell(at, Cell { value, formula, style: StyleId::DEFAULT });
