@@ -263,6 +263,8 @@ pub struct SheetApp {
     /// holding other text. Once the cut has been pasted, Paste leaves this text alone.
     cut_text: Option<String>,
     pub started: f64,
+    /// Calculation progress/status: (progress 0.0..=1.0, formula count, timestamp ms).
+    pub calc_status: Option<(f32, usize, f64)>,
 }
 
 impl SheetApp {
@@ -306,6 +308,7 @@ impl SheetApp {
             clipboard_text_at_copy: None,
             cut_text: None,
             started: now_ms(),
+            calc_status: None,
         }
     }
 
@@ -704,6 +707,11 @@ impl SheetApp {
                         f(&u);
                     }
                 }
+            }
+        }
+        if let Some(d) = self.session.active() {
+            if d.calc.last_recalc_cells > 0 {
+                self.calc_status = Some((1.0, d.calc.last_recalc_cells, now_ms()));
             }
         }
     }

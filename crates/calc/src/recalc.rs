@@ -408,6 +408,29 @@ struct PassHost<'a> {
     tainted: HashSet<Key>,
     /// Whether the formula being evaluated has read a previous value.
     taint: bool,
+    lookup_col_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
+    lookup_row_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum LookupExactKey {
+    Text(String),
+    Number(u64),
+    Bool(bool),
+    Empty,
+}
+
+fn to_lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
+    match v {
+        Value::Text(s) => Some(LookupExactKey::Text(s.to_lowercase())),
+        Value::Number(n) => {
+            let n = if *n == 0.0 { 0.0 } else { *n };
+            Some(LookupExactKey::Number(n.to_bits()))
+        }
+        Value::Bool(b) => Some(LookupExactKey::Bool(*b)),
+        Value::Empty => Some(LookupExactKey::Empty),
+        _ => None,
+    }
 }
 
 impl<'a> PassHost<'a> {
@@ -431,6 +454,8 @@ impl<'a> PassHost<'a> {
             members: HashSet::default(),
             tainted: HashSet::default(),
             taint: false,
+            lookup_col_cache: HashMap::default(),
+            lookup_row_cache: HashMap::default(),
         }
     }
 }
@@ -778,6 +803,64 @@ impl Host for PassHost<'_> {
         x ^= x >> 27;
         *self.rng = x;
         (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn lookup_find_row(&mut self, sheet: usize, search_col: u32, r0: u32, r1: u32, needle: &Value) -> Option<u32> {
+        let wild = matches!(needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
+        if wild {
+            return (r0..=r1).find(|&r| {
+                let key = self.cell_value(sheet, CellRef::new(r, search_col));
+                gridcraft_functions::lookup_equal(needle, &key, true)
+            });
+        }
+
+        let Some(needle_key) = to_lookup_exact_key(needle) else {
+            return (r0..=r1).find(|&r| {
+                let key = self.cell_value(sheet, CellRef::new(r, search_col));
+                gridcraft_functions::lookup_equal(needle, &key, false)
+            });
+        };
+
+        let key = (sheet, search_col, r0, r1);
+        if !self.lookup_col_cache.contains_key(&key) {
+            let mut map = HashMap::default();
+            for r in r0..=r1 {
+                let val = self.cell_value(sheet, CellRef::new(r, search_col));
+                if let Some(k) = to_lookup_exact_key(&val) {
+                    map.entry(k).or_insert(r);
+                }
+            }
+            self.lookup_col_cache.insert(key, map);
+        }
+        self.lookup_col_cache.get(&key).and_then(|map| map.get(&needle_key).copied())
+    }
+    fn lookup_find_col(&mut self, sheet: usize, search_row: u32, c0: u32, c1: u32, needle: &Value) -> Option<u32> {
+        let wild = matches!(needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
+        if wild {
+            return (c0..=c1).find(|&c| {
+                let key = self.cell_value(sheet, CellRef::new(search_row, c));
+                gridcraft_functions::lookup_equal(needle, &key, true)
+            });
+        }
+
+        let Some(needle_key) = to_lookup_exact_key(needle) else {
+            return (c0..=c1).find(|&c| {
+                let key = self.cell_value(sheet, CellRef::new(search_row, c));
+                gridcraft_functions::lookup_equal(needle, &key, false)
+            });
+        };
+
+        let key = (sheet, search_row, c0, c1);
+        if !self.lookup_row_cache.contains_key(&key) {
+            let mut map = HashMap::default();
+            for c in c0..=c1 {
+                let val = self.cell_value(sheet, CellRef::new(search_row, c));
+                if let Some(k) = to_lookup_exact_key(&val) {
+                    map.entry(k).or_insert(c);
+                }
+            }
+            self.lookup_row_cache.insert(key, map);
+        }
+        self.lookup_row_cache.get(&key).and_then(|map| map.get(&needle_key).copied())
     }
 }
 

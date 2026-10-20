@@ -332,6 +332,35 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                             ui.add_space(10.0);
                         }
                     }
+                    // Calculation indicator and progress bar (Excel style)
+                    let calc_info = app.calc_status.or_else(|| {
+                        app.session.active().and_then(|d| {
+                            if d.calc.last_recalc_cells > 0 {
+                                Some((1.0, d.calc.last_recalc_cells, 0.0))
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    if let Some((progress, count, at)) = calc_info {
+                        let age = if at > 0.0 { crate::now_ms() - at } else { 0.0 };
+                        if at == 0.0 || age < 12000.0 || count > 100 {
+                            ui.add_space(8.0);
+                            let (bar_rect, resp) = ui.allocate_exact_size(vec2(80.0, 10.0), Sense::hover());
+                            ui.painter().rect_filled(bar_rect, 2.0, t.separator);
+                            let fill_w = (bar_rect.width() * progress.clamp(0.0, 1.0)).max(2.0);
+                            let fill_rect = Rect::from_min_size(bar_rect.min, vec2(fill_w, bar_rect.height()));
+                            ui.painter().rect_filled(fill_rect, 2.0, t.accent);
+
+                            ui.add_space(6.0);
+                            let pct = (progress * 100.0).round() as u32;
+                            let msg = format!("Calculando: (4 threads): {pct}%");
+                            let tip = format!("{count} fórmulas calculadas");
+                            resp.on_hover_text(&tip);
+                            ui.label(egui::RichText::new(msg).font(theme::ui_font(12.0)).color(t.text_dim)).on_hover_text(tip);
+                            ui.add_space(8.0);
+                        }
+                    }
                 });
             });
         },

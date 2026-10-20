@@ -76,6 +76,24 @@ pub trait Host {
     fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
         false
     }
+    /// Exact lookup index for a range column: returns the first matching row for `needle`,
+    /// or None if not found.
+    fn lookup_find_row(&mut self, sheet: usize, search_col: u32, r0: u32, r1: u32, needle: &Value) -> Option<u32> {
+        let wild = matches!(needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
+        (r0..=r1).find(|&r| {
+            let key = self.cell_value(sheet, CellRef::new(r, search_col));
+            gridcraft_functions::lookup_equal(needle, &key, wild)
+        })
+    }
+    /// Exact lookup index for a range row: returns the first matching column for `needle`,
+    /// or None if not found.
+    fn lookup_find_col(&mut self, sheet: usize, search_row: u32, c0: u32, c1: u32, needle: &Value) -> Option<u32> {
+        let wild = matches!(needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
+        (c0..=c1).find(|&c| {
+            let key = self.cell_value(sheet, CellRef::new(search_row, c));
+            gridcraft_functions::lookup_equal(needle, &key, wild)
+        })
+    }
 }
 
 pub struct Evaluator<'h> {
@@ -695,11 +713,7 @@ impl<'h> Evaluator<'h> {
                             .collect();
                         gridcraft_functions::bsearch_last(&needle, &keys, false).map(|i| trimmed.start.row + i as u32)
                     } else {
-                        let wild = matches!(&needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
-                        (trimmed.start.row..=trimmed.end.row).find(|&r| {
-                            let key = self.host.cell_value(area.sheet, CellRef::new(r, search_col));
-                            gridcraft_functions::lookup_equal(&needle, &key, wild)
-                        })
+                        self.host.lookup_find_row(area.sheet, search_col, trimmed.start.row, trimmed.end.row, &needle)
                     };
                     let Some(r) = match_row else {
                         return err(CellError::NA);
@@ -715,11 +729,7 @@ impl<'h> Evaluator<'h> {
                             .collect();
                         gridcraft_functions::bsearch_last(&needle, &keys, false).map(|i| trimmed.start.col + i as u32)
                     } else {
-                        let wild = matches!(&needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
-                        (trimmed.start.col..=trimmed.end.col).find(|&c| {
-                            let key = self.host.cell_value(area.sheet, CellRef::new(search_row, c));
-                            gridcraft_functions::lookup_equal(&needle, &key, wild)
-                        })
+                        self.host.lookup_find_col(area.sheet, search_row, trimmed.start.col, trimmed.end.col, &needle)
                     };
                     let Some(c) = match_col else {
                         return err(CellError::NA);
