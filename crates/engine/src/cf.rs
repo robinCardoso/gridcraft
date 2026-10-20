@@ -24,6 +24,7 @@ pub struct CfLook {
 #[derive(Default)]
 pub struct CfCache {
     stats: HashMap<usize, RuleStats>,
+    cell_cache: HashMap<CellRef, Option<CfLook>>,
 }
 
 #[derive(Default, Clone)]
@@ -34,7 +35,7 @@ struct RuleStats {
     counts: HashMap<String, usize>,
 }
 
-fn numbers_in(sh: &Sheet, ranges: &[RangeRef]) -> (Vec<f64>, HashMap<String, usize>) {
+fn numbers_in(sh: &Sheet, ranges: &[RangeRef], need_counts: bool) -> (Vec<f64>, HashMap<String, usize>) {
     let mut nums = Vec::new();
     let mut counts = HashMap::new();
     for r in ranges {
@@ -47,13 +48,26 @@ fn numbers_in(sh: &Sheet, ranges: &[RangeRef]) -> (Vec<f64>, HashMap<String, usi
             if let Value::Number(n) = v {
                 nums.push(n);
             }
-            if !v.is_empty() {
+            if need_counts && !v.is_empty() {
                 *counts.entry(v.display().to_lowercase()).or_insert(0) += 1;
             }
         }
     }
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     (nums, counts)
+}
+
+fn rule_needs_stats(rule: &CfRule) -> bool {
+    matches!(
+        rule,
+        CfRule::Duplicate { .. }
+            | CfRule::Unique { .. }
+            | CfRule::Top10 { .. }
+            | CfRule::AboveAverage { .. }
+            | CfRule::ColorScale { .. }
+            | CfRule::DataBar { .. }
+            | CfRule::IconSet { .. }
+    )
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -99,6 +113,9 @@ impl CfCache {
 
     /// Conditional look of `c`, or `None` when no rule applies.
     pub fn look(&mut self, wb: &Workbook, sheet: usize, c: CellRef) -> Option<CfLook> {
+        if let Some(cached) = self.cell_cache.get(&c) {
+            return cached.clone();
+        }
         let sh = wb.sheet(sheet)?;
         if sh.cond_formats.is_empty() {
             return None;
@@ -107,21 +124,27 @@ impl CfCache {
         let mut any = false;
         let mut rules: Vec<(usize, &CondFormat)> =
             sh.cond_formats.iter().enumerate().filter(|(_, cf)| cf.ranges.iter().any(|r| r.contains(c))).collect();
+        if rules.is_empty() {
+            self.cell_cache.insert(c, None);
+            return None;
+        }
         rules.sort_by_key(|(_, cf)| cf.priority);
         let v = sh.value(c);
         for (idx, cf) in rules {
             let first = cf.ranges.first().map(|r| r.start).unwrap_or(c);
-            let st = self
-                .stats
-                .entry(idx)
-                .or_insert_with(|| {
-                    let (sorted, counts) = numbers_in(sh, &cf.ranges);
+            let st = if rule_needs_stats(&cf.rule) {
+                if !self.stats.contains_key(&idx) {
+                    let need_counts = matches!(cf.rule, CfRule::Duplicate { .. } | CfRule::Unique { .. });
+                    let (sorted, counts) = numbers_in(sh, &cf.ranges, need_counts);
                     let n = sorted.len().max(1) as f64;
                     let avg = sorted.iter().sum::<f64>() / n;
                     let std = (sorted.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / n).sqrt();
-                    RuleStats { sorted, avg, std, counts }
-                })
-                .clone();
+                    self.stats.insert(idx, RuleStats { sorted, avg, std, counts });
+                }
+                self.stats.get(&idx)
+            } else {
+                None
+            };
             let text = v.display();
             let matched_style: Option<&Style> = match &cf.rule {
                 CfRule::CellIs { op, a, b, style } => {
@@ -156,13 +179,15 @@ impl CfCache {
                 CfRule::Errors { style } => v.is_error().then_some(style.as_ref()),
                 CfRule::NoErrors { style } => (!v.is_error()).then_some(style.as_ref()),
                 CfRule::Duplicate { style } => {
-                    (!v.is_empty() && st.counts.get(&text.to_lowercase()).copied().unwrap_or(0) > 1).then_some(style.as_ref())
+                    let count = st.and_then(|s| s.counts.get(&text.to_lowercase())).copied().unwrap_or(0);
+                    (!v.is_empty() && count > 1).then_some(style.as_ref())
                 }
                 CfRule::Unique { style } => {
-                    (!v.is_empty() && st.counts.get(&text.to_lowercase()).copied().unwrap_or(0) == 1).then_some(style.as_ref())
+                    let count = st.and_then(|s| s.counts.get(&text.to_lowercase())).copied().unwrap_or(0);
+                    (!v.is_empty() && count == 1).then_some(style.as_ref())
                 }
-                CfRule::Top10 { bottom, percent, rank, style } => match v.as_f64() {
-                    Some(n) if !st.sorted.is_empty() => {
+                CfRule::Top10 { bottom, percent, rank, style } => match (v.as_f64(), st) {
+                    (Some(n), Some(st)) if !st.sorted.is_empty() => {
                         let k = if *percent { ((st.sorted.len() as f64) * (*rank as f64) / 100.0).floor().max(1.0) as usize } else { *rank as usize };
                         let k = k.clamp(1, st.sorted.len());
                         let ok = if *bottom {
@@ -174,13 +199,13 @@ impl CfCache {
                     }
                     _ => None,
                 },
-                CfRule::AboveAverage { below, equal, std_dev, style } => match v.as_f64() {
-                    Some(n) => {
+                CfRule::AboveAverage { below, equal, std_dev, style } => match (v.as_f64(), st) {
+                    (Some(n), Some(st)) => {
                         let thr = st.avg + if *below { -1.0 } else { 1.0 } * st.std * *std_dev as f64;
                         let ok = if *below { n < thr || (*equal && n == thr) } else { n > thr || (*equal && n == thr) };
                         ok.then_some(style.as_ref())
                     }
-                    None => None,
+                    _ => None,
                 },
                 CfRule::TimePeriod { period, style } => match v.as_f64() {
                     Some(n) => {
@@ -215,10 +240,10 @@ impl CfCache {
                     None => None,
                 },
                 CfRule::ColorScale { stops } => {
-                    if let Some(n) = v.as_f64() {
+                    if let (Some(n), Some(st)) = (v.as_f64(), st) {
                         let pts: Vec<(f64, [u8; 3])> = stops
                             .iter()
-                            .map(|(k, col)| (threshold(wb, sheet, c, &st, k), col.resolve(&wb.theme).unwrap_or([255, 255, 255])))
+                            .map(|(k, col)| (threshold(wb, sheet, c, st, k), col.resolve(&wb.theme).unwrap_or([255, 255, 255])))
                             .collect();
                         let rgb = match pts.as_slice() {
                             [(a, ca), (b, cb)] => lerp(*ca, *cb, if b > a { (n - a) / (b - a) } else { 0.0 }),
@@ -239,9 +264,9 @@ impl CfCache {
                     None
                 }
                 CfRule::DataBar { min, max, color, gradient, show_value } => {
-                    if let Some(n) = v.as_f64() {
-                        let lo = threshold(wb, sheet, c, &st, min);
-                        let hi = threshold(wb, sheet, c, &st, max);
+                    if let (Some(n), Some(st)) = (v.as_f64(), st) {
+                        let lo = threshold(wb, sheet, c, st, min);
+                        let hi = threshold(wb, sheet, c, st, max);
                         let lo = if lo > 0.0 { 0.0 } else { lo };
                         let frac = if hi > lo { ((n - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 1.0 };
                         if out.bar.is_none() {
@@ -257,7 +282,7 @@ impl CfCache {
                     None
                 }
                 CfRule::IconSet { set, thresholds, reverse, show_value } => {
-                    if let Some(n) = v.as_f64() {
+                    if let (Some(n), Some(st)) = (v.as_f64(), st) {
                         let k = icon_count(set);
                         // One threshold per icon, the first being the lower bound (as in the file);
                         // also accept the lower bound left out, else Excel's defaults.
@@ -270,7 +295,7 @@ impl CfCache {
                                 defaults.get(1..).unwrap_or_default()
                             }
                         };
-                        let cuts: Vec<f64> = lower.iter().map(|t| threshold(wb, sheet, c, &st, t)).collect();
+                        let cuts: Vec<f64> = lower.iter().map(|t| threshold(wb, sheet, c, st, t)).collect();
                         let mut idx = cuts.iter().filter(|cut| n >= **cut).count();
                         if *reverse {
                             idx = k - 1 - idx.min(k - 1);
@@ -297,7 +322,9 @@ impl CfCache {
                 }
             }
         }
-        any.then_some(out)
+        let res = any.then_some(out);
+        self.cell_cache.insert(c, res.clone());
+        res
     }
 }
 

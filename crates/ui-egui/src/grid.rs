@@ -153,6 +153,8 @@ pub struct GridState {
     pub line_index_cache: Option<((u64, u64, usize), Arc<LineIndex>, Arc<LineIndex>, Arc<crate::outline::Axis>, Arc<crate::outline::Axis>)>,
     /// Used range cached per (doc uid, revision, sheet).
     pub used_range_cache: Option<((u64, u64, usize), Option<RangeRef>)>,
+    /// Conditional formatting cache, cached per (doc uid, revision, sheet).
+    pub cf_cache: Option<((u64, u64, usize), CfCache)>,
 }
 
 /// Ctrl+wheel zoom for one (doc uid, sheet). egui eases a notch in over several frames and
@@ -581,12 +583,12 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     };
     let resp = ui.allocate_rect(rect, Sense::click_and_drag());
     app.grid.rect = Some(rect);
-    let Some(d) = app.session.active() else { return };
-    let wb: Arc<Workbook> = d.wb.clone();
-    let si = wb.active_sheet;
+    let (uid, revision, wb, si, sel) = {
+        let Some(d) = app.session.active() else { return };
+        (d.uid, d.revision, d.wb.clone(), d.wb.active_sheet, d.selection.clone())
+    };
     let Some(sh) = wb.sheet(si) else { return };
-    let sel = d.selection.clone();
-    let place = (d.uid, si);
+    let place = (uid, si);
     let mut view = app.view();
     // Page Layout view: pages on a desk, rulers above and left of the headings.
     let paper = sh.view == gridcraft_engine::model::SheetViewMode::PageLayout;
@@ -598,7 +600,7 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         Rect::from_min_max(pos2((rect.left() + ruler).min(rect.right()), (rect.top() + ruler).min(rect.bottom())), rect.max)
     };
     let (ri, ci, ro, co) = {
-        let key = (d.uid, d.revision, si);
+        let key = (uid, revision, si);
         if let Some((k, ri, ci, ro, co)) = &app.grid.line_index_cache
             && *k == key
         {
@@ -685,7 +687,7 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         app.grid.wheel_zoom = Some(zooming);
     }
     view.scroll = view.scroll.max(egui::Vec2::ZERO);
-    let (mut max_x, mut max_y) = (sh.col_left(MAX_COLS - 20) as f32, sh.row_top(MAX_ROWS - 40) as f32);
+    let (mut max_x, mut max_y) = (ci.start(MAX_COLS - 20) as f32, ri.start(MAX_ROWS - 40) as f32);
     if paper {
         // Page layout units run past sheet units (margins and gaps); the end is known once the
         // pages reach the last row / column.
@@ -751,12 +753,17 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     painter.rect_filled(rect, 0.0, t.grid_bg);
     // Everything up to the headers is painted in logical (left-to-right) coordinates.
     let mirror_from = painter.add(egui::Shape::Noop);
-    let mut cf = CfCache::new();
+    let key = (uid, revision, si);
+    let mut cf = match app.grid.cf_cache.take() {
+        Some((k, cache)) if k == key => cache,
+        _ => CfCache::new(),
+    };
     let quads = if geo.paper.is_some() {
         crate::paper_view::paint_pages(app, &painter, &geo, &wb, si, sh, &sel, outline, &mut cf, &t)
     } else {
         paint_panes(app, &painter, &geo, &wb, si, sh, &sel, outline, &mut cf, &t)
     };
+    app.grid.cf_cache = Some((key, cf));
     // Objects above cells.
     let objects = crate::chartview::paint_objects(app, &painter.with_clip_rect(geo.cells), &geo, &wb, si, sh);
     paint_overlays(app, ui, &painter.with_clip_rect(geo.cells), &geo, &wb, si, sh, &sel);
