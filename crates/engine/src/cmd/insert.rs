@@ -408,22 +408,7 @@ fn table_flag(s: &mut Session, p: &Json, which: &str) -> Result<Json> {
 
 /// Writes the totals row cells (labels and SUBTOTAL formulas).
 fn write_totals(sh: &mut Sheet, ti: usize) {
-    let Some(t) = sh.tables.get(ti).cloned() else { return };
-    if !t.totals_row {
-        return;
-    }
-    let row = t.range.end.row;
-    for (i, col) in t.columns.iter().enumerate() {
-        let c = CellRef::new(row, t.range.start.col + i as u32);
-        if let Some(code) = col.totals.subtotal_code() {
-            let f = format!("=SUBTOTAL({code},{}[{}])", t.name, col.name);
-            sh.set_cell(c, Cell { formula: Some(std::sync::Arc::new(Formula::new(&f))), value: gridcraft_core::Value::Empty, style: sh.style_id(c) });
-        } else if let Some(l) = &col.totals_label {
-            sh.set_value(c, gridcraft_core::Value::text(l.as_str()));
-        } else {
-            sh.remove_cell(c);
-        }
-    }
+    crate::tables::write_totals(sh, ti);
 }
 
 fn table_total_fn(s: &mut Session, p: &Json) -> Result<Json> {

@@ -1,7 +1,7 @@
 //! Table styles: how a cell inside a table looks (our own palettes, keyed by the familiar
 //! `TableStyleLight1…21 / Medium1…28 / Dark1…11` names so files round-trip).
 
-use gridcraft_core::{CellRef, RangeRef};
+use gridcraft_core::{CellRef, RangeRef, MAX_ROWS};
 use gridcraft_model::*;
 
 /// (family, number) from a style name, e.g. `TableStyleMedium2` → ("Medium", 2).
@@ -251,6 +251,208 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
     cx.structural = true;
 }
 
+/// Writes the totals row cells (labels and SUBTOTAL formulas).
+pub(crate) fn write_totals(sh: &mut gridcraft_model::Sheet, ti: usize) {
+    let Some(t) = sh.tables.get(ti).cloned() else { return };
+    if !t.totals_row {
+        return;
+    }
+    let row = t.range.end.row;
+    for (i, col) in t.columns.iter().enumerate() {
+        let c = CellRef::new(row, t.range.start.col + i as u32);
+        if let Some(code) = col.totals.subtotal_code() {
+            let f = format!("=SUBTOTAL({code},{}[{}])", t.name, col.name);
+            sh.set_cell(c, Cell {
+                formula: Some(std::sync::Arc::new(Formula::new(&f))),
+                value: gridcraft_core::Value::Empty,
+                style: sh.style_id(c),
+            });
+        } else if let Some(l) = &col.totals_label {
+            sh.set_value(c, gridcraft_core::Value::text(l.as_str()));
+        } else {
+            sh.remove_cell(c);
+        }
+    }
+}
+
+/// When cells are entered or pasted adjacent to or inside an existing table, the table automatically
+/// expands to incorporate the new rows and propagates calculated column formulas and cell styles down.
+pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
+    if cx.wb.sheets.iter().all(|s| s.tables.is_empty()) {
+        return;
+    }
+
+    let sheet_count = cx.wb.sheets.len();
+    for si in 0..sheet_count {
+        let num_tables = cx.wb.sheet(si).map_or(0, |sh| sh.tables.len());
+        if num_tables == 0 {
+            continue;
+        }
+
+        // Changed cells on this sheet
+        let sheet_changed: Vec<CellRef> = cx.changed.iter().filter(|(s, _)| *s == si).map(|(_, c)| *c).collect();
+        if sheet_changed.is_empty() {
+            continue;
+        }
+
+        for ti in 0..num_tables {
+            let Some(t) = cx.wb.sheet(si).and_then(|sh| sh.tables.get(ti).cloned()) else { continue };
+            let c0 = t.range.start.col;
+            let c1 = t.range.end.col;
+            let header_offset = if t.header_row { 1 } else { 0 };
+            let data_start = t.range.start.row + header_offset;
+            let data_end = if t.totals_row { t.range.end.row.saturating_sub(1) } else { t.range.end.row };
+
+            // Check if any changed cell on this sheet touches this table's columns
+            let touches_table_cols = sheet_changed.iter().any(|c| c.col >= c0 && c.col <= c1);
+            if !touches_table_cols {
+                continue;
+            }
+
+            // Find contiguous non-empty rows extending beyond data_end
+            let Some(sh) = cx.wb.sheet(si) else { continue };
+            let has_content = |c: CellRef| -> bool {
+                sh.cell(c).is_some_and(|cl| !cl.value.is_empty() || cl.formula.is_some())
+            };
+
+            let mut curr_end = data_end;
+            while curr_end + 1 < MAX_ROWS {
+                let next_row = curr_end + 1;
+
+                // Stop if next_row intersects any other table on this sheet
+                if sh.tables.iter().enumerate().any(|(other_ti, other)| {
+                    other_ti != ti && other.range.contains(CellRef::new(next_row, c0))
+                }) {
+                    break;
+                }
+
+                // Check if next_row has non-empty content in the table's columns
+                let row_has_content = (c0..=c1).any(|col| has_content(CellRef::new(next_row, col)));
+                if !row_has_content {
+                    break;
+                }
+
+                // Ensure next_row is either part of changed cells or contiguous from an expanded row
+                let row_changed = sheet_changed.iter().any(|c| c.row == next_row && c.col >= c0 && c.col <= c1);
+                if curr_end > data_end || row_changed {
+                    curr_end = next_row;
+                } else {
+                    break;
+                }
+            }
+
+            if curr_end <= data_end {
+                continue;
+            }
+
+            let new_data_end = curr_end;
+            let old_data_end = data_end;
+            let old_template_row = if old_data_end >= data_start { old_data_end } else { t.range.start.row };
+
+            // Collect template formulas and styles from old_template_row or column metadata
+            let mut col_formulas = Vec::new();
+            let mut col_styles = Vec::new();
+
+            for (col_idx, table_col) in t.columns.iter().enumerate() {
+                let col = c0 + col_idx as u32;
+                let template_cell = CellRef::new(old_template_row, col);
+                let template_formula = if old_template_row >= data_start {
+                    sh.cell(template_cell).and_then(|c| c.formula.clone())
+                } else {
+                    None
+                };
+                let col_formula_str = table_col.formula.clone();
+                col_formulas.push((template_formula, col_formula_str));
+                col_styles.push(sh.style_id(template_cell));
+            }
+
+            let old_table_range = t.range;
+            let new_end_row = if t.totals_row { new_data_end + 1 } else { new_data_end };
+
+            let Some(shm) = cx.wb.sheet_mut(si) else { continue };
+
+            // Populate formulas & styles in the expanded rows
+            let mut new_touched = Vec::new();
+            for r in (old_data_end + 1)..=new_data_end {
+                for (col_idx, (template_formula, col_formula_str)) in col_formulas.iter().enumerate() {
+                    let col = c0 + col_idx as u32;
+                    let target_cell = CellRef::new(r, col);
+                    let is_empty = shm.cell(target_cell).map_or(true, |c| c.value.is_empty() && c.formula.is_none());
+                    let style = col_styles[col_idx];
+
+                    if is_empty {
+                        let new_formula: Option<Formula> = if let Some(tf) = template_formula {
+                            let dr = (r as i64) - (old_template_row as i64);
+                            if let Some(expr) = tf.expr() {
+                                let shifted = gridcraft_formula::adjust::shift_relative(expr, dr, 0);
+                                Some(Formula::from_expr(shifted))
+                            } else {
+                                Some(Formula::new(&tf.text))
+                            }
+                        } else if let Some(f_str) = col_formula_str {
+                            let f = Formula::new(f_str);
+                            if let Some(expr) = f.expr() {
+                                let base_row = data_start as i64;
+                                let dr = (r as i64) - base_row;
+                                let shifted = gridcraft_formula::adjust::shift_relative(expr, dr, 0);
+                                Some(Formula::from_expr(shifted))
+                            } else {
+                                Some(f)
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(formula) = new_formula {
+                            shm.set_cell(target_cell, Cell {
+                                value: gridcraft_core::Value::Empty,
+                                formula: Some(std::sync::Arc::new(formula)),
+                                style,
+                            });
+                            new_touched.push(target_cell);
+                        } else if shm.style_id(target_cell) != style {
+                            if let Some(cl) = shm.cells.get_mut(target_cell) {
+                                cl.style = style;
+                            } else {
+                                shm.set_cell(target_cell, Cell {
+                                    value: gridcraft_core::Value::Empty,
+                                    formula: None,
+                                    style,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update table range
+            if let Some(tbl) = shm.tables.get_mut(ti) {
+                tbl.range.end.row = new_end_row;
+            }
+
+            // If totals row was on, rewrite it at the new totals row position
+            if t.totals_row {
+                write_totals(shm, ti);
+                for col in c0..=c1 {
+                    new_touched.push(CellRef::new(new_end_row, col));
+                }
+            }
+
+            // Update sheet autofilter range if it was matching the old table range
+            if let Some(af) = shm.autofilter.as_mut() {
+                if af.range == old_table_range {
+                    af.range.end.row = new_end_row;
+                }
+            }
+
+            for cell in new_touched {
+                cx.touch(si, cell);
+            }
+            cx.structural = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gridcraft_core::Value;
@@ -291,6 +493,66 @@ mod tests {
         s.execute("range.setValues", json!({"range": "A1", "values": [["a", "b"], [1, 2], [3, 4]]})).unwrap();
         s.execute("insert.table", json!({"range": "A1:B3", "header": true})).unwrap();
         assert_eq!(s.execute("edit.goTo", json!({"reference": "Table1"})).unwrap()["selection"], "A2:B3");
+    }
+
+    #[test]
+    fn typing_below_table_auto_expands_and_propagates_formulas() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Item", "Price", "Double"], ["A", 10, "=B2*2"]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
+
+        let t = &s.doc().unwrap().wb.sheet(0).unwrap().tables[0];
+        assert_eq!(t.range.a1(), "A1:C2");
+
+        // Enter "B" into A3 (immediately below table)
+        s.execute("cell.set", json!({"cell": "A3", "input": "B"})).unwrap();
+        s.execute("cell.set", json!({"cell": "B3", "input": "25"})).unwrap();
+
+        let t = &s.doc().unwrap().wb.sheet(0).unwrap().tables[0];
+        assert_eq!(t.range.a1(), "A1:C3");
+
+        // Check that C3 has the propagated formula "=B3*2" and evaluated value 50.0
+        let c3 = s.execute("cell.get", json!({"cell": "C3"})).unwrap();
+        assert_eq!(c3["formula"], "=B3*2");
+        assert_eq!(c3["value"], json!(50.0));
+    }
+
+    #[test]
+    fn pasting_column_auto_expands_table_and_evaluates_all_rows() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Code", "Qty", "Total"], ["P1", 2, "=B2*10"]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:C2", "header": true})).unwrap();
+
+        // Paste into A3 (A3..B5)
+        s.execute("edit.paste", json!({"at": "A3", "text": "P2\t5\nP3\t7\nP4\t10"})).unwrap();
+
+        let t = &s.doc().unwrap().wb.sheet(0).unwrap().tables[0];
+        assert_eq!(t.range.a1(), "A1:C5");
+
+        // Verify formula propagation and calculations
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+        assert_eq!(get(&mut s, "C3")["formula"], "=B3*10");
+        assert_eq!(get(&mut s, "C3")["value"], json!(50.0));
+        assert_eq!(get(&mut s, "C4")["formula"], "=B4*10");
+        assert_eq!(get(&mut s, "C4")["value"], json!(70.0));
+        assert_eq!(get(&mut s, "C5")["formula"], "=B5*10");
+        assert_eq!(get(&mut s, "C5")["value"], json!(100.0));
+    }
+
+    #[test]
+    fn edit_not_adjacent_does_not_expand_table() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Item", "Val"], ["A", 1]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B2", "header": true})).unwrap();
+
+        // Enter cell at A10 (far below table)
+        s.execute("cell.set", json!({"cell": "A10", "input": "Far"})).unwrap();
+
+        let t = &s.doc().unwrap().wb.sheet(0).unwrap().tables[0];
+        assert_eq!(t.range.a1(), "A1:B2");
     }
 }
 

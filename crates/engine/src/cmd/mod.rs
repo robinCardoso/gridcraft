@@ -321,6 +321,7 @@ pub(crate) fn edit<R>(s: &mut Session, f: impl FnOnce(&mut Ctx) -> Result<R>) ->
     commit(d, |cx| {
         let r = f(cx)?;
         crate::tables::sync_headers(cx);
+        crate::tables::auto_expand_tables(cx);
         Ok(r)
     })
 }
