@@ -256,7 +256,7 @@ fn lower_chars(s: &str) -> Vec<char> {
 }
 
 /// Whether the pattern contains an unescaped wildcard.
-pub(crate) fn has_wildcards(pattern: &str) -> bool {
+pub fn has_wildcards(pattern: &str) -> bool {
     tokenize(pattern).iter().any(|t| !matches!(t, Tok::Char(_))) || pattern.contains('~')
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn wildcard_find(pattern: &str, text: &str, start: usize) -> Option<u
 
 /// Exact-or-wildcard equality used by MATCH/VLOOKUP/XLOOKUP exact modes: text with wildcards
 /// matches by pattern (only when `wild`), otherwise values compare case-insensitively.
-pub(crate) fn lookup_equal(needle: &Value, hay: &Value, wild: bool) -> bool {
+pub fn lookup_equal(needle: &Value, hay: &Value, wild: bool) -> bool {
     match (needle, hay) {
         (Value::Text(p), Value::Text(t)) => {
             if wild {

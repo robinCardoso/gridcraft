@@ -48,7 +48,7 @@ fn find_exact(x: &Value, hay: &[Value], wild: bool, reverse: bool) -> Option<usi
 /// `HLOOKUP("STRING", {"INTEGRAL","DOUBLE","BLANK","STRING","REF","AREA (rows)",<blank>}, …)`
 /// finds "STRING" and `LOOKUP("DOUBLE", {"DOUBLE","BLANK","STRING","REF","AREA (rows)"}, …)`
 /// finds "DOUBLE". Work is linear in the vector length at worst.
-fn bsearch_last(x: &Value, hay: &[Value], desc: bool) -> Option<usize> {
+pub fn bsearch_last(x: &Value, hay: &[Value], desc: bool) -> Option<usize> {
     let mut hi = hay.len().checked_sub(1)?;
     let mut lo = 0usize;
     let mut best = None;
@@ -139,11 +139,21 @@ fn vh_lookup(args: &[Arg], vertical: bool) -> R<Value> {
     }
     let idx = idx.trunc() as usize - 1;
     let approx = opt_bool(args, 3, true)?;
-    let (keys, len) = if vertical { (column(&table, 0), table.cols) } else { (row(&table, 0), table.rows) };
+    let len = if vertical { table.cols } else { table.rows };
     if idx >= len {
         return Err(CellError::Ref);
     }
-    let pos = if approx { bsearch_last(&x, &keys, false) } else { find_exact(&x, &keys, true, false) };
+    let pos = if approx {
+        let (keys, _) = if vertical { (column(&table, 0), table.cols) } else { (row(&table, 0), table.rows) };
+        bsearch_last(&x, &keys, false)
+    } else {
+        let wild = matches!(&x, Value::Text(t) if has_wildcards(t));
+        if vertical {
+            (0..table.rows).find(|&r| lookup_equal(&x, table.get(r, 0).unwrap_or(&Value::Empty), wild))
+        } else {
+            (0..table.cols).find(|&c| lookup_equal(&x, table.get(0, c).unwrap_or(&Value::Empty), wild))
+        }
+    };
     let pos = pos.ok_or(CellError::NA)?;
     let v = if vertical { table.get(pos, idx) } else { table.get(idx, pos) };
     Ok(cell_result(v.cloned().unwrap_or(Value::Empty)))

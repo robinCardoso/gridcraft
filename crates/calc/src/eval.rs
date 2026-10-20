@@ -649,6 +649,85 @@ impl<'h> Evaluator<'h> {
                 }
                 if rest.len() % 2 == 1 { rest.last().map_or(err(CellError::NA), |d| self.eval(d)) } else { err(CellError::NA) }
             }
+            "VLOOKUP" | "HLOOKUP" => {
+                if args.len() < 3 || args.len() > 4 {
+                    return err(CellError::Value);
+                }
+                let table_ev = self.eval(&args[1]);
+                let Ev::R(areas) = &table_ev else {
+                    return self.builtin(name, args);
+                };
+                let [area] = areas.as_slice() else {
+                    return err(CellError::Value);
+                };
+                let x = self.arg_val(args, 0).unwrap_or_default().scalar();
+                if let Value::Error(e) = x {
+                    return err(e);
+                }
+                let needle = if matches!(x, Value::Empty) { Value::Number(0.0) } else { x };
+                let idx_num = match self.arg_num(args, 2, 0.0) {
+                    Ok(n) => n,
+                    Err(e) => return err(e),
+                };
+                if idx_num < 1.0 {
+                    return err(CellError::Value);
+                }
+                let idx = idx_num.trunc() as usize - 1;
+                let approx = match args.get(3) {
+                    Some(Expr::Missing) | None => true,
+                    Some(e) => match self.value(e).scalar().to_bool() {
+                        Ok(b) => b,
+                        Err(e) => return err(e),
+                    },
+                };
+                let is_vertical = name == "VLOOKUP";
+                let len = if is_vertical { area.range.width() as usize } else { area.range.height() as usize };
+                if idx >= len {
+                    return err(CellError::Ref);
+                }
+                let trimmed = self.trim(area);
+                if is_vertical {
+                    let search_col = area.range.start.col;
+                    let return_col = area.range.start.col + idx as u32;
+                    let match_row = if approx {
+                        let keys: Vec<Value> = (trimmed.start.row..=trimmed.end.row)
+                            .map(|r| self.host.cell_value(area.sheet, CellRef::new(r, search_col)))
+                            .collect();
+                        gridcraft_functions::bsearch_last(&needle, &keys, false).map(|i| trimmed.start.row + i as u32)
+                    } else {
+                        let wild = matches!(&needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
+                        (trimmed.start.row..=trimmed.end.row).find(|&r| {
+                            let key = self.host.cell_value(area.sheet, CellRef::new(r, search_col));
+                            gridcraft_functions::lookup_equal(&needle, &key, wild)
+                        })
+                    };
+                    let Some(r) = match_row else {
+                        return err(CellError::NA);
+                    };
+                    let val = self.host.cell_value(area.sheet, CellRef::new(r, return_col));
+                    Ev::V(if val.is_empty() { Value::Number(0.0) } else { val })
+                } else {
+                    let search_row = area.range.start.row;
+                    let return_row = area.range.start.row + idx as u32;
+                    let match_col = if approx {
+                        let keys: Vec<Value> = (trimmed.start.col..=trimmed.end.col)
+                            .map(|c| self.host.cell_value(area.sheet, CellRef::new(search_row, c)))
+                            .collect();
+                        gridcraft_functions::bsearch_last(&needle, &keys, false).map(|i| trimmed.start.col + i as u32)
+                    } else {
+                        let wild = matches!(&needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
+                        (trimmed.start.col..=trimmed.end.col).find(|&c| {
+                            let key = self.host.cell_value(area.sheet, CellRef::new(search_row, c));
+                            gridcraft_functions::lookup_equal(&needle, &key, wild)
+                        })
+                    };
+                    let Some(c) = match_col else {
+                        return err(CellError::NA);
+                    };
+                    let val = self.host.cell_value(area.sheet, CellRef::new(return_row, c));
+                    Ev::V(if val.is_empty() { Value::Number(0.0) } else { val })
+                }
+            }
             "ROW" | "COLUMN" => {
                 let is_row = name == "ROW";
                 if args.is_empty() || matches!(args.first(), Some(Expr::Missing)) {

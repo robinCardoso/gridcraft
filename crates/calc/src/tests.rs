@@ -432,6 +432,45 @@ fn choose_with_an_array_index() {
 }
 
 #[test]
+fn vlookup_and_hlookup_on_range_references() {
+    let mut t = T::new();
+    t.set("A1", "Code");
+    t.set("B1", "Name");
+    t.set("C1", "Price");
+
+    t.set("A2", "10023AN");
+    t.set("B2", "JUNTA");
+    t.set("C2", "7.76");
+
+    t.set("A3", "60660orsc");
+    t.set("B3", "JG.JTAS.");
+    t.set("C3", "807.48");
+
+    // Exact match VLOOKUP on full column or block range
+    t.set("E1", "=VLOOKUP(\"10023AN\", A1:C3, 2, FALSE)");
+    assert_eq!(t.get("E1"), Value::from("JUNTA"));
+
+    t.set("E2", "=VLOOKUP(\"60660orsc\", A1:C3, 3, FALSE)");
+    assert_eq!(t.num("E2"), 807.48);
+
+    // Case-insensitive exact match
+    t.set("E3", "=VLOOKUP(\"60660ORSC\", A1:C3, 2, FALSE)");
+    assert_eq!(t.get("E3"), Value::from("JG.JTAS."));
+
+    // Not found returns #N/A
+    t.set("E4", "=VLOOKUP(\"MISSING\", A1:C3, 2, FALSE)");
+    assert_eq!(t.get("E4"), Value::Error(CellError::NA));
+
+    // Column out of bounds returns #REF!
+    t.set("E5", "=VLOOKUP(\"10023AN\", A1:C3, 4, FALSE)");
+    assert_eq!(t.get("E5"), Value::Error(CellError::Ref));
+
+    // HLOOKUP
+    t.set("E6", "=HLOOKUP(\"Price\", A1:C3, 2, FALSE)");
+    assert_eq!(t.num("E6"), 7.76);
+}
+
+#[test]
 fn references_functions() {
     let mut t = T::new();
     for (i, v) in [10, 20, 30, 40].iter().enumerate() {
