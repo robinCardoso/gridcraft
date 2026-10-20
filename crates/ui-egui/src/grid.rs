@@ -149,6 +149,10 @@ pub struct GridState {
     pub hscroll: Option<Rect>,
     /// Ctrl+wheel zoom in progress (see [`WheelZoom`]).
     pub wheel_zoom: Option<WheelZoom>,
+    /// Prefix sums over row heights and column widths, cached per (doc uid, revision, sheet).
+    pub line_index_cache: Option<((u64, u64, usize), Arc<LineIndex>, Arc<LineIndex>, Arc<crate::outline::Axis>, Arc<crate::outline::Axis>)>,
+    /// Used range cached per (doc uid, revision, sheet).
+    pub used_range_cache: Option<((u64, u64, usize), Option<RangeRef>)>,
 }
 
 /// Ctrl+wheel zoom for one (doc uid, sheet). egui eases a notch in over several frames and
@@ -218,20 +222,24 @@ pub struct Geo {
 }
 
 impl Geo {
-    pub fn new(sh: &Sheet, rect: Rect, scroll: egui::Vec2) -> Geo {
+    pub fn with_indices(
+        sh: &Sheet,
+        rect: Rect,
+        scroll: egui::Vec2,
+        ri: std::sync::Arc<LineIndex>,
+        ci: std::sync::Arc<LineIndex>,
+        row_outline: Arc<crate::outline::Axis>,
+        col_outline: Arc<crate::outline::Axis>,
+    ) -> Geo {
         let zoom = (sh.zoom as f32 / 100.0).clamp(0.1, 4.0);
         let z = zoom * DISPLAY_SCALE;
         let header_h = if sh.show_headings { (COL_HEADER_H * zoom.max(0.75)).round() } else { 0.0 };
-        let ri = std::sync::Arc::new(LineIndex::new(&sh.rows, sh.default_row_height, MAX_ROWS));
-        let ci = std::sync::Arc::new(LineIndex::new(&sh.cols, sh.default_col_width, MAX_COLS));
         let last_row = ri.at((scroll.y + rect.height() / z) as f64 + 200.0) + 1;
         let digits = (last_row as f32).log10().floor() as i32 + 1;
         let header_w = if sh.show_headings { ((digits.max(2) as f32 * 7.0 + 14.0) * zoom.max(0.75)).round() } else { 0.0 };
         let (fr, fc) = sh.freeze.unwrap_or((0, 0));
         let frozen_w = (ci.start(fc) as f32) * z;
         let frozen_h = (ri.start(fr) as f32) * z;
-        let row_outline = Arc::new(crate::outline::Axis::new(&sh.rows));
-        let col_outline = Arc::new(crate::outline::Axis::new(&sh.cols));
         let mut band_w = crate::outline::band(row_outline.levels, zoom);
         let mut band_h = crate::outline::band(col_outline.levels, zoom);
         // Without headings the level buttons still need a corner to sit in.
@@ -262,6 +270,14 @@ impl Geo {
             ci,
             paper: None,
         }
+    }
+
+    pub fn new(sh: &Sheet, rect: Rect, scroll: egui::Vec2) -> Geo {
+        let ri = std::sync::Arc::new(LineIndex::new(&sh.rows, sh.default_row_height, MAX_ROWS));
+        let ci = std::sync::Arc::new(LineIndex::new(&sh.cols, sh.default_col_width, MAX_COLS));
+        let row_outline = Arc::new(crate::outline::Axis::new(&sh.rows));
+        let col_outline = Arc::new(crate::outline::Axis::new(&sh.cols));
+        Self::with_indices(sh, rect, scroll, ri, ci, row_outline, col_outline)
     }
     /// Left edge of the row headers (right of the outline band).
     pub fn head_left(&self) -> f32 {
@@ -581,15 +597,30 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     } else {
         Rect::from_min_max(pos2((rect.left() + ruler).min(rect.right()), (rect.top() + ruler).min(rect.bottom())), rect.max)
     };
+    let (ri, ci, ro, co) = {
+        let key = (d.uid, d.revision, si);
+        if let Some((k, ri, ci, ro, co)) = &app.grid.line_index_cache
+            && *k == key
+        {
+            (ri.clone(), ci.clone(), ro.clone(), co.clone())
+        } else {
+            let ri = std::sync::Arc::new(LineIndex::new(&sh.rows, sh.default_row_height, MAX_ROWS));
+            let ci = std::sync::Arc::new(LineIndex::new(&sh.cols, sh.default_col_width, MAX_COLS));
+            let ro = Arc::new(crate::outline::Axis::new(&sh.rows));
+            let co = Arc::new(crate::outline::Axis::new(&sh.cols));
+            app.grid.line_index_cache = Some((key, ri.clone(), ci.clone(), ro.clone(), co.clone()));
+            (ri, ci, ro, co)
+        }
+    };
     let make_geo = |app: &mut SheetApp, scroll: egui::Vec2| -> Geo {
         if paper {
-            let probe = Geo::new(sh, grid_rect, scroll);
+            let probe = Geo::with_indices(sh, grid_rect, scroll, ri.clone(), ci.clone(), ro.clone(), co.clone());
             if let Some(g) = crate::paper_view::grid_for(app, &wb, si, sh, probe.cells.size(), scroll) {
                 let g = crate::paper_view::with_dragged_margin(app, &wb, si, g);
                 return Geo::paged(sh, grid_rect, scroll, g);
             }
         }
-        Geo::new(sh, rect, scroll)
+        Geo::with_indices(sh, rect, scroll, ri.clone(), ci.clone(), ro.clone(), co.clone())
     };
     // Scrolling.
     let (scroll_delta, zoom_delta, modifiers, now) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers, i.time));
@@ -826,7 +857,17 @@ fn vertical_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, sh: &Sheet, geo: &G
     }
     let visible = track.height() / geo.z;
     let scroll = app.view().scroll.y;
-    let last = sh.used_range().map(|r| r.end.row.saturating_add(10)).unwrap_or(100).clamp(100, MAX_ROWS - 1);
+    let last = {
+        let key = app.session.active().map(|d| (d.uid, d.revision, d.wb.active_sheet)).unwrap_or((0, 0, 0));
+        let r = if let Some((k, r)) = &app.grid.used_range_cache && *k == key {
+            *r
+        } else {
+            let r = sh.used_range();
+            app.grid.used_range_cache = Some((key, r));
+            r
+        };
+        r.map(|r| r.end.row.saturating_add(10)).unwrap_or(100).clamp(100, MAX_ROWS - 1)
+    };
     let content = geo.scroll_top_of(sh, last);
     let extent = (content - visible).max(scroll).max(0.0).min(limit);
     let id = ui.id().with("vscroll");
@@ -879,7 +920,17 @@ pub(crate) fn horizontal_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, track:
     let Some(sh) = wb.active() else { return };
     let visible = ((geo.cells.width() - geo.frozen_w) / geo.z).max(0.0);
     let scroll = app.view().scroll.x;
-    let last = sh.used_range().map(|r| r.end.col.saturating_add(10)).unwrap_or(26).clamp(26, MAX_COLS - 1);
+    let last = {
+        let key = app.session.active().map(|d| (d.uid, d.revision, d.wb.active_sheet)).unwrap_or((0, 0, 0));
+        let r = if let Some((k, r)) = &app.grid.used_range_cache && *k == key {
+            *r
+        } else {
+            let r = sh.used_range();
+            app.grid.used_range_cache = Some((key, r));
+            r
+        };
+        r.map(|r| r.end.col.saturating_add(10)).unwrap_or(26).clamp(26, MAX_COLS - 1)
+    };
     let content = geo.scroll_left_of(sh, last);
     let extent = (content - visible).max(scroll).max(0.0);
     let id = ui.id().with("hscroll");

@@ -399,10 +399,22 @@ impl crate::DocState {
         }
         // The active sheet is view state: change it without making the workbook dirty.
         let dirty = self.is_dirty();
-        let wb = std::sync::Arc::make_mut(&mut self.wb);
-        wb.active_sheet = i;
         if !dirty {
+            // Temporarily replace self.saved with a dummy Arc so that self.wb has strong_count == 1,
+            // avoiding an expensive deep clone of all sheets, cell tables, styles, and VBA project.
+            self.saved = std::sync::Arc::new(gridcraft_model::Workbook::new());
+            if let Some(wb) = std::sync::Arc::get_mut(&mut self.wb) {
+                wb.active_sheet = i;
+            } else {
+                let wb = std::sync::Arc::make_mut(&mut self.wb);
+                wb.active_sheet = i;
+            }
             self.saved = self.wb.clone();
+        } else if let Some(wb) = std::sync::Arc::get_mut(&mut self.wb) {
+            wb.active_sheet = i;
+        } else {
+            let wb = std::sync::Arc::make_mut(&mut self.wb);
+            wb.active_sheet = i;
         }
         self.selection = self.sheet_selections.get(i).cloned().unwrap_or_default();
     }

@@ -121,7 +121,7 @@ const UNDO_LIMIT: usize = 100;
 impl DocState {
     pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
         let mut calc = Calc::new();
-        calc.recalc_all(&mut wb);
+        calc.recalc_on_load(&mut wb);
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
@@ -158,21 +158,59 @@ impl DocState {
             return;
         }
         let dirty = self.is_dirty();
-        let wb = Arc::make_mut(&mut self.wb);
-        for (i, c) in tops {
-            if let Some(sh) = wb.sheets.get_mut(*i)
-                && sh.view_top_left != *c
-            {
-                Arc::make_mut(sh).view_top_left = *c;
-            }
-        }
-        if let Some(sh) = wb.sheets.get_mut(si)
-            && sh.view_active != active
-        {
-            Arc::make_mut(sh).view_active = active;
-        }
         if !dirty {
+            self.saved = Arc::new(Workbook::new());
+            if let Some(wb) = Arc::get_mut(&mut self.wb) {
+                for (i, c) in tops {
+                    if let Some(sh) = wb.sheets.get_mut(*i)
+                        && sh.view_top_left != *c
+                    {
+                        if let Some(sh_mut) = Arc::get_mut(sh) {
+                            sh_mut.view_top_left = *c;
+                        } else {
+                            Arc::make_mut(sh).view_top_left = *c;
+                        }
+                    }
+                }
+                if let Some(sh) = wb.sheets.get_mut(si)
+                    && sh.view_active != active
+                {
+                    if let Some(sh_mut) = Arc::get_mut(sh) {
+                        sh_mut.view_active = active;
+                    } else {
+                        Arc::make_mut(sh).view_active = active;
+                    }
+                }
+            } else {
+                let wb = Arc::make_mut(&mut self.wb);
+                for (i, c) in tops {
+                    if let Some(sh) = wb.sheets.get_mut(*i)
+                        && sh.view_top_left != *c
+                    {
+                        Arc::make_mut(sh).view_top_left = *c;
+                    }
+                }
+                if let Some(sh) = wb.sheets.get_mut(si)
+                    && sh.view_active != active
+                {
+                    Arc::make_mut(sh).view_active = active;
+                }
+            }
             self.saved = self.wb.clone();
+        } else {
+            let wb = Arc::make_mut(&mut self.wb);
+            for (i, c) in tops {
+                if let Some(sh) = wb.sheets.get_mut(*i)
+                    && sh.view_top_left != *c
+                {
+                    Arc::make_mut(sh).view_top_left = *c;
+                }
+            }
+            if let Some(sh) = wb.sheets.get_mut(si)
+                && sh.view_active != active
+            {
+                Arc::make_mut(sh).view_active = active;
+            }
         }
     }
     pub fn display_title(&self) -> String {

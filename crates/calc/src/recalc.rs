@@ -826,6 +826,32 @@ impl Calc {
         self.run(wb, all, true);
     }
 
+    /// Recalculates after loading: builds the dependency graph and only evaluates formulas
+    /// that do not already have a computed value or require dynamic-array spilling.
+    /// Formulas whose values were pre-calculated and saved by Excel are preserved instantly.
+    pub fn recalc_on_load(&mut self, wb: &mut Workbook) {
+        self.rebuild(wb);
+        for i in 0..wb.sheets.len() {
+            if wb.sheet(i).is_some_and(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty())
+                && let Some(sh) = wb.sheet_mut(i)
+            {
+                sh.spill.clear();
+                sh.spill_ranges.clear();
+            }
+        }
+        let mut needed: Vec<Key> = Vec::new();
+        for &k in self.graph.nodes.keys() {
+            if let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1)) {
+                if cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()) {
+                    needed.push(k);
+                }
+            }
+        }
+        if !needed.is_empty() {
+            self.run(wb, needed, false);
+        }
+    }
+
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
