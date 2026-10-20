@@ -47,16 +47,25 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paste",
             ["Home", "Clipboard"],
             Some("Cmd+V"),
-            "{at?: \"C3\", text?: \"tab-separated text from the system clipboard\", html?: \"the clipboard's HTML flavour; cells the source recorded as numbers (x:num, sdval) stay numbers\"}",
+            "{at?: \"C3\", text?: \"tab-separated text from the system clipboard\", html?: \"the clipboard's HTML flavour; cells the source recorded as numbers (x:num, sdval) stay numbers\", asText?: bool}",
             has_doc,
             paste
+        ),
+        cmd!(
+            "edit.pasteAsText",
+            "Paste as Text",
+            ["Home", "Clipboard"],
+            None,
+            "{at?: \"C3\", text?: \"...\"} — pastes clipboard content strictly as text, preserving leading zeros and setting the text format (@)",
+            has_doc,
+            paste_as_text
         ),
         cmd!(
             "edit.pasteSpecial",
             "Paste Special…",
             ["Home", "Clipboard"],
             Some("Ctrl+Cmd+V"),
-            "{what: all|formulas|values|formats|comments|validation|allExceptBorders|columnWidths|formulasAndNumberFormats|valuesAndNumberFormats, operation?: none|add|subtract|multiply|divide, skipBlanks?, transpose?, link?}",
+            "{what: all|formulas|values|text|formats|comments|validation|allExceptBorders|columnWidths|formulasAndNumberFormats|valuesAndNumberFormats, operation?: none|add|subtract|multiply|divide, skipBlanks?, transpose?, link?}",
             has_clipboard,
             paste_special
         ),
@@ -779,6 +788,7 @@ enum What {
     All,
     Formulas,
     Values,
+    Text,
     Formats,
     Comments,
     Validation,
@@ -788,35 +798,59 @@ enum What {
     ValuesAndNumberFormats,
 }
 
+fn paste_as_text(s: &mut Session, p: &Json) -> Result<Json> {
+    let mut p2 = p.clone();
+    p2["asText"] = json!(true);
+    paste(s, &p2)
+}
+
 fn paste(s: &mut Session, p: &Json) -> Result<Json> {
-    // External text (from the system clipboard) when it differs from ours.
-    if let Some(text) = str_param(p, "text")
-        && s.clipboard.as_ref().is_none_or(|c| c.text.trim_end_matches(['\r', '\n']) != text.trim_end_matches(['\r', '\n']))
-    {
-        return paste_text(s, p, text);
+    let as_text = bool_param(p, "asText").or_else(|| bool_param(p, "as_text")).unwrap_or(false)
+        || str_param(p, "what") == Some("text");
+
+    let clip_text = s.clipboard.as_ref().map(|c| c.text.clone());
+    // External text (from the system clipboard) when it differs from ours, or when asText is requested.
+    if let Some(text) = str_param(p, "text") {
+        if as_text || clip_text.as_ref().is_none_or(|c| c.trim_end_matches(['\r', '\n']) != text.trim_end_matches(['\r', '\n'])) {
+            return paste_text(s, p, text, as_text);
+        }
+    } else if as_text && let Some(text) = clip_text {
+        return paste_text(s, p, &text, true);
     }
     if s.clipboard.is_none() {
         return Err(EngineError::Other("Nothing to paste.".into()));
     }
-    paste_special(s, &json!({"what": "all", "at": p.get("at").cloned().unwrap_or(Json::Null)}))
+    let what = if as_text { "text" } else { "all" };
+    paste_special(s, &json!({"what": what, "at": p.get("at").cloned().unwrap_or(Json::Null)}))
 }
 
-fn paste_text(s: &mut Session, p: &Json, text: &str) -> Result<Json> {
+fn paste_text(s: &mut Session, p: &Json, text: &str, as_text: bool) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
     let at = cell_param_on(s, p, "at", sheet)?.unwrap_or(s.doc()?.selection.current().start);
     let rows: Vec<Vec<String>> = parse_tsv(text);
     // The HTML flavour, when the host passed it: the number behind each cell's shown text.
-    let html = str_param(p, "html").map(crate::clip_html::table_cells).unwrap_or_default();
+    let html = if as_text {
+        Vec::new()
+    } else {
+        str_param(p, "html").map(crate::clip_html::table_cells).unwrap_or_default()
+    };
     let h = rows.len();
     let w = rows.iter().map(Vec::len).max().unwrap_or(0);
     edit(s, |cx| {
         for (ri, row) in rows.iter().enumerate() {
             for (ci, v) in row.iter().enumerate() {
                 let Some(c) = at.offset(ri as i64, ci as i64) else { continue };
-                let mut cell = input_to_cell(v, sheet, c, &mut cx.wb).unwrap_or_else(|_| Some(Cell::value(Value::text(v.as_str()))));
-                if let Some(cl) = cell.as_mut() {
-                    numeric_from_html(cl, v, html.get(ri).and_then(|r| r.get(ci)), &mut cx.wb);
-                }
+                let cell = if as_text {
+                    let cur_style = cx.wb.sheet(sheet).map(|sh| sh.style_id(c)).unwrap_or_default();
+                    let text_style = cx.wb.styles.derive(cur_style, |st| st.num_fmt = gridcraft_model::NumFmt::new("@"));
+                    Some(Cell { value: Value::text(v.as_str()), formula: None, style: text_style })
+                } else {
+                    let mut cl = input_to_cell(v, sheet, c, &mut cx.wb).unwrap_or_else(|_| Some(Cell::value(Value::text(v.as_str()))));
+                    if let Some(cell) = cl.as_mut() {
+                        numeric_from_html(cell, v, html.get(ri).and_then(|r| r.get(ci)), &mut cx.wb);
+                    }
+                    cl
+                };
                 let sh = cx.sheet_mut(sheet)?;
                 match cell {
                     Some(cell) => sh.set_cell(c, cell),
@@ -913,6 +947,7 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
         "all" => What::All,
         "formulas" => What::Formulas,
         "values" => What::Values,
+        "text" => What::Text,
         "formats" => What::Formats,
         "comments" | "notes" => What::Comments,
         "validation" => What::Validation,
@@ -1058,6 +1093,14 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
                                         let nf = src_wb.styles.get(sc_cell.style).num_fmt.clone();
                                         new.style = cx.wb.styles.derive(old.style, |s| s.num_fmt = nf);
                                     }
+                                }
+                                What::Text => {
+                                    new_picture = src_picture.clone();
+                                    new.formula = None;
+                                    let code = src_wb.styles.get(sc_cell.style).num_fmt.as_str();
+                                    let text_str = crate::display::format(&src_val, code, &src_wb).text;
+                                    new.value = Value::text(text_str);
+                                    new.style = cx.wb.styles.derive(old.style, |s| s.num_fmt = gridcraft_model::NumFmt::new("@"));
                                 }
                                 What::Formats => new.style = map_style(sc_cell.style, &mut cx.wb),
                                 What::Comments | What::Validation | What::ColumnWidths => {}

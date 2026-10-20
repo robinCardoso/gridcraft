@@ -79,6 +79,23 @@ fn pasted_currency_text_keeps_the_number_from_the_clipboard_html() {
 }
 
 #[test]
+fn paste_as_text_preserves_leading_zeros() {
+    let mut s = s();
+    // Normal paste converts "0151510" to number 151510
+    s.execute("edit.paste", json!({"at": "A1", "text": "0151510\n00123\n"})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::number(151510.0));
+
+    // Paste as text preserves "0151510" as text and sets format to @
+    s.execute("edit.pasteAsText", json!({"at": "B1", "text": "0151510\n00123\n"})).unwrap();
+    assert_eq!(v(&s, "B1"), Value::text("0151510"));
+    assert_eq!(v(&s, "B2"), Value::text("00123"));
+    let d = s.doc().unwrap();
+    let sh = d.wb.active().unwrap();
+    let b1_style = sh.style_id(CellRef::parse("B1").unwrap());
+    assert_eq!(d.wb.styles.get(b1_style).num_fmt.as_str(), "@");
+}
+
+#[test]
 fn editing_a_name_renames_it_in_formulas() {
     // Name Manager › Edit…: `oldName` edits the name in place; formulas that use it follow.
     let mut s = s();

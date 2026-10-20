@@ -18,6 +18,7 @@ pub const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("file.options", "File", "Options", "Options"),
     // Home
     ("edit.paste", "Home", "Clipboard", "Paste"),
+    ("edit.pasteAsText", "Home", "Clipboard", "Paste as Text"),
     ("edit.pasteSpecial", "Home", "Clipboard", "Paste Special"),
     ("edit.cut", "Home", "Clipboard", "Cut"),
     ("edit.copy", "Home", "Clipboard", "Copy"),

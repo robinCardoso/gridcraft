@@ -4,6 +4,8 @@
 pub(super) fn translate(text: &str) -> Option<&'static str> {
     Some(match text {
         "Paste" => "Colar",
+        "Paste as Text" => "Colar como Texto",
+        "Text (keep leading zeros)" => "Texto (preservar zeros à esquerda)",
         "Paste Values" => "Colar Valores",
         "Paste Formulas" => "Colar Fórmulas",
         "Paste Formatting" => "Colar Formatação",

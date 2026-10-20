@@ -494,6 +494,8 @@ fn menu_items(app: &mut SheetApp, ui: &mut Ui, items: &[(&str, &str, serde_json:
                 app.open_dialog(d, p.clone());
             } else if *id == "edit.paste" {
                 app.paste_from_clipboard();
+            } else if *id == "edit.pasteAsText" {
+                app.paste_as_text();
             } else {
                 act(app, id, p.clone());
             }
@@ -546,6 +548,7 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
             ui,
             &[
                 ("Paste", "edit.paste", json!({})),
+                ("Paste as Text", "edit.pasteAsText", json!({})),
                 ("Paste Values", "edit.pasteSpecial", json!({"what": "values"})),
                 ("Paste Formulas", "edit.pasteSpecial", json!({"what": "formulas"})),
                 ("Paste Formatting", "edit.pasteSpecial", json!({"what": "formats"})),

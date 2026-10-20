@@ -2910,6 +2910,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                 ("Cut", "edit.cut"),
                 ("Copy", "edit.copy"),
                 ("Paste", "edit.paste"),
+                ("Paste as Text", "edit.pasteAsText"),
                 ("Paste Special…", "ui:pasteSpecial"),
                 ("-", ""),
                 ("Insert…", "ui:insertCells"),
@@ -2965,6 +2966,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                             app.copy_to_clipboard(ui.ctx(), id);
                         }
                         "edit.paste" => app.paste_from_clipboard(),
+                        "edit.pasteAsText" => app.paste_as_text(),
                         other => app.run_or_alert(other, json!({})),
                     }
                 }
@@ -3219,6 +3221,7 @@ fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
                             app.copy_to_clipboard(ui.ctx(), id);
                         }
                         "edit.paste" => app.paste_from_clipboard(),
+                        "edit.pasteAsText" => app.paste_as_text(),
                         other => app.run_or_alert(other, json!({})),
                     }
                 }

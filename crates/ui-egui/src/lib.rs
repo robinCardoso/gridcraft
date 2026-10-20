@@ -456,6 +456,18 @@ impl SheetApp {
         }
     }
 
+    /// Paste clipboard content strictly as text, preserving leading zeros and setting the text format (@).
+    pub fn paste_as_text(&mut self) {
+        if let Some(text) = self.system_clipboard_text() {
+            if self.session.clipboard.is_none() || self.clipboard_text_at_copy.as_ref() != Some(&text) {
+                self.cut_text = None;
+                self.run_or_alert("edit.paste", json!({"text": text, "asText": true}));
+                return;
+            }
+        }
+        self.run_or_alert("edit.pasteSpecial", json!({"what": "text"}));
+    }
+
     /// The system clipboard's plain text, with the line endings of egui's `Event::Paste` text.
     /// `None` when it holds no text or the host can't read it.
     fn system_clipboard_text(&mut self) -> Option<String> {

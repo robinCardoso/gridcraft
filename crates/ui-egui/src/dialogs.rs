@@ -297,6 +297,7 @@ impl Dialog {
                             ("all", "All"),
                             ("formulas", "Formulas (F)"),
                             ("values", "Values (V)"),
+                            ("text", "Text (keep leading zeros)"),
                             ("formats", "Formats (T)"),
                             ("comments", "Comments and notes (C)"),
                             ("validation", "Validation"),
