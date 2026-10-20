@@ -65,47 +65,15 @@ pub fn load_document(p: &Json, mut progress: Option<Box<dyn FnMut(&str) + Send>>
         }
         (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
     } else if let Some(path) = str_param(p, "path") {
-        let path_is_db = crate::dbfile::is_db_path(path);
-        let companion_db = if !path_is_db {
-            let p_path = std::path::Path::new(path);
-            let ext = p_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext.eq_ignore_ascii_case("xlsx") || ext.eq_ignore_ascii_case("xlsm") {
-                let db_cand = p_path.with_extension("db");
-                if db_cand.exists() {
-                    Some(db_cand.to_string_lossy().into_owned())
-                } else if let Ok(meta) = std::fs::metadata(path)
-                    && meta.len() > 3 * 1024 * 1024
-                {
-                    let db_str = db_cand.to_string_lossy().into_owned();
-                    if let Some(cb) = &mut progress {
-                        cb("Otimizando planilha grande para SQLite...");
-                    }
-                    let res = crate::dbfile::import_xlsx_with_progress(path, &db_str, &mut |sheet, rows| {
-                        if let Some(cb) = &mut progress {
-                            cb(&format!("Importando aba '{sheet}' ({rows} linhas)..."));
-                        }
-                    });
-                    if res.is_ok() { Some(db_str) } else { None }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        // A database is opened by path (SQLite needs the file, not its bytes).
-        let effective_path = companion_db.as_deref().unwrap_or(path);
-        let is_db = path_is_db || companion_db.is_some();
+        let is_db = crate::dbfile::is_db_path(path);
         if let Some(cb) = &mut progress {
             if is_db {
-                cb("Abrindo banco SQLite de alta performance...");
+                cb("Abrindo banco SQLite...");
             } else {
                 cb("Lendo dados do arquivo...");
             }
         }
-        (effective_path.to_string(), if is_db { Vec::new() } else { crate::io::read_file(path)? })
+        (path.to_string(), if is_db { Vec::new() } else { crate::io::read_file(path)? })
     } else {
         return Err(bad("file.open", "missing `path` or `base64`"));
     };
