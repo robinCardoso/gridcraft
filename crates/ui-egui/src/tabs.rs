@@ -333,18 +333,10 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                         }
                     }
                     // Calculation indicator and progress bar (Excel style)
-                    let calc_info = app.calc_status.or_else(|| {
-                        app.session.active().and_then(|d| {
-                            if d.calc.last_recalc_cells > 0 {
-                                Some((1.0, d.calc.last_recalc_cells, 0.0))
-                            } else {
-                                None
-                            }
-                        })
-                    });
-                    if let Some((progress, count, at)) = calc_info {
+                    if let Some((progress, count, at)) = app.calc_status {
                         let age = if at > 0.0 { crate::now_ms() - at } else { 0.0 };
-                        if at == 0.0 || age < 12000.0 || count > 100 {
+                        if age < 2500.0 {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
                             ui.add_space(8.0);
                             let (bar_rect, resp) = ui.allocate_exact_size(vec2(80.0, 10.0), Sense::hover());
                             ui.painter().rect_filled(bar_rect, 2.0, t.separator);
@@ -359,6 +351,8 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                             resp.on_hover_text(&tip);
                             ui.label(egui::RichText::new(msg).font(theme::ui_font(12.0)).color(t.text_dim)).on_hover_text(tip);
                             ui.add_space(8.0);
+                        } else {
+                            app.calc_status = None;
                         }
                     }
                 });
