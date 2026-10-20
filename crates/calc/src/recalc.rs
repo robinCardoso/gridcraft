@@ -191,6 +191,8 @@ pub struct Graph {
     nodes: HashMap<Key, Node>,
     /// single cell → dependents
     cell_deps: HashMap<Key, HashSet<Key>>,
+    /// (sheet, col) → dependents covering the whole column (all rows 0..=MAX_ROWS-1)
+    whole_col_deps: HashMap<(usize, u32), HashSet<Key>>,
     /// (sheet, col) → row intervals of the ranges (up to `WIDE` columns) that cover the column
     col_deps: HashMap<(usize, u32), Intervals<Key>>,
     /// sheet → row intervals of wider ranges, with their columns: (first, last, dependent)
@@ -240,8 +242,12 @@ impl Graph {
             self.cell_deps.entry(c).or_default().insert(k);
         }
         for (s, c, r0, r1) in cols {
-            self.col_deps.entry((s, c)).or_default().insert(r0, r1, k);
-            self.unsettled_cols.insert((s, c));
+            if r0 == 0 && r1 >= gridcraft_core::MAX_ROWS - 1 {
+                self.whole_col_deps.entry((s, c)).or_default().insert(k);
+            } else {
+                self.col_deps.entry((s, c)).or_default().insert(r0, r1, k);
+                self.unsettled_cols.insert((s, c));
+            }
         }
         for (s, r) in wide {
             self.wide_deps.entry(s).or_default().insert(r.start.row, r.end.row, (r.start.col, r.end.col, k));
@@ -265,7 +271,14 @@ impl Graph {
             }
         }
         for (s, c, r0, r1) in cols {
-            if let Some(v) = self.col_deps.get_mut(&(s, c)) {
+            if r0 == 0 && r1 >= gridcraft_core::MAX_ROWS - 1 {
+                if let Some(v) = self.whole_col_deps.get_mut(&(s, c)) {
+                    v.remove(&k);
+                    if v.is_empty() {
+                        self.whole_col_deps.remove(&(s, c));
+                    }
+                }
+            } else if let Some(v) = self.col_deps.get_mut(&(s, c)) {
                 v.remove(r0, r1, k);
                 self.unsettled_cols.insert((s, c));
             }
@@ -305,6 +318,9 @@ impl Graph {
         if let Some(v) = self.cell_deps.get(&(sheet, c)) {
             out.extend(v.iter().copied());
         }
+        if let Some(v) = self.whole_col_deps.get(&(sheet, c.col)) {
+            out.extend(v.iter().copied());
+        }
         if let Some(v) = self.col_deps.get(&(sheet, c.col)) {
             v.query(c.row, c.row, &mut |k| out.push(*k));
         }
@@ -312,6 +328,38 @@ impl Graph {
             v.query(c.row, c.row, &mut |(c0, c1, k)| {
                 if *c0 <= c.col && c.col <= *c1 {
                     out.push(*k);
+                }
+            });
+        }
+    }
+
+    /// Optimized closure traversal that dedups whole-column dependents across cells in the same column.
+    pub fn dependents_closure(
+        &self,
+        sheet: usize,
+        c: CellRef,
+        whole_cols_seen: &mut HashSet<(usize, u32)>,
+        mut emit: impl FnMut(Key),
+    ) {
+        if let Some(v) = self.cell_deps.get(&(sheet, c)) {
+            for &k in v {
+                emit(k);
+            }
+        }
+        if whole_cols_seen.insert((sheet, c.col)) {
+            if let Some(v) = self.whole_col_deps.get(&(sheet, c.col)) {
+                for &k in v {
+                    emit(k);
+                }
+            }
+        }
+        if let Some(v) = self.col_deps.get(&(sheet, c.col)) {
+            v.query(c.row, c.row, &mut |k| emit(*k));
+        }
+        if let Some(v) = self.wide_deps.get(&sheet) {
+            v.query(c.row, c.row, &mut |(c0, c1, k)| {
+                if *c0 <= c.col && c.col <= *c1 {
+                    emit(*k);
                 }
             });
         }
@@ -333,13 +381,22 @@ impl Graph {
             }
         }
         let (r0, r1) = (range.start.row, range.end.row);
-        if (range.width() as usize) <= self.col_deps.len() {
+        let col_count = self.col_deps.len() + self.whole_col_deps.len();
+        if (range.width() as usize) <= col_count {
             for col in range.start.col..=range.end.col {
+                if let Some(v) = self.whole_col_deps.get(&(sheet, col)) {
+                    out.extend(v.iter().copied());
+                }
                 if let Some(v) = self.col_deps.get(&(sheet, col)) {
                     v.query(r0, r1, &mut |k| out.push(*k));
                 }
             }
         } else {
+            for ((s, col), v) in &self.whole_col_deps {
+                if *s == sheet && range.start.col <= *col && *col <= range.end.col {
+                    out.extend(v.iter().copied());
+                }
+            }
             for ((s, col), v) in &self.col_deps {
                 if *s == sheet && range.start.col <= *col && *col <= range.end.col {
                     v.query(r0, r1, &mut |k| out.push(*k));
@@ -1026,32 +1083,29 @@ impl Calc {
     fn dirty_closure(&self, _wb: &Workbook, seeds: &[Key]) -> Vec<Key> {
         let mut seen: HashSet<Key> = HashSet::default();
         let mut queue: VecDeque<Key> = VecDeque::new();
-        for k in seeds {
-            if self.graph.nodes.contains_key(k) && seen.insert(*k) {
-                queue.push_back(*k);
+        let mut whole_cols_seen: HashSet<(usize, u32)> = HashSet::default();
+
+        let push = |k: Key, queue: &mut VecDeque<Key>, seen: &mut HashSet<Key>| {
+            if seen.insert(k) {
+                queue.push_back(k);
             }
-            let mut deps = Vec::new();
-            self.graph.dependents(k.0, k.1, &mut deps);
-            for d in deps {
-                if seen.insert(d) {
-                    queue.push_back(d);
-                }
+        };
+
+        for &k in seeds {
+            if self.graph.nodes.contains_key(&k) {
+                push(k, &mut queue, &mut seen);
             }
+            self.graph.dependents_closure(k.0, k.1, &mut whole_cols_seen, |d| {
+                push(d, &mut queue, &mut seen);
+            });
         }
-        for k in &self.graph.dynamic {
-            if seen.insert(*k) {
-                queue.push_back(*k);
-            }
+        for &k in &self.graph.dynamic {
+            push(k, &mut queue, &mut seen);
         }
-        let mut deps = Vec::new();
         while let Some(k) = queue.pop_front() {
-            deps.clear();
-            self.graph.dependents(k.0, k.1, &mut deps);
-            for d in deps.drain(..) {
-                if seen.insert(d) {
-                    queue.push_back(d);
-                }
-            }
+            self.graph.dependents_closure(k.0, k.1, &mut whole_cols_seen, |d| {
+                push(d, &mut queue, &mut seen);
+            });
         }
         seen.into_iter().collect()
     }
