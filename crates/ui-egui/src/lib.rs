@@ -201,6 +201,18 @@ pub struct Services {
 /// Shared queue of files read asynchronously (browser file picker, drag and drop).
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
+pub struct LoadingTask {
+    pub title: String,
+    pub path: String,
+    pub status: String,
+    pub rx: std::sync::mpsc::Receiver<LoadTaskMessage>,
+}
+
+pub enum LoadTaskMessage {
+    Status(String),
+    Done(Result<(gridcraft_engine::DocState, Vec<String>), String>),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Perf {
     pub frame_ms: f64,
@@ -290,6 +302,8 @@ pub struct SheetApp {
     pub started: f64,
     /// Calculation progress/status: (progress 0.0..=1.0, formula count, timestamp ms).
     pub calc_status: Option<(f32, usize, f64)>,
+    /// Background task loading a workbook with real-time feedback.
+    pub loading: Option<LoadingTask>,
 }
 
 impl SheetApp {
@@ -303,6 +317,7 @@ impl SheetApp {
             text_box_editor: None,
             dialog: None,
             backstage: None,
+            loading: None,
             message: None,
             toast: None,
             notice: None,
@@ -801,7 +816,7 @@ impl SheetApp {
                 } else if let Some(pick) = &self.services.pick_open
                     && let Some(path) = pick()
                 {
-                    self.open_path(&path);
+                    self.open_path_async(&path);
                 }
             }
             "saveAs" => {
@@ -843,6 +858,47 @@ impl SheetApp {
             Some(b) => b.page = page,
             None => self.backstage = Some(backstage::Backstage::new(page)),
         }
+    }
+
+    pub fn open_path_async(&mut self, path: &str) {
+        self.backstage = None;
+        if let Some(i) = self.session.documents().iter().position(|d| d.path.as_deref() == Some(path)) {
+            self.session.set_active(i);
+            self.after_open(Some(path), &serde_json::json!({"index": i, "alreadyOpen": true}));
+            self.after_engine();
+            return;
+        }
+        let title = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Book").to_string();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path_clone = path.to_string();
+            let tx_status = tx.clone();
+            let is_pt = self.ui.language == i18n::Language::PtBr;
+            let initial_status = if is_pt { "Lendo dados da planilha...".to_string() } else { "Reading spreadsheet data...".to_string() };
+            let spawned = std::thread::Builder::new()
+                .name("gridcraft-loader".into())
+                .spawn(move || {
+                    let res = gridcraft_engine::load_document(
+                        &serde_json::json!({"path": path_clone}),
+                        Some(Box::new(move |msg| {
+                            let _ = tx_status.send(LoadTaskMessage::Status(msg.to_string()));
+                        })),
+                    )
+                    .map_err(|e| e.to_string());
+                    let _ = tx.send(LoadTaskMessage::Done(res));
+                });
+            if spawned.is_ok() {
+                self.loading = Some(LoadingTask {
+                    title,
+                    path: path.to_string(),
+                    status: initial_status,
+                    rx,
+                });
+                return;
+            }
+        }
+        self.open_path(path);
     }
 
     pub fn open_path(&mut self, path: &str) {
@@ -1152,6 +1208,36 @@ impl SheetApp {
             ctx.request_repaint();
         }
         control::poll(self, ctx);
+        if let Some(loading) = &mut self.loading {
+            ctx.request_repaint();
+            let mut done = None;
+            while let Ok(msg) = loading.rx.try_recv() {
+                match msg {
+                    LoadTaskMessage::Status(s) => loading.status = s,
+                    LoadTaskMessage::Done(res) => {
+                        done = Some(res);
+                        break;
+                    }
+                }
+            }
+            if let Some(res) = done {
+                let path = loading.path.clone();
+                self.loading = None;
+                match res {
+                    Ok((doc, warnings)) => match self.session.install_document(doc, warnings) {
+                        Ok(r) => self.after_open(Some(&path), &r),
+                        Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e.to_string()))),
+                    },
+                    Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
+                        self.open_dialog("openPassword", json!({"path": path}));
+                    }
+                    Err(e) => {
+                        self.message = Some(("GridCraft".into(), clean_error(&e)));
+                    }
+                }
+                self.after_engine();
+            }
+        }
         // Files read asynchronously (web file picker, dropped files).
         let arrived: Vec<(String, Vec<u8>)> = self
             .services
@@ -1233,6 +1319,7 @@ impl SheetApp {
         dialogs::show(self, &ctx);
         widgets::message_box(self, &ctx);
         widgets::toast(self, &ctx);
+        widgets::loading_modal(self, &ctx);
         control::issue_screenshots(self, &ctx);
         control::collect_screenshots(self, &ctx);
         if !ctx.input(|i| i.focused) {

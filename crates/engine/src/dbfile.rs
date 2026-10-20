@@ -28,16 +28,23 @@ mod native {
 
     /// Streams `xlsx` into a new database at `out`; returns one line per table.
     pub fn import_xlsx(xlsx: &str, out: &str) -> Result<(Vec<(String, u64, usize)>, Vec<String>)> {
-        let report = gridcraft_db::import_xlsx(std::path::Path::new(xlsx), std::path::Path::new(out), &mut |sheet, rows| {
-            log::info!("importing '{sheet}': {rows} rows");
-        })
-        .map_err(|e| EngineError::Other(format!("We can't convert '{xlsx}': {e}")))?;
+        import_xlsx_with_progress(xlsx, out, &mut |_, _| {})
+    }
+
+    /// Streams `xlsx` into a new database at `out` with progress reports; returns one line per table.
+    pub fn import_xlsx_with_progress(
+        xlsx: &str,
+        out: &str,
+        progress: &mut dyn FnMut(&str, u64),
+    ) -> Result<(Vec<(String, u64, usize)>, Vec<String>)> {
+        let report = gridcraft_db::import_xlsx(std::path::Path::new(xlsx), std::path::Path::new(out), progress)
+            .map_err(|e| EngineError::Other(format!("We can't convert '{xlsx}': {e}")))?;
         Ok((report.tables.into_iter().map(|t| (t.sheet, t.rows, t.columns)).collect(), report.warnings))
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{import_xlsx, open, save};
+pub use native::{import_xlsx, import_xlsx_with_progress, open, save};
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -58,7 +65,16 @@ mod web {
     pub fn import_xlsx(_xlsx: &str, _out: &str) -> Result<(Vec<(String, u64, usize)>, Vec<String>)> {
         unavailable()
     }
+
+    pub fn import_xlsx_with_progress(
+        _xlsx: &str,
+        _out: &str,
+        _progress: &mut dyn FnMut(&str, u64),
+    ) -> Result<(Vec<(String, u64, usize)>, Vec<String>)> {
+        unavailable()
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use web::{import_xlsx, open, save};
+pub use web::{import_xlsx, import_xlsx_with_progress, open, save};
+

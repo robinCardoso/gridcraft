@@ -401,10 +401,8 @@ fn recent_list(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Ou
         }
         let resp = resp.on_hover_text(&path);
         if resp.clicked() {
-            app.open_path(&path);
-            if app.session.active().and_then(|d| d.path.as_deref()) == Some(path.as_str()) {
-                out.close = true;
-            }
+            app.open_path_async(&path);
+            out.close = true;
         }
     }
 }
@@ -558,7 +556,7 @@ fn open_page(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outc
         let before = app.session.active().map(|d| d.uid);
         app.open_dialog("open", json!({}));
         // Desktop pickers return at once; the web picker delivers later (see `SheetApp::logic`).
-        if app.session.active().map(|d| d.uid) != before {
+        if app.session.active().map(|d| d.uid) != before || app.loading.is_some() {
             out.close = true;
         }
     }

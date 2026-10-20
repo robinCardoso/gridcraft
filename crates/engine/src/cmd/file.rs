@@ -43,27 +43,49 @@ fn new_workbook(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn open(s: &mut Session, p: &Json) -> Result<Json> {
-    let (name, bytes) = if let Some(b) = str_param(p, "base64") {
-        (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
-    } else if let Some(path) = str_param(p, "path") {
+    if let Some(path) = str_param(p, "path") {
         // Already open? Switch to it.
         if let Some(i) = s.documents().iter().position(|d| d.path.as_deref() == Some(path)) {
             s.set_active(i);
             return Ok(json!({"index": i, "alreadyOpen": true}));
         }
+    } else if str_param(p, "base64").is_none() {
+        s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
+        return ok();
+    }
+    let (doc, warnings) = load_document(p, None)?;
+    s.install_document(doc, warnings)
+}
+
+/// Loads a document from path or base64 without needing a Session, allowing background execution.
+pub fn load_document(p: &Json, mut progress: Option<Box<dyn FnMut(&str) + Send>>) -> Result<(DocState, Vec<String>)> {
+    let (name, bytes) = if let Some(b) = str_param(p, "base64") {
+        if let Some(cb) = &mut progress {
+            cb("Decodificando dados da planilha...");
+        }
+        (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
+    } else if let Some(path) = str_param(p, "path") {
         let path_is_db = crate::dbfile::is_db_path(path);
         let companion_db = if !path_is_db {
-            let p = std::path::Path::new(path);
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let p_path = std::path::Path::new(path);
+            let ext = p_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext.eq_ignore_ascii_case("xlsx") || ext.eq_ignore_ascii_case("xlsm") {
-                let db_cand = p.with_extension("db");
+                let db_cand = p_path.with_extension("db");
                 if db_cand.exists() {
                     Some(db_cand.to_string_lossy().into_owned())
                 } else if let Ok(meta) = std::fs::metadata(path)
                     && meta.len() > 3 * 1024 * 1024
                 {
                     let db_str = db_cand.to_string_lossy().into_owned();
-                    if crate::dbfile::import_xlsx(path, &db_str).is_ok() { Some(db_str) } else { None }
+                    if let Some(cb) = &mut progress {
+                        cb("Otimizando planilha grande para SQLite...");
+                    }
+                    let res = crate::dbfile::import_xlsx_with_progress(path, &db_str, &mut |sheet, rows| {
+                        if let Some(cb) = &mut progress {
+                            cb(&format!("Importando aba '{sheet}' ({rows} linhas)..."));
+                        }
+                    });
+                    if res.is_ok() { Some(db_str) } else { None }
                 } else {
                     None
                 }
@@ -76,10 +98,16 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         // A database is opened by path (SQLite needs the file, not its bytes).
         let effective_path = companion_db.as_deref().unwrap_or(path);
         let is_db = path_is_db || companion_db.is_some();
+        if let Some(cb) = &mut progress {
+            if is_db {
+                cb("Abrindo banco SQLite de alta performance...");
+            } else {
+                cb("Lendo dados do arquivo...");
+            }
+        }
         (effective_path.to_string(), if is_db { Vec::new() } else { crate::io::read_file(path)? })
     } else {
-        s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
-        return ok();
+        return Err(bad("file.open", "missing `path` or `base64`"));
     };
     let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
     let (mut wb, warnings) = if crate::dbfile::is_db_path(&name) {
@@ -89,6 +117,9 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         }
         (w, warns)
     } else {
+        if let Some(cb) = &mut progress {
+            cb("Processando dados e fórmulas...");
+        }
         crate::io::open_bytes_with(&name, &bytes, str_param(p, "password"), bool_param(p, "csvAsText").unwrap_or(false))?
     };
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
@@ -100,38 +131,19 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     } else {
         std::path::Path::new(&name).file_name().and_then(|n| n.to_str()).unwrap_or("Book").to_string()
     };
-    // An import has no save target: ordinary Save must ask for a new destination. Neither does a
-    // workbook decrypted with its password, so Save never replaces the encrypted original with
-    // an unprotected copy.
     let path = if crate::dbfile::is_db_path(&name) {
         Some(name.clone())
     } else {
         str_param(p, "path").filter(|_| !imported && !encrypted).map(str::to_string)
     };
-    // Replace an untouched blank Book1 like Excel does.
-    if s.documents().len() == 1
-        && s.active().is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
-    {
-        s.close_document(0);
+    if let Some(cb) = &mut progress {
+        cb("Recalculando e preparando visualização...");
     }
     let mut doc = DocState::new(wb, path, title);
     if crate::io::FileKind::from_path(&name).is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Xlsx {
         doc.content_kind = Some(crate::io::FileKind::Xlsx);
     }
-    let i = s.add_document(doc);
-    // The decrypted-workbook notice is for the info bar, not a message box.
-    let shown: Vec<&str> = warnings.iter().map(String::as_str).filter(|w| *w != crate::io::DECRYPTED_NOTICE).collect();
-    if !shown.is_empty() {
-        let mut message = shown.iter().take(5).copied().collect::<Vec<_>>().join("\n\n");
-        if shown.len() > 5 {
-            message.push_str(&format!("\n\n{} additional import warnings.", shown.len() - 5));
-        }
-        s.ui_requests.push(crate::UiRequest::Message(message));
-    }
-    let d = s.doc()?;
-    Ok(
-        json!({"index": i, "title": d.display_title(), "sheets": d.wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(), "warnings": warnings}),
-    )
+    Ok((doc, warnings))
 }
 
 fn save(s: &mut Session, p: &Json) -> Result<Json> {

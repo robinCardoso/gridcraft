@@ -32,6 +32,7 @@ use serde::Serialize;
 use serde_json::Value as Json;
 
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command, register_test_command};
+pub use cmd::file::load_document;
 pub use gridcraft_calc as calc;
 pub use gridcraft_core as core;
 pub use gridcraft_formula as formula;
@@ -346,6 +347,32 @@ impl Session {
             wb.sheets.push(Arc::new(gridcraft_model::Sheet::new(name)));
         }
         self.add_document(DocState::new(wb, None, format!("Book{n}")))
+    }
+
+    /// Mounts an asynchronously or synchronously loaded document into the session.
+    pub fn install_document(&mut self, doc: DocState, warnings: Vec<String>) -> Result<Json> {
+        // Replace an untouched blank Book1 like Excel does.
+        if self.documents().len() == 1
+            && self.active().is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
+        {
+            self.close_document(0);
+        }
+        let i = self.add_document(doc);
+        let shown: Vec<&str> = warnings.iter().map(String::as_str).filter(|w| *w != crate::io::DECRYPTED_NOTICE).collect();
+        if !shown.is_empty() {
+            let mut message = shown.iter().take(5).copied().collect::<Vec<_>>().join("\n\n");
+            if shown.len() > 5 {
+                message.push_str(&format!("\n\n{} additional import warnings.", shown.len() - 5));
+            }
+            self.ui_requests.push(crate::UiRequest::Message(message));
+        }
+        let d = self.doc()?;
+        Ok(serde_json::json!({
+            "index": i,
+            "title": d.display_title(),
+            "sheets": d.wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            "warnings": warnings,
+        }))
     }
 
     pub fn commands(&self) -> Vec<CommandInfo> {

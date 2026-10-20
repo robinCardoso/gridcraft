@@ -50,7 +50,7 @@ impl eframe::App for App {
         // Files dropped on the window open as workbooks.
         for f in std::mem::take(&mut raw.dropped_files) {
             if let Some(p) = f.path().to_str().map(str::to_string).filter(|p| !p.is_empty()) {
-                self.0.open_path(&p);
+                self.0.open_path_async(&p);
             }
         }
     }

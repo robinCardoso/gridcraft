@@ -323,6 +323,28 @@ pub fn toast(app: &mut SheetApp, ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(200));
 }
 
+/// A modal overlay showing an animated spinner and status while a workbook is being loaded.
+pub fn loading_modal(app: &SheetApp, ctx: &egui::Context) {
+    let Some(loading) = &app.loading else { return };
+    let t = Tokens::get(ctx);
+    egui::Modal::new(egui::Id::new("loading_modal")).show(ctx, |ui| {
+        ui.set_width(420.0);
+        ui.vertical_centered(|ui| {
+            ui.add_space(14.0);
+            ui.add(egui::Spinner::new().size(38.0).color(t.accent));
+            ui.add_space(16.0);
+            let is_pt = app.ui.language == i18n::Language::PtBr;
+            let title = if is_pt { "Carregando planilha..." } else { "Loading workbook..." };
+            ui.label(egui::RichText::new(title).font(theme::ui_bold(16.0)).color(t.text));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(&loading.title).font(theme::ui_bold(13.5)).color(t.accent));
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(&loading.status).font(theme::ui_font(12.0)).color(t.text_dim));
+            ui.add_space(14.0);
+        });
+    });
+}
+
 /// The info bar under the ribbon (Excel's message-bar slot). Shows an open-time notice with an
 /// optional action button and a dismiss ✕. Returns nothing; dismissing clears `app.notice`.
 pub fn notice_bar(app: &mut SheetApp, ui: &mut Ui) {
