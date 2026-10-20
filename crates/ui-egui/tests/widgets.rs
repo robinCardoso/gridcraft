@@ -60,3 +60,20 @@ fn big_button_without_dropdown_keeps_centered_labels_and_width() {
         assert!((rect.width() - (widest + 12.0).max(44.0)).abs() < 0.01);
     }
 }
+
+#[test]
+fn big_button_enabled_false_renders_disabled_colors() {
+    let ctx = egui::Context::default();
+    let mut fonts = FontDefinitions::default();
+    let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    fonts.families.insert(FontFamily::Name(theme::UI.into()), proportional);
+    ctx.set_fonts(fonts);
+    let t = theme::Tokens::get(&ctx);
+    let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0))), ..Default::default() }, |ui| {
+        widgets::big_button_enabled(ui, Icon::Paste, "Paste", "Paste", true, false);
+    });
+    output.textures_delta.clear();
+    let shapes: Vec<_> = output.shapes.into_iter().map(|shape| shape.shape).collect();
+    let text = shapes.iter().find_map(|s| if let Shape::Text(t) = s { Some(t) } else { None }).expect("text galley found");
+    assert_eq!(text.fallback_color, t.text_disabled);
+}

@@ -172,15 +172,15 @@ fn canonical_engine_templates_enter_the_selected_formula_language() {
 }
 
 #[test]
-fn portuguese_interface_retains_its_canonical_formula_fallback() {
+fn portuguese_interface_uses_portuguese_formulas() {
     let mut app = app();
     app.run("app.language.set", json!({"code":"pt-BR"})).unwrap();
     assert_eq!(app.ui.language, Language::PtBr);
     assert_eq!(app.ui.language.tr("Data"), "Dados");
-    assert!(enter(&mut app, "=SUM(1.5,2.25)"));
+    assert!(enter(&mut app, "=SOMA(1,5;2,25)"));
     app.begin_edit(None, true);
-    assert_eq!(app.editor.as_ref().unwrap().text, "=SUM(1.5,2.25)");
-    assert!(!enter(&mut app, "=SUMA(1;2)"));
+    assert_eq!(app.editor.as_ref().unwrap().text, "=SOMA(1,5;2,25)");
+    assert!(!enter(&mut app, "=SOMA(1, 2, 3)"));
     let restored: UiState = serde_json::from_str(&serde_json::to_string(&app.ui).unwrap()).unwrap();
     assert_eq!(restored.language, Language::PtBr);
     assert_eq!(Language::Es.tr("Page Layout|Orientation"), "Orientación");

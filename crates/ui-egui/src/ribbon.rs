@@ -8,7 +8,7 @@ use crate::SheetApp;
 use crate::icons::{self, Icon};
 use crate::keytips::keytip_table;
 use crate::theme::{self, Tokens};
-use crate::widgets::{big_button, color_palette, icon_button, small_button, split_button, toggle_button};
+use crate::widgets::{big_button, big_button_enabled, color_palette, icon_button, small_button, split_button, toggle_button};
 
 pub const TABS: &[&str] = &["Home", "Insert", "Draw", "Page Layout", "Formulas", "Data", "Review", "View", "Automate"];
 
@@ -507,8 +507,9 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let st = active_style(app);
     // Clipboard
-    let paste = big_button(ui, Icon::Paste, "Paste", "Paste (⌘V)", true);
-    paste.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Paste"));
+    let can_paste = app.can_paste();
+    let paste = big_button_enabled(ui, Icon::Paste, "Paste", "Paste (⌘V)", true, can_paste);
+    paste.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, can_paste, "Paste"));
     for sequence in
         keytip_table::group_extension(app.keytips.prefix().unwrap_or_default(), &["edit.paste", "edit.pasteSpecial", "dialog:pasteSpecial"])
     {
@@ -517,7 +518,7 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
     if paste.clicked() {
         app.paste_from_clipboard();
     }
-    let paste_keys = matches!(app.keytips.prefix(), Some("HV" | "E"));
+    let paste_keys = can_paste && matches!(app.keytips.prefix(), Some("HV" | "E"));
     // Keep a keyboard-opened menu anchored to the button when a pointer click
     // cancels keytips, so its items remain in place and can still be clicked.
     let anchor_id = paste.id.with("keytip_anchor");
@@ -542,23 +543,25 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
     if paste_keys {
         paste_popup = paste_popup.open_memory(egui::SetOpenCommand::Bool(true));
     }
-    paste_popup.show(|ui| {
-        menu_items(
-            app,
-            ui,
-            &[
-                ("Paste", "edit.paste", json!({})),
-                ("Paste as Text", "edit.pasteAsText", json!({})),
-                ("Paste Values", "edit.pasteSpecial", json!({"what": "values"})),
-                ("Paste Formulas", "edit.pasteSpecial", json!({"what": "formulas"})),
-                ("Paste Formatting", "edit.pasteSpecial", json!({"what": "formats"})),
-                ("Transpose", "edit.pasteSpecial", json!({"what": "all", "transpose": true})),
-                ("Paste Link", "edit.pasteSpecial", json!({"what": "all", "link": true})),
-                ("-", "", json!(null)),
-                ("Paste Special…", "dialog:pasteSpecial", json!({})),
-            ],
-        );
-    });
+    if can_paste {
+        paste_popup.show(|ui| {
+            menu_items(
+                app,
+                ui,
+                &[
+                    ("Paste", "edit.paste", json!({})),
+                    ("Paste as Text", "edit.pasteAsText", json!({})),
+                    ("Paste Values", "edit.pasteSpecial", json!({"what": "values"})),
+                    ("Paste Formulas", "edit.pasteSpecial", json!({"what": "formulas"})),
+                    ("Paste Formatting", "edit.pasteSpecial", json!({"what": "formats"})),
+                    ("Transpose", "edit.pasteSpecial", json!({"what": "all", "transpose": true})),
+                    ("Paste Link", "edit.pasteSpecial", json!({"what": "all", "link": true})),
+                    ("-", "", json!(null)),
+                    ("Paste Special…", "dialog:pasteSpecial", json!({})),
+                ],
+            );
+        });
+    }
     ui.vertical(|ui| {
         let __k = icon_button(ui, Icon::Cut, t.text, "Cut (⌘X)", vec2(26.0, 23.0));
         control_keytip(app, ui, &__k, "edit.cut");

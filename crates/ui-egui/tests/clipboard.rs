@@ -482,3 +482,26 @@ fn the_cut_text_pastes_again_once_the_clipboard_has_held_other_text() {
     h.run_steps(2);
     assert_eq!(value_at(&h, "H1"), Some(Value::from("Name")), "the same text copied afresh pastes");
 }
+
+#[test]
+fn escape_cancels_copy_mode_and_disables_paste() {
+    let mut h = harness(Services::default());
+    h.state_mut().run("edit.copy", json!({"range": "A1:B2"})).unwrap();
+    assert!(h.state_mut().can_paste(), "can paste right after copy");
+    assert!(h.state().session.clipboard.is_some(), "clipboard has copied cells");
+
+    // Press Escape
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    assert!(h.state().session.clipboard.is_none(), "marching ants are gone");
+    assert!(!h.state_mut().can_paste(), "cannot paste after pressing escape");
+
+    // Pasting after Escape must not paste cancelled content
+    h.state_mut().run("selection.set", json!({"cell": "D4"})).unwrap();
+    h.input_mut().events.push(Event::Paste("Name\tScore\nAda\t42\n".into()));
+    h.run_steps(2);
+    assert_eq!(value_at(&h, "D4"), Some(Value::Empty), "cell D4 remains empty");
+    assert!(h.state().toast.is_some() || h.state().message.is_some(), "Paste reports there is nothing to paste");
+}
+

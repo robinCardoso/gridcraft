@@ -262,6 +262,9 @@ pub struct SheetApp {
     /// text noted for an unpublished cut); `None` after a copy, or once the clipboard is seen
     /// holding other text. Once the cut has been pasted, Paste leaves this text alone.
     cut_text: Option<String>,
+    /// The system clipboard's text when a copy or cut was cancelled (e.g. via Escape or Enter).
+    /// While the host clipboard still holds this text, Paste is disabled so it is not pasted again.
+    cancelled_text: Option<String>,
     pub started: f64,
     /// Calculation progress/status: (progress 0.0..=1.0, formula count, timestamp ms).
     pub calc_status: Option<(f32, usize, f64)>,
@@ -307,6 +310,7 @@ impl SheetApp {
             selected_chart: None,
             clipboard_text_at_copy: None,
             cut_text: None,
+            cancelled_text: None,
             started: now_ms(),
             calc_status: None,
         }
@@ -349,6 +353,7 @@ impl SheetApp {
         if matches!(id, "edit.copy" | "edit.cut") && r.is_ok() {
             self.clipboard_text_at_copy = self.system_clipboard_text();
             self.cut_text = if id == "edit.cut" { self.clipboard_text_at_copy.clone() } else { None };
+            self.cancelled_text = None;
         }
         r
     }
@@ -411,6 +416,7 @@ impl SheetApp {
         let Some(text) = result.get("text").and_then(Json::as_str) else { return };
         // The system clipboard gets this copy, so its text decides what Paste pastes.
         self.clipboard_text_at_copy = None;
+        self.cancelled_text = None;
         self.cut_text = (command == "edit.cut").then(|| text.replace("\r\n", "\n"));
         if let Some(html) = result.get("html").and_then(Json::as_str)
             && let Some(copy_html) = &mut self.services.copy_html
@@ -423,6 +429,24 @@ impl SheetApp {
         ctx.copy_text(text.to_string());
     }
 
+    /// Cancels copy mode (e.g. on Escape or after an Enter paste), clearing the internal clipboard
+    /// and recording the current clipboard text as cancelled so Paste is disabled until a new copy.
+    pub fn cancel_copy(&mut self) {
+        if let Some(text) = self.system_clipboard_text() {
+            self.cancelled_text = Some(text);
+        } else if let Some(clip) = &self.session.clipboard {
+            self.cancelled_text = Some(clip.text.replace("\r\n", "\n"));
+        }
+        self.session.clipboard = None;
+        self.session.format_painter = None;
+    }
+
+    /// Whether anything is available to paste (controls active vs disabled/opaque rendering of
+    /// the Paste button without reading the host clipboard on every frame).
+    pub fn can_paste(&self) -> bool {
+        self.session.clipboard.is_some() || (self.cancelled_text.is_none() && self.cut_text.is_none())
+    }
+
     /// Paste text that came from the system clipboard (Cmd/Ctrl+V, or the ribbon and menu Paste),
     /// with the clipboard's HTML flavour when the host can read it.
     ///
@@ -431,12 +455,18 @@ impl SheetApp {
     /// clipboard is pasted instead, which reports "Nothing to paste.". Other text means the
     /// clipboard has moved on, so the cut's text is forgotten and pastes normally later.
     pub fn paste_external(&mut self, text: String) {
+        if Self::same_clipboard_text(Some(&text), self.cancelled_text.as_deref()) {
+            if self.session.clipboard.is_none() {
+                return self.run_or_alert("edit.paste", json!({}));
+            }
+        }
         if Self::same_clipboard_text(Some(&text), self.cut_text.as_deref()) {
             if self.session.clipboard.is_none() {
                 return self.run_or_alert("edit.paste", json!({}));
             }
         } else {
             self.cut_text = None;
+            self.cancelled_text = None;
         }
         let html = self.services.paste_html.as_mut().and_then(|read| read());
         let params = match html {
@@ -460,7 +490,15 @@ impl SheetApp {
     pub fn paste_as_text(&mut self) {
         if let Some(text) = self.system_clipboard_text() {
             if self.session.clipboard.is_none() || self.clipboard_text_at_copy.as_ref() != Some(&text) {
+                if Self::same_clipboard_text(Some(&text), self.cancelled_text.as_deref())
+                    || Self::same_clipboard_text(Some(&text), self.cut_text.as_deref())
+                {
+                    if self.session.clipboard.is_none() {
+                        return self.run_or_alert("edit.pasteSpecial", json!({"what": "text"}));
+                    }
+                }
                 self.cut_text = None;
+                self.cancelled_text = None;
                 self.run_or_alert("edit.paste", json!({"text": text, "asText": true}));
                 return;
             }

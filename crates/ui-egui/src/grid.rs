@@ -2706,7 +2706,7 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                     // Excel: Enter while a copied range is marked pastes it and ends copy mode.
                     Key::Enter if !m.alt && !m.ctrl && !shift && !cmd && app.session.clipboard.is_some() => {
                         app.run_or_alert("edit.paste", json!({}));
-                        app.session.clipboard = None;
+                        app.cancel_copy();
                         app.grid.ensure_visible = true;
                     }
                     Key::Enter => {
@@ -2729,8 +2729,7 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                         }
                     }
                     Key::Escape => {
-                        app.session.clipboard = None;
-                        app.session.format_painter = None;
+                        app.cancel_copy();
                     }
                     Key::Space if !cmd && !shift && is_checkbox(sh, app) => app.run_or_alert("cell.toggleCheckbox", json!({})),
                     Key::F8 if m.alt => {
@@ -2933,12 +2932,15 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                 items.insert(6, item);
             }
             let lang = crate::i18n::current(ui.ctx());
+            let can_paste = app.can_paste();
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();
                     continue;
                 }
-                if ui.add(egui::Button::new(lang.tr(label)).frame(false).min_size(vec2(190.0, 20.0))).clicked() {
+                let is_paste = matches!(id, "edit.paste" | "edit.pasteAsText" | "ui:pasteSpecial");
+                let enabled = !is_paste || can_paste;
+                if ui.add_enabled(enabled, egui::Button::new(lang.tr(label)).frame(false).min_size(vec2(190.0, 20.0))).clicked() {
                     close = true;
                     match id {
                         "ui:pasteSpecial" => app.open_dialog("pasteSpecial", json!({})),
@@ -3206,12 +3208,15 @@ fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
                 items.insert(5, item);
             }
             let lang = crate::i18n::current(ui.ctx());
+            let can_paste = app.can_paste();
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();
                     continue;
                 }
-                if ui.add(egui::Button::new(lang.tr(label)).frame(false).min_size(vec2(180.0, 20.0))).clicked() {
+                let is_paste = matches!(id, "edit.paste" | "edit.pasteAsText" | "ui:pasteSpecial");
+                let enabled = !is_paste || can_paste;
+                if ui.add_enabled(enabled, egui::Button::new(lang.tr(label)).frame(false).min_size(vec2(180.0, 20.0))).clicked() {
                     close = true;
                     match id {
                         "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),

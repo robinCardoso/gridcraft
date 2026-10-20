@@ -43,33 +43,39 @@ pub fn toggle_button(ui: &mut Ui, icon: Icon, on: bool, tip: &str) -> Response {
 
 /// Large ribbon button: 32px icon over a one- or two-line label.
 pub fn big_button(ui: &mut Ui, icon: Icon, label: &str, tip: &str, dropdown: bool) -> Response {
+    big_button_enabled(ui, icon, label, tip, dropdown, ui.is_enabled())
+}
+
+/// Large ribbon button with explicit enabled/disabled state (dimmed icon and text when disabled).
+pub fn big_button_enabled(ui: &mut Ui, icon: Icon, label: &str, tip: &str, dropdown: bool, enabled: bool) -> Response {
     let t = Tokens::get(ui.ctx());
     let font = theme::ui_font(11.5);
     let label = tr(ui, label);
-    let lines: Vec<_> = label.split('\n').map(|line| ui.painter().layout_no_wrap(line.to_string(), font.clone(), t.text)).collect();
+    let text_color = if enabled { t.text } else { t.text_disabled };
+    let lines: Vec<_> = label.split('\n').map(|line| ui.painter().layout_no_wrap(line.to_string(), font.clone(), text_color)).collect();
     let arrow_size = 10.0;
     let arrow_space = if dropdown { 4.0 + arrow_size } else { 0.0 };
     let text_w = lines.iter().enumerate().map(|(i, line)| line.size().x + if i + 1 == lines.len() { arrow_space } else { 0.0 }).fold(0.0, f32::max);
     let w = (text_w + 12.0).max(44.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 72.0), Sense::click());
-    if resp.is_pointer_button_down_on() {
+    if enabled && resp.is_pointer_button_down_on() {
         ui.painter().rect_filled(rect, 5.0, t.pressed);
-    } else if resp.hovered() {
+    } else if enabled && resp.hovered() {
         ui.painter().rect_filled(rect, 5.0, t.hover);
     }
-    icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.center().x, rect.top() + 21.0), vec2(30.0, 30.0)), icon, t.text);
+    icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.center().x, rect.top() + 21.0), vec2(30.0, 30.0)), icon, text_color);
     for (i, line) in lines.iter().enumerate() {
         let has_arrow = dropdown && i + 1 == lines.len();
         let line_w = line.size().x + if has_arrow { arrow_space } else { 0.0 };
         let left = rect.center().x - line_w / 2.0;
         let y = rect.top() + 46.0 + i as f32 * 13.0;
-        ui.painter().galley(pos2(left, y - line.size().y / 2.0), line.clone(), t.text);
+        ui.painter().galley(pos2(left, y - line.size().y / 2.0), line.clone(), text_color);
         if has_arrow {
             icons::paint(
                 ui.painter(),
                 Rect::from_center_size(pos2(left + line_w - arrow_size / 2.0, y + 1.0), vec2(arrow_size, arrow_size)),
                 Icon::Chevron,
-                t.text_dim,
+                if enabled { t.text_dim } else { t.text_disabled },
             );
         }
     }
@@ -81,24 +87,26 @@ pub fn small_button(ui: &mut Ui, icon: Icon, label: &str, tip: &str, dropdown: b
     let t = Tokens::get(ui.ctx());
     let font = theme::ui_font(12.5);
     let label = tr(ui, label);
-    let tw = if label.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(label.to_string(), font.clone(), t.text).size().x + 6.0 };
+    let enabled = ui.is_enabled();
+    let text_color = if enabled { t.text } else { t.text_disabled };
+    let tw = if label.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(label.to_string(), font.clone(), text_color).size().x + 6.0 };
     let w = 24.0 + tw + if dropdown { 12.0 } else { 0.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 23.0), Sense::click());
-    if resp.is_pointer_button_down_on() {
+    if enabled && resp.is_pointer_button_down_on() {
         ui.painter().rect_filled(rect, 4.0, t.pressed);
-    } else if resp.hovered() {
+    } else if enabled && resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, t.hover);
     }
-    icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.left() + 12.0, rect.center().y), vec2(16.0, 16.0)), icon, t.text);
+    icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.left() + 12.0, rect.center().y), vec2(16.0, 16.0)), icon, text_color);
     if !label.is_empty() {
-        ui.painter().text(pos2(rect.left() + 24.0, rect.center().y), Align2::LEFT_CENTER, label, font, t.text);
+        ui.painter().text(pos2(rect.left() + 24.0, rect.center().y), Align2::LEFT_CENTER, label, font, text_color);
     }
     if dropdown {
         icons::paint(
             ui.painter(),
             Rect::from_center_size(pos2(rect.right() - 7.0, rect.center().y + 1.0), vec2(10.0, 10.0)),
             Icon::Chevron,
-            t.text_dim,
+            if enabled { t.text_dim } else { t.text_disabled },
         );
     }
     resp.on_hover_text(tr(ui, tip))
