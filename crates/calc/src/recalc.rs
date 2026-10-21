@@ -467,6 +467,7 @@ struct PassHost<'a> {
     taint: bool,
     lookup_col_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
     lookup_row_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
+    val_cache: HashMap<u64, Value>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -513,6 +514,7 @@ impl<'a> PassHost<'a> {
             taint: false,
             lookup_col_cache: HashMap::default(),
             lookup_row_cache: HashMap::default(),
+            val_cache: HashMap::default(),
         }
     }
 }
@@ -919,6 +921,12 @@ impl Host for PassHost<'_> {
         }
         self.lookup_row_cache.get(&key).and_then(|map| map.get(&needle_key).copied())
     }
+    fn get_cached_val(&mut self, key: u64) -> Option<Value> {
+        self.val_cache.get(&key).cloned()
+    }
+    fn set_cached_val(&mut self, key: u64, val: Value) {
+        self.val_cache.insert(key, val);
+    }
 }
 
 impl Calc {
@@ -1084,7 +1092,14 @@ impl Calc {
         let dirty = self.dirty_closure(wb, &seeds);
         let t1 = prof_now();
         let n = dirty.len();
-        self.run(wb, dirty, false);
+        if n > 1_000 {
+            let active = wb.active_sheet;
+            let mut active_dirty: Vec<Key> = dirty.into_iter().filter(|k| k.0 == active).collect();
+            active_dirty.sort_by_key(|k| (k.1.row, k.1.col));
+            self.run_scoped(wb, active_dirty, false, Some(active));
+        } else {
+            self.run(wb, dirty, false);
+        }
         if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
             eprintln!("recalc: {} seeds, closure {} cells {:.1} ms, run {:.1} ms", seeds.len(), n, t1 - t0, prof_now() - t1);
         }

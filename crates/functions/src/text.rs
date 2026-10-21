@@ -112,11 +112,19 @@ fn len(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 }
 
 fn lower(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
-    text_val(text(a, 0)?.to_lowercase())
+    let s = text(a, 0)?;
+    if s.is_ascii() && !s.bytes().any(|b| b.is_ascii_uppercase()) {
+        return text_val(s);
+    }
+    text_val(s.to_lowercase())
 }
 
 fn upper(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
-    text_val(text(a, 0)?.to_uppercase())
+    let s = text(a, 0)?;
+    if s.is_ascii() && !s.bytes().any(|b| b.is_ascii_lowercase()) {
+        return text_val(s);
+    }
+    text_val(s.to_uppercase())
 }
 
 fn proper(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
@@ -141,6 +149,9 @@ fn proper(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 
 fn trim(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let s = text(a, 0)?;
+    if !s.starts_with(' ') && !s.ends_with(' ') && !s.contains("  ") {
+        return text_val(s);
+    }
     text_val(s.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
@@ -152,7 +163,7 @@ fn substitute(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let s = text(a, 0)?;
     let old = text(a, 1)?;
     let new = text(a, 2)?;
-    if old.is_empty() {
+    if old.is_empty() || !s.contains(old.as_str()) {
         return text_val(s);
     }
     if has(a, 3) {

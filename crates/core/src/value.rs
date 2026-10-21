@@ -294,8 +294,8 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
         (Value::Empty, Value::Empty) => Ordering::Equal,
         (Value::Empty, Value::Number(n)) => compare_numbers(0.0, *n),
         (Value::Number(n), Value::Empty) => compare_numbers(*n, 0.0),
-        (Value::Empty, Value::Text(t)) => "".cmp(&t.to_lowercase() as &str),
-        (Value::Text(t), Value::Empty) => (t.to_lowercase() as String).as_str().cmp(""),
+        (Value::Empty, Value::Text(t)) => "".cmp(if t.is_empty() { "" } else { "a" }),
+        (Value::Text(t), Value::Empty) => (if t.is_empty() { "" } else { "a" }).cmp(""),
         (Value::Empty, Value::Bool(b)) => false.cmp(b),
         (Value::Bool(b), Value::Empty) => b.cmp(&false),
         (Value::Number(x), Value::Number(y)) => compare_numbers(*x, *y),
@@ -325,6 +325,15 @@ pub fn compare_numbers(a: f64, b: f64) -> Ordering {
 
 /// Case-insensitive text order (Unicode lowercase).
 pub fn compare_text(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        for (ca, cb) in a.bytes().zip(b.bytes()) {
+            let diff = ca.to_ascii_lowercase().cmp(&cb.to_ascii_lowercase());
+            if diff != Ordering::Equal {
+                return diff;
+            }
+        }
+        return a.len().cmp(&b.len());
+    }
     let mut ai = a.chars().flat_map(char::to_lowercase);
     let mut bi = b.chars().flat_map(char::to_lowercase);
     loop {

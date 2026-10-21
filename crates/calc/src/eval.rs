@@ -94,6 +94,77 @@ pub trait Host {
             gridcraft_functions::lookup_equal(needle, &key, wild)
         })
     }
+    /// Cache for invariant expressions evaluated during a pass.
+    fn get_cached_val(&mut self, _key: u64) -> Option<Value> {
+        None
+    }
+    fn set_cached_val(&mut self, _key: u64, _val: Value) {}
+}
+
+pub fn hash_expr<H: std::hash::Hasher>(e: &Expr, state: &mut H) {
+    use std::hash::Hash;
+    std::mem::discriminant(e).hash(state);
+    match e {
+        Expr::Number(f) => state.write_u64(f.to_bits()),
+        Expr::Text(t) => t.hash(state),
+        Expr::Bool(b) => b.hash(state),
+        Expr::Error(err) => err.code().hash(state),
+        Expr::Ref(r) => r.hash(state),
+        Expr::Struct(s) => s.hash(state),
+        Expr::Name(name) => name.hash(state),
+        Expr::Call(name, args) => {
+            name.hash(state);
+            for a in args {
+                hash_expr(a, state);
+            }
+        }
+        Expr::Binary(op, a, b) => {
+            op.hash(state);
+            hash_expr(a, state);
+            hash_expr(b, state);
+        }
+        Expr::Unary(op, a) => {
+            op.hash(state);
+            hash_expr(a, state);
+        }
+        Expr::Paren(a) => hash_expr(a, state),
+        Expr::Array(rows) => {
+            for row in rows {
+                for cell in row {
+                    hash_expr(cell, state);
+                }
+            }
+        }
+        Expr::Invoke(c, args) => {
+            hash_expr(c, state);
+            for a in args {
+                hash_expr(a, state);
+            }
+        }
+        Expr::Missing => 0u8.hash(state),
+    }
+}
+
+pub fn is_expr_invariant(e: &Expr, variant_names: &std::collections::HashSet<&str>) -> bool {
+    let mut ok = true;
+    e.walk(&mut |node| {
+        if !ok {
+            return;
+        }
+        match node {
+            Expr::Struct(s) if s.specifiers.contains(&StructItem::ThisRow) => ok = false,
+            Expr::Ref(r) => match &r.kind {
+                RefKind::Cell(c) if !c.row_abs || !c.col_abs => ok = false,
+                RefKind::Range(a, b) if !a.row_abs || !a.col_abs || !b.row_abs || !b.col_abs => ok = false,
+                _ => {}
+            },
+            Expr::Name(n) if variant_names.contains(n.as_str()) => ok = false,
+            Expr::Call(n, _) if matches!(n.as_str(), "ROW" | "COLUMN" | "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY" | "INDIRECT" | "OFFSET" | "CELL") => ok = false,
+            Expr::Unary(UnOp::At, _) => ok = false,
+            _ => {}
+        }
+    });
+    ok
 }
 
 pub struct Evaluator<'h> {
@@ -519,15 +590,34 @@ impl<'h> Evaluator<'h> {
                     rest.push((*o, r.as_ref()));
                     left = l.as_ref();
                 }
-                let mut acc = self.value(left);
+                let mut acc = self.value_maybe_cached(left);
                 while let Some((o, r)) = rest.pop() {
-                    let y = self.value(r);
+                    let y = self.value_maybe_cached(r);
                     acc = binary_values(o, &acc, &y, self.host.workbook().date_system);
                 }
                 Ev::V(acc)
             }
         }
     }
+
+    fn value_maybe_cached(&mut self, e: &Expr) -> Value {
+        if matches!(e, Expr::Call(..) | Expr::Binary(..)) && self.env.is_empty() {
+            let empty_set = std::collections::HashSet::new();
+            if is_expr_invariant(e, &empty_set) {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                hash_expr(e, &mut hasher);
+                let h = std::hash::Hasher::finish(&hasher);
+                if let Some(v) = self.host.get_cached_val(h) {
+                    return v;
+                }
+                let val = self.value(e);
+                self.host.set_cached_val(h, val.clone());
+                return val;
+            }
+        }
+        self.value(e)
+    }
+
 
     // ------------------------------------------------------------------ calls
 
@@ -1043,12 +1133,31 @@ impl<'h> Evaluator<'h> {
             return err(CellError::Value);
         }
         let base = self.env.len();
+        let mut variant_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for pair in args[..args.len() - 1].chunks(2) {
             let [Expr::Name(n), v] = pair else {
                 self.env.truncate(base);
                 return err(CellError::Value);
             };
-            let val = self.eval(v);
+            let val = if is_expr_invariant(v, &variant_names) {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                n.hash(&mut hasher);
+                hash_expr(v, &mut hasher);
+                let h = hasher.finish();
+                if let Some(cached) = self.host.get_cached_val(h) {
+                    Ev::V(cached)
+                } else {
+                    let ev = self.eval(v);
+                    if let Ev::V(ref val) = ev {
+                        self.host.set_cached_val(h, val.clone());
+                    }
+                    ev
+                }
+            } else {
+                variant_names.insert(n.as_str());
+                self.eval(v)
+            };
             self.env.push((n.clone(), val));
         }
         let r = match args.last() {
@@ -1776,7 +1885,11 @@ fn binary_scalar(op: BinOp, a: &Value, b: &Value, sys: gridcraft_core::DateSyste
         }),
         BinOp::Concat => match (a.to_text(), b.to_text()) {
             (Ok(x), Ok(y)) => {
-                if x.len() + y.len() > 32767 * 4 {
+                if x.is_empty() {
+                    Value::text(y)
+                } else if y.is_empty() {
+                    Value::text(x)
+                } else if x.len() + y.len() > 32767 * 4 {
                     Value::Error(CellError::Value)
                 } else {
                     Value::text(x + &y)
