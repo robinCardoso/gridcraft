@@ -999,6 +999,10 @@ fn masked_numbers(target: &Array, mask: &[bool]) -> R<Vec<f64>> {
 
 fn countifs(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     let first = as_array(&crate::util::arg(a, 0)?.value);
+    if a.len() == 2 {
+        let c = Criterion::parse_arg(&crate::util::arg(a, 1)?.value.scalar())?;
+        return num_val(first.iter().filter(|v| c.matches(v)).count() as f64);
+    }
     let mask = criteria_mask(a, 0, first.rows, first.cols)?;
     num_val(mask.iter().filter(|m| **m).count() as f64)
 }

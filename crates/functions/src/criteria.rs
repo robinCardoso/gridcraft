@@ -19,13 +19,23 @@ enum Op {
     Ge,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tok {
+    Char(char),
+    Any,
+    Star,
+}
+
 #[derive(Clone, Debug)]
 enum Operand {
     Number(f64),
     Bool(bool),
     Error(CellError),
-    /// Text (lower-cased chars kept for wildcard matching).
-    Text(String),
+    /// Text (pattern and optional pre-tokenized tokens for wildcard matching).
+    Text {
+        pat: String,
+        tokens: Option<Vec<Tok>>,
+    },
     /// A criterion cut to its first 255 UTF-16 units in the middle of a surrogate pair: the
     /// complete characters before the cut, followed (in Excel) by a lone high surrogate.
     ///
@@ -118,7 +128,15 @@ impl Criterion {
         } else if let Some(e) = CellError::parse(rest) {
             Operand::Error(e)
         } else {
-            Operand::Text(rest.to_string())
+            let tokens = if has_wildcards(rest) {
+                Some(tokenize(rest))
+            } else {
+                None
+            };
+            Operand::Text {
+                pat: rest.to_string(),
+                tokens,
+            }
         };
         Criterion { op, operand, bare_empty: false }
     }
@@ -126,11 +144,11 @@ impl Criterion {
     /// Whether a cell value satisfies the criterion.
     pub(crate) fn matches(&self, v: &Value) -> bool {
         let v = match v {
-            Value::Array(a) => a.data.first().cloned().unwrap_or(Value::Empty),
-            other => other.clone(),
+            Value::Array(a) => a.data.first().unwrap_or(&Value::Empty),
+            other => other,
         };
         if self.bare_empty {
-            return matches!(&v, Value::Empty) || matches!(&v, Value::Text(t) if t.is_empty());
+            return matches!(v, Value::Empty) || matches!(v, Value::Text(t) if t.is_empty());
         }
         match &self.operand {
             Operand::Blank => {
@@ -140,14 +158,14 @@ impl Criterion {
                     Op::Ne => !blank,
                     // "<" / ">" with nothing: Excel compares against "" for text cells, but an
                     // empty string never matches ("<=" and ">=" count it in neither).
-                    _ => match &v {
+                    _ => match v {
                         Value::Text(t) if !t.is_empty() => cmp_op(self.op, compare_text(t, "")),
                         _ => false,
                     },
                 }
             }
             Operand::Number(n) => {
-                let cell = match &v {
+                let cell = match v {
                     Value::Number(x) => Some(*x),
                     // Numeric text matches only for equality (COUNTIF("1") counts text "1").
                     Value::Text(t) if matches!(self.op, Op::Eq | Op::Ne) => parse_number_text(t),
@@ -158,25 +176,33 @@ impl Criterion {
                     None => self.op == Op::Ne,
                 }
             }
-            Operand::Bool(b) => match &v {
+            Operand::Bool(b) => match v {
                 Value::Bool(x) => cmp_op(self.op, x.cmp(b)),
                 _ => self.op == Op::Ne,
             },
-            Operand::Error(e) => match &v {
+            Operand::Error(e) => match v {
                 Value::Error(x) => cmp_op(self.op, x.code().cmp(&e.code())),
                 _ => self.op == Op::Ne,
             },
-            Operand::Text(pat) => match self.op {
+            Operand::Text { pat, tokens } => match self.op {
                 Op::Eq | Op::Ne => {
                     // Blank cells hold no text: `"*"` skips them and `"<>*"` counts them.
-                    let cell_text = match &v {
-                        Value::Text(t) => Some(t.to_string()),
-                        _ => None,
+                    let m = match v {
+                        Value::Text(t) => {
+                            if let Some(toks) = tokens {
+                                let lowered = lower_chars(t);
+                                match_from(toks, &lowered, true).is_some()
+                            } else if t.is_ascii() && pat.is_ascii() {
+                                t.eq_ignore_ascii_case(pat)
+                            } else {
+                                compare_text(t, pat) == Ordering::Equal
+                            }
+                        }
+                        _ => false,
                     };
-                    let m = cell_text.is_some_and(|t| wildcard_match(pat, &t));
                     if self.op == Op::Eq { m } else { !m }
                 }
-                _ => match &v {
+                _ => match v {
                     Value::Text(t) => cmp_op(self.op, compare_text(t, pat)),
                     _ => false,
                 },
@@ -184,8 +210,8 @@ impl Criterion {
             Operand::CutText(kept) => match self.op {
                 Op::Eq => false,
                 Op::Ne => true,
-                Op::Lt | Op::Le => matches!(&v, Value::Text(t) if compare_text(t, kept) != Ordering::Greater),
-                Op::Gt | Op::Ge => matches!(&v, Value::Text(t) if compare_text(t, kept) == Ordering::Greater),
+                Op::Lt | Op::Le => matches!(v, Value::Text(t) if compare_text(t, kept) != Ordering::Greater),
+                Op::Gt | Op::Ge => matches!(v, Value::Text(t) if compare_text(t, kept) == Ordering::Greater),
             },
         }
     }
@@ -221,12 +247,6 @@ fn cmp_op(op: Op, o: Ordering) -> bool {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Tok {
-    Char(char),
-    Any,
-    Star,
-}
 
 fn tokenize(pattern: &str) -> Vec<Tok> {
     let mut out = Vec::new();
@@ -257,11 +277,21 @@ fn lower_chars(s: &str) -> Vec<char> {
 
 /// Whether the pattern contains an unescaped wildcard.
 pub fn has_wildcards(pattern: &str) -> bool {
+    if !pattern.bytes().any(|b| b == b'*' || b == b'?' || b == b'~') {
+        return false;
+    }
     tokenize(pattern).iter().any(|t| !matches!(t, Tok::Char(_))) || pattern.contains('~')
 }
 
 /// Case-insensitive whole-text match with `*`, `?` and `~` escapes.
 pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
+    if !has_wildcards(pattern) {
+        return if pattern.is_ascii() && text.is_ascii() {
+            pattern.eq_ignore_ascii_case(text)
+        } else {
+            compare_text(pattern, text) == Ordering::Equal
+        };
+    }
     let p = tokenize(pattern);
     let t = lower_chars(text);
     match_from(&p, &t, true).is_some()

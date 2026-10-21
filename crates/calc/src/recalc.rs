@@ -988,7 +988,17 @@ impl Calc {
             }
         }
         if !needed.is_empty() {
-            self.run(wb, needed, false);
+            if needed.len() > 1_000 {
+                let active = wb.active_sheet;
+                needed.retain(|k| k.0 == active || wb.sheet(k.0).and_then(|s| s.cell(k.1)).is_some_and(|c| c.formula.as_ref().is_some_and(|f| f.array.is_some())));
+                needed.sort_by_key(|k| (k.1.row, k.1.col));
+                needed.truncate(1_000);
+                if !needed.is_empty() {
+                    self.run_scoped(wb, needed, false, Some(active));
+                }
+            } else {
+                self.run(wb, needed, false);
+            }
         }
     }
 
@@ -1111,7 +1121,12 @@ impl Calc {
     }
 
     /// Evaluates the dirty set and writes results (and spills) back.
-    fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool) {
+    fn run(&mut self, wb: &mut Workbook, dirty: Vec<Key>, full: bool) {
+        self.run_scoped(wb, dirty, full, None);
+    }
+
+    /// Evaluates the dirty set, optionally scoped to a single sheet to avoid cascading recalculation across massive workbooks on load.
+    fn run_scoped(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool, scope_sheet: Option<usize>) {
         let mut dynamic_again = !self.graph.dynamic.is_empty();
         for _round in 0..8 {
             if dirty.is_empty() {
@@ -1231,12 +1246,18 @@ impl Calc {
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
                 eprintln!("  write-back {:.1} ms", prof_now() - tw);
             }
+            if let Some(sh) = scope_sheet {
+                spill_changes.retain(|k| k.0 == sh);
+            }
             spill_changes.sort_by_key(|(s, c)| (*s, c.row, c.col));
             spill_changes.dedup();
             if spill_changes.is_empty() {
                 break;
             }
             dirty = self.dirty_closure(wb, &spill_changes);
+            if let Some(sh) = scope_sheet {
+                dirty.retain(|k| k.0 == sh);
+            }
         }
     }
 }
