@@ -18,12 +18,26 @@ fn test_inspect_cotacao_table() {
     let (mut wb, _report) = gridcraft_xlsx::read_xlsx(&bytes).expect("parse xlsx");
     println!("read_xlsx took {:.2?}", t_read.elapsed());
 
-    let sh0 = wb.sheet_mut(0).unwrap();
-    sh0.set_cell(gridcraft_core::CellRef::new(0, 1), gridcraft_model::Cell {
-        value: gridcraft_core::Value::text("sc"),
-        formula: None,
-        style: gridcraft_model::StyleId(0),
-    });
+    println!("--- INSPECT COTACAO SHEET (SHEET 0) ---");
+    if let Some(sh0) = wb.sheet(0) {
+        println!("Sheet 0 name: {}", sh0.name);
+        println!("Sheet 0 table count: {}", sh0.tables.len());
+        for t in &sh0.tables {
+            println!("  Table name: {}, range: {:?}", t.name, t.range);
+            for (ci, c) in t.columns.iter().enumerate() {
+                println!("    Col {}: name={}, formula={:?}", ci, c.name, c.formula);
+            }
+        }
+        for r in [14, 15, 16] { // Excel rows 15, 16, 17
+            for c in 0..12 {
+                let cell_ref = gridcraft_core::CellRef::new(r, c);
+                let cell = sh0.cell(cell_ref);
+                let f_str = cell.and_then(|x| x.formula.as_ref()).map(|f| &f.text);
+                let v_str = cell.map(|x| &x.value);
+                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r+1, c, cell_ref.a1(), f_str, v_str);
+            }
+        }
+    }
 
     println!("Inspect sheet 1 (LISTA_PRECO) before recalc:");
     if let Some(sh1) = wb.sheet(1) {
