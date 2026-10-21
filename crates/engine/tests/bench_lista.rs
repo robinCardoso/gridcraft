@@ -2,11 +2,17 @@ use std::time::Instant;
 
 #[test]
 fn test_inspect_cotacao_table() {
-    let path = r"c:\Users\Robson-PC\.antigravity\projetos\grif-excel\LISTA TESTE V3.xlsx";
-    if !std::path::Path::new(path).exists() {
-        println!("File {path} not found, skipping benchmark test");
+    let reduced = r"c:\Users\Robson-PC\.antigravity\projetos\grif-excel\LISTA REDUZIDA.xlsx";
+    let full = r"c:\Users\Robson-PC\.antigravity\projetos\grif-excel\LISTA TESTE V3.xlsx";
+    let path = if std::path::Path::new(reduced).exists() {
+        reduced
+    } else if std::path::Path::new(full).exists() {
+        full
+    } else {
+        println!("Test file not found, skipping benchmark test");
         return;
-    }
+    };
+    println!("Running benchmark with file: {path}");
     let bytes = std::fs::read(path).expect("read file");
     let t_read = Instant::now();
     let (mut wb, _report) = gridcraft_xlsx::read_xlsx(&bytes).expect("parse xlsx");
@@ -82,15 +88,17 @@ fn test_inspect_cotacao_table() {
         println!("F3 Eval result: {:?}", res);
     }
 
-    println!("Timing 100 rows of Col F evaluation:");
-    let t_100 = Instant::now();
-    for r in 2..102 {
+    let max_row = wb.sheet(1).and_then(|s| s.used_range()).map(|r| r.end.row).unwrap_or(100);
+    let sample_rows = 102.min(max_row + 1);
+    println!("Timing rows 2..{sample_rows} of Col F evaluation:");
+    let t_col = Instant::now();
+    for r in 2..sample_rows {
         let cell_ref = gridcraft_core::CellRef::new(r, 5);
         if let Some(f) = wb.sheet(1).unwrap().cell(cell_ref).and_then(|c| c.formula.as_ref()) {
             gridcraft_calc::evaluate(&wb, 1, cell_ref, &f.text);
         }
     }
-    println!("  100 rows of Col F took {:.2?}", t_100.elapsed());
+    println!("  Rows 2..{sample_rows} of Col F took {:.2?}", t_col.elapsed());
     println!("Testing DocState and wb_switch_sheet(1) to LISTA_PRECO:");
     let mut doc = gridcraft_engine::DocState::new(wb, None, "Test".into());
     let t_switch = Instant::now();
