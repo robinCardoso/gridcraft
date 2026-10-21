@@ -8,7 +8,9 @@ fn test_inspect_cotacao_table() {
         return;
     }
     let bytes = std::fs::read(path).expect("read file");
+    let t_read = Instant::now();
     let (mut wb, _report) = gridcraft_xlsx::read_xlsx(&bytes).expect("parse xlsx");
+    println!("read_xlsx took {:.2?}", t_read.elapsed());
 
     let sh0 = wb.sheet_mut(0).unwrap();
     sh0.set_cell(gridcraft_core::CellRef::new(0, 1), gridcraft_model::Cell {
@@ -17,25 +19,99 @@ fn test_inspect_cotacao_table() {
         style: gridcraft_model::StyleId(0),
     });
 
+    println!("Inspect sheet 1 (LISTA_PRECO) before recalc:");
+    if let Some(sh1) = wb.sheet(1) {
+        println!("Sheet 1 name: {}", sh1.name);
+        println!("Sheet 1 table count: {}", sh1.tables.len());
+        for t in &sh1.tables {
+            println!("  Table name: {}, range: {:?}", t.name, t.range);
+            for (ci, c) in t.columns.iter().enumerate() {
+                if ci < 10 {
+                    println!("    Col {}: name={}, formula={:?}", ci, c.name, c.formula);
+                }
+            }
+        }
+        for r in 1..=3 {
+            for c in 0..10 {
+                let cell_ref = gridcraft_core::CellRef::new(r, c);
+                let cell = sh1.cell(cell_ref);
+                let f_str = cell.and_then(|x| x.formula.as_ref()).map(|f| &f.text);
+                let v_str = cell.map(|x| &x.value);
+                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r+1, c, cell_ref.a1(), f_str, v_str);
+            }
+        }
+    }
+
     println!("Initializing calc with recalc_on_load:");
     let mut calc = gridcraft_calc::Calc::new();
     let t0 = Instant::now();
     calc.recalc_on_load(&mut wb);
     println!("  recalc_on_load took {:.2?}", t0.elapsed());
 
-    println!("Testing calc.cells_changed on changing B1 to 'sc':");
-    let t1 = Instant::now();
-    calc.cells_changed(&mut wb, &[(0, gridcraft_core::CellRef::new(0, 1))]);
-    println!("  calc.cells_changed B1 took {:.2?}", t1.elapsed());
+    println!("--- DETAILED EVAL OF F3 AND I3 ---");
+    let sh1_idx = 1;
+    let f3_ref = gridcraft_core::CellRef::new(2, 5);
+    
+    // Test 1: LISTA_PRECO[@Referencia]
+    let v1 = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, "LISTA_PRECO[@Referencia]");
+    println!("Eval LISTA_PRECO[@Referencia] at F3: {:?}", v1);
 
-    println!("Testing calc.cells_changed on changing B2 to 'BA':");
-    let sh0 = wb.sheet_mut(0).unwrap();
-    sh0.set_cell(gridcraft_core::CellRef::new(1, 1), gridcraft_model::Cell {
-        value: gridcraft_core::Value::text("BA"),
-        formula: None,
-        style: gridcraft_model::StyleId(0),
+    // Test 2: LISTA_PRECO[@cst_produto]
+    let v2 = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, "LISTA_PRECO[@cst_produto]");
+    println!("Eval LISTA_PRECO[@cst_produto] at F3: {:?}", v2);
+
+    // Test 3: PRECO_LIQUIDO[[#All],[Fornecedor]]
+    let v3 = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, "PRECO_LIQUIDO[[#All],[Fornecedor]]");
+    println!("Eval PRECO_LIQUIDO[[#All],[Fornecedor]]: {:?}", match &v3 {
+        gridcraft_core::Value::Array(a) => format!("Array of {} elements", a.data.len()),
+        other => format!("{:?}", other),
     });
-    let t2 = Instant::now();
-    calc.cells_changed(&mut wb, &[(0, gridcraft_core::CellRef::new(1, 1))]);
-    println!("  calc.cells_changed B2 took {:.2?}", t2.elapsed());
+
+    // Test 4: REGRA_CST[]
+    let v4 = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, "REGRA_CST[]");
+    println!("Eval REGRA_CST[]: {:?}", match &v4 {
+        gridcraft_core::Value::Array(a) => format!("Array of {} elements", a.data.len()),
+        other => format!("{:?}", other),
+    });
+
+    // Test 5: Full F3 formula
+    let f3_cell = wb.sheet(sh1_idx).unwrap().cell(f3_ref);
+    if let Some(f) = f3_cell.and_then(|c| c.formula.as_ref()) {
+        println!("F3 Formula text: {}", f.text);
+        let res = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, &f.text);
+        println!("F3 Eval result: {:?}", res);
+    }
+
+    println!("Timing 100 rows of Col F evaluation:");
+    let t_100 = Instant::now();
+    for r in 2..102 {
+        let cell_ref = gridcraft_core::CellRef::new(r, 5);
+        if let Some(f) = wb.sheet(1).unwrap().cell(cell_ref).and_then(|c| c.formula.as_ref()) {
+            gridcraft_calc::evaluate(&wb, 1, cell_ref, &f.text);
+        }
+    }
+    println!("  100 rows of Col F took {:.2?}", t_100.elapsed());
+    println!("Testing DocState and wb_switch_sheet(1) to LISTA_PRECO:");
+    let mut doc = gridcraft_engine::DocState::new(wb, None, "Test".into());
+    let t_switch = Instant::now();
+    doc.wb_switch_sheet(1);
+    println!("  wb_switch_sheet(1) took {:.2?}", t_switch.elapsed());
+
+    println!("Checking cells in LISTA_PRECO after wb_switch_sheet(1):");
+    if let Some(sh1) = doc.wb.sheet(1) {
+        for r in 1..=4 {
+            for c in [0, 1, 5, 6, 8] {
+                let cell_ref = gridcraft_core::CellRef::new(r, c);
+                let cell = sh1.cell(cell_ref);
+                let f_str = cell.and_then(|x| x.formula.as_ref()).map(|f| &f.text);
+                let v_str = cell.map(|x| &x.value);
+                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r+1, c, cell_ref.a1(), f_str, v_str);
+            }
+        }
+        // Assert that row 3 (index 2) calculated accurately
+        let f3_val = sh1.value(gridcraft_core::CellRef::new(2, 5));
+        assert_eq!(f3_val, gridcraft_core::Value::text("Bruto"));
+        let i3_val = sh1.value(gridcraft_core::CellRef::new(2, 8));
+        assert_eq!(i3_val, gridcraft_core::Value::text("NACIONAL"));
+    }
 }

@@ -1010,6 +1010,33 @@ impl Calc {
         }
     }
 
+    /// Recalculates uncomputed formulas on the given sheet, up to `limit` formulas.
+    /// If `limit == 0`, all uncomputed formulas on the sheet are recalculated.
+    pub fn recalc_sheet_scoped(&mut self, wb: &mut Workbook, sheet: usize, limit: usize) {
+        let mut needed: Vec<Key> = Vec::new();
+        for &k in self.graph.nodes.keys() {
+            if k.0 == sheet {
+                if let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1)) {
+                    if cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()) {
+                        needed.push(k);
+                    }
+                }
+            }
+        }
+        if !needed.is_empty() {
+            needed.sort_by_key(|k| (k.1.row, k.1.col));
+            if limit > 0 && needed.len() > limit {
+                needed.truncate(limit);
+            }
+            self.run_scoped(wb, needed, false, Some(sheet));
+        }
+    }
+
+    /// Recalculates all uncomputed formulas on the given sheet.
+    pub fn recalc_sheet(&mut self, wb: &mut Workbook, sheet: usize) {
+        self.recalc_sheet_scoped(wb, sheet, 0);
+    }
+
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();

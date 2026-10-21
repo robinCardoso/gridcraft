@@ -3,7 +3,7 @@
 
 use std::f64::consts::PI;
 
-use gridcraft_core::{Array, CellError, Value};
+use gridcraft_core::{CellError, Value};
 
 use crate::criteria::Criterion;
 use crate::util::{
@@ -954,47 +954,53 @@ fn seriessum(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 // ---------------------------------------------------------------------------------------------
 // Criteria aggregates
 
-/// Values at the matched positions of `target` for every (range, criteria) pair.
-fn criteria_mask(a: &[Arg], first_pair: usize, rows: usize, cols: usize) -> R<Vec<bool>> {
+/// Indices of matched positions in ranges for every (range, criteria) pair.
+fn criteria_matches(a: &[Arg], first_pair: usize, rows: usize, cols: usize) -> R<Vec<usize>> {
     let rest = a.get(first_pair..).unwrap_or(&[]);
     if rest.is_empty() || rest.len() % 2 != 0 {
         return Err(CellError::Value);
     }
-    // A text criterion over 255 characters is `#VALUE!` only when there is a single criteria
-    // pair. With two or more pairs Excel matches its first 255 characters instead.
     let single_pair = rest.len() == 2;
-    let mut mask = vec![true; rows.saturating_mul(cols)];
-    for pair in rest.chunks(2) {
+    let mut chunks = rest.chunks(2);
+
+    // First pair
+    let Some(first_chunk) = chunks.next() else { return Ok(Vec::new()) };
+    let (Some(range), Some(crit)) = (first_chunk.first(), first_chunk.get(1)) else { return Err(CellError::Value) };
+    let r = as_array(&range.value);
+    if r.rows != rows || r.cols != cols {
+        return Err(CellError::Value);
+    }
+    let scalar = crit.value.scalar();
+    let c = if single_pair { Criterion::parse_arg(&scalar)? } else { Criterion::parse_arg_truncated(&scalar) };
+
+    let mut matches: Vec<usize> = Vec::new();
+    for (i, v) in r.iter().enumerate() {
+        if c.matches(v) {
+            matches.push(i);
+        }
+    }
+
+    // Subsequent pairs narrow down the matching candidate indices
+    for pair in chunks {
+        if matches.is_empty() {
+            return Ok(matches);
+        }
         let (Some(range), Some(crit)) = (pair.first(), pair.get(1)) else { return Err(CellError::Value) };
         let r = as_array(&range.value);
         if r.rows != rows || r.cols != cols {
             return Err(CellError::Value);
         }
         let scalar = crit.value.scalar();
-        let c = if single_pair { Criterion::parse_arg(&scalar)? } else { Criterion::parse_arg_truncated(&scalar) };
-        for (m, v) in mask.iter_mut().zip(r.iter()) {
-            if *m && !c.matches(v) {
-                *m = false;
+        let c = Criterion::parse_arg_truncated(&scalar);
+        matches.retain(|&idx| {
+            if let Some(v) = r.data.get(idx) {
+                c.matches(v)
+            } else {
+                false
             }
-        }
+        });
     }
-    Ok(mask)
-}
-
-/// Numbers in `target` where `mask` is set (errors at matched positions propagate).
-fn masked_numbers(target: &Array, mask: &[bool]) -> R<Vec<f64>> {
-    let mut out = Vec::new();
-    for (v, m) in target.iter().zip(mask.iter()) {
-        if !*m {
-            continue;
-        }
-        match v {
-            Value::Number(n) => out.push(*n),
-            Value::Error(e) => return Err(*e),
-            _ => {}
-        }
-    }
-    Ok(out)
+    Ok(matches)
 }
 
 fn countifs(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
@@ -1003,15 +1009,25 @@ fn countifs(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
         let c = Criterion::parse_arg(&crate::util::arg(a, 1)?.value.scalar())?;
         return num_val(first.iter().filter(|v| c.matches(v)).count() as f64);
     }
-    let mask = criteria_mask(a, 0, first.rows, first.cols)?;
-    num_val(mask.iter().filter(|m| **m).count() as f64)
+    let matches = criteria_matches(a, 0, first.rows, first.cols)?;
+    num_val(matches.len() as f64)
 }
 
-/// The values of the `*IFS` target range with the mask from its pairs.
+/// The values of the `*IFS` target range at the matched positions from its pairs.
 fn ifs_numbers(a: &[Arg]) -> R<Vec<f64>> {
     let target = as_array(&crate::util::arg(a, 0)?.value);
-    let mask = criteria_mask(a, 1, target.rows, target.cols)?;
-    masked_numbers(&target, &mask)
+    let matches = criteria_matches(a, 1, target.rows, target.cols)?;
+    let mut out = Vec::with_capacity(matches.len());
+    for idx in matches {
+        if let Some(v) = target.data.get(idx) {
+            match v {
+                Value::Number(n) => out.push(*n),
+                Value::Error(e) => return Err(*e),
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn sumifs(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {

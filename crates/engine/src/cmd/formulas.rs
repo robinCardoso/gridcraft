@@ -55,7 +55,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "formulas.evaluateFormula", "Evaluate Formula", ["Formulas", "Formula Auditing"], None, "{cell?, formula?} → steps", has_doc, evaluate_formula),
         cmd!(query "formulas.evaluate", "Evaluate", [], None, "{formula: \"=SUM(A1:A3)\", cell?} → value without changing the sheet", has_doc, evaluate),
         cmd!(noundo "formulas.calculateNow", "Calculate Now", ["Formulas", "Calculation"], Some("F9"), "{}", has_doc, calc_now),
-        cmd!(noundo "formulas.calculateSheet", "Calculate Sheet", ["Formulas", "Calculation"], Some("Shift+F9"), "{}", has_doc, calc_now),
+        cmd!(noundo "formulas.calculateSheet", "Calculate Sheet", ["Formulas", "Calculation"], Some("Shift+F9"), "{}", has_doc, calc_sheet),
         cmd!(
             "formulas.calculationOptions",
             "Calculation Options",
@@ -554,6 +554,15 @@ fn calc_now(s: &mut Session, _: &Json) -> Result<Json> {
     d.calc.recalc_all(&mut wb);
     d.wb = std::sync::Arc::new(wb);
     Ok(json!({"cells": d.calc.last_recalc_cells}))
+}
+
+fn calc_sheet(s: &mut Session, _: &Json) -> Result<Json> {
+    let d = s.doc_mut()?;
+    let active = d.wb.active_sheet;
+    let mut wb = (*d.wb).clone();
+    d.calc.recalc_sheet(&mut wb, active);
+    d.wb = std::sync::Arc::new(wb);
+    Ok(json!({"cells": d.calc.last_recalc_cells, "sheet": active}))
 }
 
 fn calc_options(s: &mut Session, p: &Json) -> Result<Json> {

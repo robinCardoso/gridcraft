@@ -437,6 +437,18 @@ impl crate::DocState {
             wb.active_sheet = i;
         }
         self.selection = self.sheet_selections.get(i).cloned().unwrap_or_default();
+        if self.wb.sheet(i).is_some_and(|sh| sh.cells.iter().any(|(_, c)| c.formula.is_some() && c.value.is_empty())) {
+            let dirty = self.is_dirty();
+            if !dirty {
+                self.saved = std::sync::Arc::new(gridcraft_model::Workbook::new());
+                let wb = std::sync::Arc::make_mut(&mut self.wb);
+                self.calc.recalc_sheet_scoped(wb, i, 500);
+                self.saved = self.wb.clone();
+            } else {
+                let wb = std::sync::Arc::make_mut(&mut self.wb);
+                self.calc.recalc_sheet_scoped(wb, i, 500);
+            }
+        }
     }
 }
 
