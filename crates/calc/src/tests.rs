@@ -1832,6 +1832,44 @@ fn whole_column_structured_ref_dirties_column_readers_only() {
     assert_eq!(t.num("D2"), 101.0);
 }
 
+/// Whole-column structured precedents must track table geometry after the table grows.
+/// Pinning `Sales[Qty]` at graph time and then expanding the table without refreshing those
+/// Areas leaves dependents blind to new rows (the post–resolve_struct regression).
+#[test]
+fn expanding_table_refreshes_whole_column_structured_precedents() {
+    use crate::eval::precedents;
+    use gridcraft_formula::parse;
+
+    let mut t = T::new();
+    t.set("A1", "Qty");
+    t.set("A2", "1");
+    t.set("A3", "2");
+    push_table(&mut t, "Sales", "A1:A3", &["Qty"], true, false);
+    t.set("C1", "=SUM(Sales[Qty])");
+    assert_eq!(t.num("C1"), 3.0);
+
+    let (areas, _) = precedents(&t.wb, 0, c("C1"), &parse("=SUM(Sales[Qty])").unwrap());
+    assert_eq!(areas[0].range.a1(), "A2:A3");
+
+    // Grow the table and add a row the way auto-expand does — without a full rebuild yet.
+    t.wb.sheet_mut(0).unwrap().tables[0].range.end.row = 3; // A1:A4
+    t.wb.sheet_mut(0).unwrap().cells.set(c("A4"), Cell::value(Value::Number(10.0)));
+
+    // Stale graph: C1 still depends only on A2:A3, so A4 does not dirty it.
+    let seeds = [(0, c("A4"))];
+    assert!(
+        !t.calc.cascade_exceeds(&seeds, 1),
+        "before refresh, editing the new row must not dirty SUM(Sales[Qty])"
+    );
+
+    // After nodes that read the table are rebuilt against current geometry, the new row is visible.
+    t.calc.rebuild(&t.wb);
+    let (areas, _) = precedents(&t.wb, 0, c("C1"), &parse("=SUM(Sales[Qty])").unwrap());
+    assert_eq!(areas[0].range.a1(), "A2:A4");
+    t.calc.cells_changed(&mut t.wb, &seeds);
+    assert_eq!(t.num("C1"), 13.0, "after rebuild, A4 must dirty and update SUM(Sales[Qty])");
+}
+
 /// Nested LET + ThisRow structured refs still evaluate per row (regression with static precedents).
 #[test]
 fn nested_let_with_this_row_structured_refs() {

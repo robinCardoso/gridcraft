@@ -233,6 +233,20 @@ permanecia.
 `whole_column_structured_ref_dirties_column_readers_only`,
 `nested_let_with_this_row_structured_refs`.
 
+### 7.2 Follow-up: expand de tabela + grafo stale ✅ (2026-10-23)
+
+**Problema:** com Areas de `Expr::Struct` pinadas no rebuild, auto-expand/paste que
+cresce a tabela marcava `structural` e chamava `recalc_all` **sem** invalidar o grafo.
+`ensure_graph` (otimização F9) via o grafo ainda “válido” e **não** reconstruía nós —
+fórmulas de coluna calculada autofilled ficavam com valor Empty; precedents de coluna
+inteira continuavam no range antigo.
+
+**Fix (universal):** `invalidate_graph()` no branch estrutural síncrono de `commit`
+(`engine/src/cmd/mod.rs`), simétrico ao path `defer_structural`.
+
+**Testes:** `paste_expands_structured_calc_columns_like_cotacao` (engine),
+`expanding_table_refreshes_whole_column_structured_precedents` (calc).
+
 ### Ainda pendente (decisão em dados — próxima sprint)
 
 1. **Reteste manual** no corpus denso: clear/edit na coluna Referencia — dirty/progresso

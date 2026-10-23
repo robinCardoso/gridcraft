@@ -174,25 +174,31 @@
 
 ## Handoff — próximos passos (para quem continuar o plano)
 
-> ### ⏸️ ONDE PARAMOS — 2026-10-23 (structured refs estáticos no grafo + dirty)
+> ### ⏸️ ONDE PARAMOS — 2026-10-23 (expand tabela + rebuild estrutural)
 >
-> **Fechado agora (código):** H9 de [`plano-desempenho-calculo.md`](./plano-desempenho-calculo.md)
-> §7.1 — `precedents` resolve `Expr::Struct` → `Area` concreta (ThisRow / coluna / Headers…)
-> em vez de `dynamic = true`; clear/edit em coluna de tabela suja só dependentes reais
-> (não todo `graph.dynamic`). Progresso incremental: denominador = `|dirty|`. Testes em
-> `calc/src/tests.rs` (`structured_ref_precedents_*`, `table_column_edit_does_not_dirty_*`,
-> `whole_column_structured_*`, `nested_let_with_this_row_*`).
+> **Fechado agora (código):** após H9 (`resolve_struct` estático), paste/auto-expand de
+> tabela **parava de calcular** nas linhas novas: o path estrutural síncrono chamava
+> `recalc_all` **sem** `invalidate_graph`, então `ensure_graph` (F9 incremental) era no-op
+> e as fórmulas autofilled nunca entravam no grafo (valores Empty). Fix: `invalidate_graph`
+> antes de `recalc_all` em `cmd/mod.rs` `commit` (igual ao path `defer_structural`). Isso
+> também re-pinna Areas de structured refs de coluna inteira à geometria nova da tabela.
+> Testes: `paste_expands_structured_calc_columns_like_cotacao`,
+> `expanding_table_refreshes_whole_column_structured_precedents`,
+> `pasting_column_auto_expands_*` / `typing_below_table_*`.
 >
-> **Herdado (ainda válido):** Q1+Q2 (yield ~75 ms + `GRIDCRAFT_CALC_STATS`); fix LET
-> aninhado; job calc 1%/0/N + Cancel; truncate >1000 removido; Wasm/clang: não tentar.
+> **Herdado (ainda válido):** H9 structured refs; Q1+Q2; fix LET aninhado; job calc;
+> truncate >1000 removido; Wasm/clang: não tentar.
 >
 > **PRÓXIMO PASSO RECOMENDADO:**
-> 1. Reteste manual: clear na coluna Referencia do corpus — progresso/dirty ≪ livro inteiro.
-> 2. Medir F9 release com `GRIDCRAFT_CALC_STATS=1` e decidir **Q4** vs **Q3/M3** vs **E1**.
+> 1. Reteste manual: abrir corpus, paste várias Referencias abaixo de ORCAMENTO —
+>    Linha/Descricao devem calcular nas linhas novas (sem F9).
+> 2. Clear na coluna Referencia — progresso/dirty ≪ livro inteiro.
+> 3. Medir F9 release com `GRIDCRAFT_CALC_STATS=1` e decidir **Q4** vs **Q3/M3** vs **E1**.
 >
 > **Reteste manual (corpus de exemplo):** abrir `LISTA REDUZIDA.xlsx`, aba `COTACAO` —
 > E16/E17/E18 (e F/J) devem diferir por referência; coluna Linha ≈ 2, 3, 4… como no Excel.
-> Clear de um bloco em Referencia não deve reavaliar ~600k fórmulas.
+> Expandir a tabela (colar códigos em Referencia) deve preencher Descricao/Linha nas linhas
+> novas. Clear de um bloco em Referencia não deve reavaliar ~600k fórmulas.
 
 
 **Mapa do que já existe (símbolos):**

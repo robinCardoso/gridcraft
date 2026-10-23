@@ -357,9 +357,14 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
         d.recalc_cascade = None;
         d.calc.invalidate_graph();
     } else if structural {
-        // A full inline recalculation pays the whole debt.
+        // A full inline recalculation pays the whole debt. Invalidate first: `recalc_all` →
+        // `ensure_graph` is a no-op while `graph_valid` (F9 incremental). Table auto-expand,
+        // row/col inserts, and other shape changes add/move formulas and resize structured-ref
+        // Areas — without a rebuild, new calculated-column cells stay Empty and whole-column
+        // precedents stay pinned to the pre-edit table range.
         d.recalc_pending = false;
         d.recalc_cascade = None;
+        d.calc.invalidate_graph();
         let _ = d.calc.recalc_all(&mut wb);
     } else if !changed.is_empty() {
         if d.recalc_pending {

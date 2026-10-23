@@ -537,6 +537,64 @@ mod tests {
         let t = &s.doc().unwrap().wb.sheet(0).unwrap().tables[0];
         assert_eq!(t.range.a1(), "A1:B2");
     }
+
+    /// COTACAO-style calculated columns: Linha looks up a price list; Descricao indexes by Linha.
+    /// Pasting many Referencia values below the table must expand, autofill formulas, and evaluate.
+    #[test]
+    fn paste_expands_structured_calc_columns_like_cotacao() {
+        let mut s = Session::new();
+        s.new_workbook();
+        // LISTA_PRECO on columns A:B
+        s.execute("range.setValues", json!({
+            "range": "A1",
+            "values": [
+                ["Codigo", "Descricao"],
+                ["MB001", "Alpha"],
+                ["MB021A", "Bravo"],
+                ["MB025A", "Charlie"],
+                ["MB019AT", "Delta"]
+            ]
+        }))
+        .unwrap();
+        s.execute("insert.table", json!({"range": "A1:B5", "header": true, "name": "LISTA_PRECO"})).unwrap();
+
+        // ORCAMENTO on columns D:F — Referencia | Linha | Descricao
+        let linha = concat!(
+            "=IF(ORCAMENTO[@Referencia]=\"\",0,",
+            "IFERROR(MATCH(ORCAMENTO[@Referencia],LISTA_PRECO[Codigo],0),0))"
+        );
+        let desc = concat!("=IF(N(ORCAMENTO[@Linha])>0,INDEX(LISTA_PRECO[Descricao],ORCAMENTO[@Linha]),\"\")");
+        s.execute("range.setValues", json!({
+            "range": "D1",
+            "values": [
+                ["Referencia", "Linha", "Descricao"],
+                ["MB001", linha, desc]
+            ]
+        }))
+        .unwrap();
+        s.execute("insert.table", json!({"range": "D1:F2", "header": true, "name": "ORCAMENTO"})).unwrap();
+
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+        assert_eq!(get(&mut s, "E2")["value"], json!(1.0));
+        assert_eq!(get(&mut s, "F2")["value"], json!("Alpha"));
+
+        // Paste several codes below the table (same symptom as the screenshot: D filled, calc cols must follow).
+        s.execute("edit.paste", json!({"at": "D3", "text": "MB021A\nMB025A\nMB019AT"})).unwrap();
+
+        let t = &s.doc().unwrap().wb.sheet(0).unwrap().tables.iter().find(|t| t.name == "ORCAMENTO").unwrap();
+        assert_eq!(t.range.a1(), "D1:F5", "table must auto-expand over the pasted rows");
+
+        let e3 = get(&mut s, "E3");
+        let f3 = get(&mut s, "F3");
+        assert!(e3["formula"].as_str().unwrap_or("").contains("ORCAMENTO"), "Linha must autofill, got {e3}");
+        assert!(f3["formula"].as_str().unwrap_or("").contains("INDEX"), "Descricao must autofill, got {f3}");
+        assert_eq!(e3["value"], json!(2.0), "Linha for MB021A; cell={e3}");
+        assert_eq!(f3["value"], json!("Bravo"), "Descricao for MB021A; cell={f3}");
+        assert_eq!(get(&mut s, "E4")["value"], json!(3.0));
+        assert_eq!(get(&mut s, "F4")["value"], json!("Charlie"));
+        assert_eq!(get(&mut s, "E5")["value"], json!(4.0));
+        assert_eq!(get(&mut s, "F5")["value"], json!("Delta"));
+    }
 }
 
 #[cfg(test)]
