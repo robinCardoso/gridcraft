@@ -174,27 +174,25 @@
 
 ## Handoff — próximos passos (para quem continuar o plano)
 
-> ### ⏸️ ONDE PARAMOS — 2026-10-23 (1ª sprint desempenho: instrumentação + yield)
+> ### ⏸️ ONDE PARAMOS — 2026-10-23 (structured refs estáticos no grafo + dirty)
 >
-> **Fechado nesta sprint (código):** Q1 + Q2 de
-> [`plano-desempenho-calculo.md`](./plano-desempenho-calculo.md) — yield/progresso por
-> **tempo** (~75 ms) em `PassHost::coop` / `run_scoped` (barra não “morre”; Cancel no
-> mesmo tick); instrumentação `GRIDCRAFT_CALC_STATS=1` (histograma µs/fórmula, top-20,
-> hit/miss de `range_array`/equality, gap entre reports). Universal (§0): zero special-case
-> por aba/arquivo. Testes: `hooks_eager_coop_*`, `hooks_progress_reports_under_slow_compute`,
-> `hooks_cancel_during_slow_compute`.
+> **Fechado agora (código):** H9 de [`plano-desempenho-calculo.md`](./plano-desempenho-calculo.md)
+> §7.1 — `precedents` resolve `Expr::Struct` → `Area` concreta (ThisRow / coluna / Headers…)
+> em vez de `dynamic = true`; clear/edit em coluna de tabela suja só dependentes reais
+> (não todo `graph.dynamic`). Progresso incremental: denominador = `|dirty|`. Testes em
+> `calc/src/tests.rs` (`structured_ref_precedents_*`, `table_column_edit_does_not_dirty_*`,
+> `whole_column_structured_*`, `nested_let_with_this_row_*`).
 >
-> **Herdado (ainda válido):** fix LET aninhado (`variant_names` + `val_cache`); job calc
-> 1%/0/N + Cancel; truncate >1000 removido; Wasm/clang: não tentar.
+> **Herdado (ainda válido):** Q1+Q2 (yield ~75 ms + `GRIDCRAFT_CALC_STATS`); fix LET
+> aninhado; job calc 1%/0/N + Cancel; truncate >1000 removido; Wasm/clang: não tentar.
 >
 > **PRÓXIMO PASSO RECOMENDADO:**
-> 1. Medir corpus denso em **release** com `GRIDCRAFT_CALC_STATS=1` (F9) e decidir
->    **Q4** vs **Q3/M3** vs spike **E1** com os números (§7 do plano de desempenho).
-> 2. (Opcional) Índice `COUNTIF`/`SUMIF`/`AVERAGEIFS`/`MAXIFS`/`MINIFS` — Q3.
+> 1. Reteste manual: clear na coluna Referencia do corpus — progresso/dirty ≪ livro inteiro.
+> 2. Medir F9 release com `GRIDCRAFT_CALC_STATS=1` e decidir **Q4** vs **Q3/M3** vs **E1**.
 >
 > **Reteste manual (corpus de exemplo):** abrir `LISTA REDUZIDA.xlsx`, aba `COTACAO` —
 > E16/E17/E18 (e F/J) devem diferir por referência; coluna Linha ≈ 2, 3, 4… como no Excel.
-> Com stats: stderr deve mostrar `[GRIDCRAFT_CALC_STATS]` ao fim do F9.
+> Clear de um bloco em Referencia não deve reavaliar ~600k fórmulas.
 
 
 **Mapa do que já existe (símbolos):**

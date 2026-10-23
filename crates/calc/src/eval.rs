@@ -2122,9 +2122,78 @@ pub fn resized_sum_range(sum: RangeRef, height: u32, width: u32) -> RangeRef {
     RangeRef::new(sum.start, CellRef::new(row, col))
 }
 
+/// Resolves a structured reference to a concrete area when the table/columns/row are known at
+/// graph-build time (same geometry as [`Evaluator::structured`]). Returns `None` when the ref
+/// cannot be pinned statically — those formulas stay in `graph.dynamic`.
+fn resolve_struct(wb: &Workbook, sheet: usize, at: CellRef, s: &StructRef) -> Option<Area> {
+    let found = if s.table.is_empty() {
+        wb.sheet(sheet).and_then(|sh| sh.tables.iter().position(|t| t.range.contains(at)).map(|ti| (sheet, ti)))
+    } else {
+        wb.table(&s.table)
+    };
+    let (si, ti) = found?;
+    let t = wb.sheet(si).and_then(|sh| sh.tables.get(ti))?;
+    let mut r0 = t.range.start.row;
+    let mut r1 = t.range.end.row;
+    let data = t.data_range();
+    let items = &s.specifiers;
+    if items.is_empty() || items.as_slice() == [StructItem::Data] {
+        let d = data?;
+        r0 = d.start.row;
+        r1 = d.end.row;
+    } else if items.contains(&StructItem::ThisRow) {
+        if at.row < t.range.start.row || at.row > t.range.end.row {
+            return None;
+        }
+        r0 = at.row;
+        r1 = at.row;
+    } else if !items.contains(&StructItem::All) {
+        let has = |i: StructItem| items.contains(&i);
+        let hdr = t.header_row.then_some(t.range.start.row);
+        let tot = t.totals_row.then_some(t.range.end.row);
+        let mut lo = u32::MAX;
+        let mut hi = 0u32;
+        let mut add = |a: u32, b: u32| {
+            lo = lo.min(a);
+            hi = hi.max(b);
+        };
+        if has(StructItem::Headers) {
+            let h = hdr?;
+            add(h, h);
+        }
+        if has(StructItem::Data) {
+            let d = data?;
+            add(d.start.row, d.end.row);
+        }
+        if has(StructItem::Totals) {
+            let h = tot?;
+            add(h, h);
+        }
+        if lo > hi {
+            return None;
+        }
+        r0 = lo;
+        r1 = hi;
+    }
+    let (mut c0, mut c1) = (t.range.start.col, t.range.end.col);
+    if let Some(a) = &s.col_start {
+        let i = t.column_index(a)?;
+        c0 = t.range.start.col + i as u32;
+        c1 = c0;
+        if let Some(b) = &s.col_end {
+            let j = t.column_index(b)?;
+            let cj = t.range.start.col + j as u32;
+            c0 = c0.min(cj);
+            c1 = c1.max(cj);
+        }
+    }
+    Some(Area { sheet: si, range: RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)) })
+}
+
 /// Collects the static references of an expression with their sheets resolved; `dynamic` is
-/// set when the formula uses INDIRECT/OFFSET/names/tables whose targets can change.
-pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
+/// set when the formula uses INDIRECT/OFFSET/names (or structured refs that cannot be pinned
+/// at graph time) whose targets can change.
+pub fn precedents(wb: &Workbook, sheet: usize, at: CellRef, e: &Expr) -> (Vec<Area>, bool) {
     let mut out = Vec::new();
     let mut dynamic = false;
     let push = |out: &mut Vec<Area>, r: &Reference, range: RangeRef| match &r.sheet {
@@ -2159,13 +2228,17 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
         {
             dynamic = true
         }
-        Expr::Name(_) | Expr::Struct(_) => dynamic = true,
+        Expr::Struct(s) => match resolve_struct(wb, sheet, at, s) {
+            Some(area) => out.push(area),
+            None => dynamic = true,
+        },
+        Expr::Name(_) => dynamic = true,
         Expr::Call(n, _) if gridcraft_functions::lookup(n).is_none() && !is_special(n) => dynamic = true,
         // A range ending in a function's result (`A1:INDEX(B1:B9,n)`) covers the cells between
         // the references inside it, not only those references.
         Expr::Binary(BinOp::Range, a, b) if !matches!((&**a, &**b), (Expr::Ref(_), Expr::Ref(_))) => {
-            let mut inner = precedents(wb, sheet, a).0;
-            inner.extend(precedents(wb, sheet, b).0);
+            let mut inner = precedents(wb, sheet, at, a).0;
+            inner.extend(precedents(wb, sheet, at, b).0);
             let mut boxes: Vec<Area> = Vec::new();
             for area in inner {
                 match boxes.iter_mut().find(|x| x.sheet == area.sheet) {

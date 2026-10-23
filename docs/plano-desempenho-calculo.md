@@ -100,6 +100,7 @@ aparece em qualquer livro com tabelas + lookup por linha):
 | **H6** | **CF / pintura** reavaliando regras caras no viewport enquanto o job corre | UI “pesada”, não o numerador 366938 | Frame ms alto só ao scroll; calc thread ok |
 | **H7** | **Deadlock / hang real** (Mutex em hooks, panic engolido, job sem report) | Raro após fix de cancel/progresso | Cancel morto; done eterno; thread parada |
 | **H8** | **Spill / dynamic arrays** desligando caches (correção intencional) | Se o livro tiver spills, caminho lento garantido | `graph.dynamic` não vazio; caches off |
+| **H9** | **`Expr::Struct` marcado `dynamic`** → `dirty_closure` inclui **todo** `graph.dynamic` em qualquer edit | Clear de ~13 células na coluna Referencia dispara ~600k | Contagem de `graph.dynamic` ≈ nº de fórmulas com structured ref; dirty ≫ seeds |
 
 **Nota “GIL”:** não há GIL de Python. O equivalente prático é **um worker de cálculo** + Mutex curto nos hooks de progresso. Paralelismo exige partição topológica (§5.3), não “soltar o GIL”.
 
@@ -119,6 +120,8 @@ Referência detalhada: [`plano-responsividade.md`](./plano-responsividade.md) (F
 | Automatic | Sem truncate >1000; deferral / `recalc_pending` / `recalc_cascade` dirty |
 | Undo | Diff / COW; undo sem rebuild O(n) |
 | UI | Viewport prioritário no `run_scoped`; CF cache por revisão; Fase 4 frame budget |
+| Structured refs no grafo | ✅ `precedents` resolve `Expr::Struct` → `Area` (ThisRow/coluna/Headers/…) quando a tabela é conhecida; `dynamic` só se irresolvível (H9) |
+| Progresso incremental | ✅ denominador = `|dirty|` na cascata Automatic (full continua `graph.len()`) |
 
 Qualquer sprint nova deve **medir contra este baseline**, não reimplementar job ou índice *IFS.
 
@@ -206,11 +209,37 @@ GRIDCRAFT_CALC_STATS=1  gridcraft.exe   # ou o binário release; F9 no corpus de
 
 Procurar linhas `[GRIDCRAFT_CALC_STATS]` no stderr ao fim de cada passada.
 
+### 7.1 Sprint structured refs / dirty subset ✅ (2026-10-23)
+
+**Problema:** `precedents` fazia `Expr::Struct(_) => dynamic = true`. Qualquer edit
+incluía **todas** as fórmulas com structured ref via `graph.dynamic` (ex.: clear de ~13
+células na coluna Referencia → dirty ~600k). A branch de jobs só adiava a UI; o custo
+permanecia.
+
+**Fix (universal):**
+- `resolve_struct` em `calc/src/eval.rs` — mesma geometria que `Evaluator::structured`
+  (ThisRow → linha da fórmula; coluna nomeada → corpo de dados; Headers/Totals/All;
+  tabela implícita pelo `at`).
+- `precedents(wb, sheet, at, expr)` passa a célula âncora; call sites em `rebuild` /
+  `update_nodes`.
+- Progresso em `run_scoped`: incremental usa `|dirty|` (cresce se spill reabrir trabalho);
+  full mantém `graph.len()`.
+
+**Medição (teste sintético):** 80 fórmulas ThisRow + clear de 13 células →
+`cascade_exceeds(..., 40) == false` e progress total ≤ 40 (antes: dirty ≈ livro inteiro).
+
+**Testes:** `structured_ref_precedents_are_static_when_resolvable`,
+`table_column_edit_does_not_dirty_all_structured_formulas`,
+`whole_column_structured_ref_dirties_column_readers_only`,
+`nested_let_with_this_row_structured_refs`.
+
 ### Ainda pendente (decisão em dados — próxima sprint)
 
-1. **Rodar** corpus denso em **release** com `GRIDCRAFT_CALC_STATS=1`, F9.
-2. **No platô ~40%:** anotar se `done` congela > 5 s e o que o top-K / p99 mostram.
-3. **Decisão:**
+1. **Reteste manual** no corpus denso: clear/edit na coluna Referencia — dirty/progresso
+   devem refletir só a cascata real (não ~600k por structured refs).
+2. **Rodar** F9 em **release** com `GRIDCRAFT_CALC_STATS=1`.
+3. **No platô ~40% (F9 full):** anotar se `done` congela > 5 s e o que o top-K / p99 mostram.
+4. **Decisão:**
    - Poucas fórmulas dominam → **Q4** (first-true / lookup do padrão `achou`); Q1 já feito.
    - Custo uniforme + cache miss alto → **M3 + Q3**.
    - Uniforme, cache quente, 1 core → spike **E1**.

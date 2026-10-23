@@ -1504,7 +1504,7 @@ impl Calc {
                 if let Some(f) = &cell.formula
                     && let Some(e) = f.expr()
                 {
-                    let (areas, dynamic) = precedents(wb, si, &e);
+                    let (areas, dynamic) = precedents(wb, si, c, &e);
                     self.graph.insert((si, c), Node { areas, dynamic });
                     built += 1;
                     if (built == 1 || built.is_multiple_of(2048))
@@ -1572,7 +1572,7 @@ impl Calc {
             let formula = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.clone());
             match formula.and_then(|f| f.expr()) {
                 Some(e) => {
-                    let (areas, dynamic) = precedents(wb, k.0, &e);
+                    let (areas, dynamic) = precedents(wb, k.0, k.1, &e);
                     self.graph.insert(k, Node { areas, dynamic });
                 }
                 None => {
@@ -1836,13 +1836,16 @@ impl Calc {
     /// the workbook is then left as it was for the evaluated subset.
     fn run_scoped(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool, scope_sheet: Option<usize>) -> bool {
         let mut dynamic_again = !self.graph.dynamic.is_empty();
-        // Progress denominator: every formula in the graph (a full recalc evaluates all of it;
-        // an incremental one evaluates no more than its dirty set and what spills re-open).
-        let total = self.graph.len().max(dirty.len()).max(1);
+        // Progress denominator: full recalc → graph size; incremental cascade → |dirty| (and grows
+        // if spills re-open more work). Avoids showing 13 / 800k after a small table edit.
+        let mut total = if full { self.graph.len().max(dirty.len()).max(1) } else { dirty.len().max(1) };
         let mut done = 0usize;
         for _round in 0..8 {
             if dirty.is_empty() {
                 break;
+            }
+            if !full {
+                total = total.max(done.saturating_add(dirty.len())).max(1);
             }
             if let Some(hooks) = self.hooks.as_ref() {
                 if hooks.cancelled() {

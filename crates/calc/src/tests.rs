@@ -1687,6 +1687,179 @@ fn update_nodes_while_invalid_is_a_noop() {
     assert_eq!(calc.graph.len(), 10);
 }
 
+fn table_col(name: &str) -> gridcraft_model::TableColumn {
+    gridcraft_model::TableColumn {
+        name: name.into(),
+        totals: Default::default(),
+        totals_label: None,
+        formula: None,
+        unique_name: None,
+        xml: None,
+    }
+}
+
+fn push_table(t: &mut T, name: &str, range: &str, cols: &[&str], header: bool, totals: bool) {
+    let sh = t.wb.sheet_mut(0).unwrap();
+    let id = (sh.tables.len() + 1) as u32;
+    sh.tables.push(gridcraft_model::Table {
+        id,
+        name: name.into(),
+        range: gridcraft_core::RangeRef::parse(range).unwrap(),
+        header_row: header,
+        totals_row: totals,
+        columns: cols.iter().map(|c| table_col(c)).collect(),
+        style: String::new(),
+        banded_rows: false,
+        banded_cols: false,
+        first_col: false,
+        last_col: false,
+        filter_button: false,
+        filter: vec![],
+        table_type: None,
+        connection_id: None,
+    });
+}
+
+/// Structured refs resolve to concrete areas at graph time (ThisRow → this cell's row; named
+/// column → data body), so they are not stamped `dynamic`.
+#[test]
+fn structured_ref_precedents_are_static_when_resolvable() {
+    use crate::eval::precedents;
+    use gridcraft_formula::parse;
+
+    let mut t = T::new();
+    t.set("A1", "Referencia");
+    t.set("B1", "Qty");
+    t.set("A2", "x");
+    t.set("B2", "2");
+    t.set("A3", "y");
+    t.set("B3", "5");
+    push_table(&mut t, "Sales", "A1:B3", &["Referencia", "Qty"], true, false);
+
+    let (areas, dynamic) = precedents(&t.wb, 0, c("C2"), &parse("=Sales[@Referencia]").unwrap());
+    assert!(!dynamic, "ThisRow must not mark the node dynamic");
+    assert_eq!(areas.len(), 1);
+    assert_eq!(areas[0].range.a1(), "A2");
+
+    let (areas, dynamic) = precedents(&t.wb, 0, c("D1"), &parse("=SUM(Sales[Qty])").unwrap());
+    assert!(!dynamic);
+    assert_eq!(areas.len(), 1);
+    assert_eq!(areas[0].range.a1(), "B2:B3");
+
+    let (areas, dynamic) = precedents(&t.wb, 0, c("E1"), &parse("=Sales[[#Headers],[Qty]]").unwrap());
+    assert!(!dynamic);
+    assert_eq!(areas[0].range.a1(), "B1");
+
+    let (_, dynamic) = precedents(&t.wb, 0, c("F1"), &parse("=Missing[Qty]").unwrap());
+    assert!(dynamic, "unresolvable table stays dynamic");
+}
+
+/// Clearing / editing cells in a table column dirties only formulas that depend on those
+/// cells (ThisRow → that row), not every structured-ref formula in the book.
+#[test]
+fn table_column_edit_does_not_dirty_all_structured_formulas() {
+    let rows = 80u32;
+    let mut t = T::new();
+    t.set("A1", "Referencia");
+    t.set("B1", "Out");
+    for r in 2..=rows + 1 {
+        t.set(&format!("A{r}"), &format!("R{r}"));
+        t.set(&format!("B{r}"), ""); // placeholder; formulas after the table exists
+    }
+    push_table(&mut t, "RefTab", &format!("A1:B{}", rows + 1), &["Referencia", "Out"], true, false);
+    for r in 2..=rows + 1 {
+        // ThisRow consumer per data row (universal table-column pattern).
+        t.set(&format!("B{r}"), &format!("=IF(RefTab[@Referencia]=\"\",\"\",RefTab[@Referencia]&\"!\")"));
+    }
+    // Unrelated formula: must not be pulled into every table edit via graph.dynamic.
+    t.set("Z1", "=99+1");
+    t.set("Z2", "=Z1*2");
+    assert_eq!(t.num("Z2"), 200.0);
+    assert_eq!(t.get("B2"), Value::from("R2!"));
+
+    let hooks = Arc::new(CalcHooks::new());
+    let max_total = Arc::new(Mutex::new(0usize));
+    let collect = max_total.clone();
+    hooks.set_progress(Box::new(move |_done, total| {
+        if let Ok(mut v) = collect.lock() {
+            *v = (*v).max(total);
+        }
+    }));
+    t.calc.set_hooks(hooks);
+
+    // Clear ~13 Referencia cells — before the fix every structured formula was dynamic, so the
+    // cascade (and progress denominator) covered the whole book (~80+). After: only dependents
+    // of those cells (ThisRow Out formulas on the same rows) plus the seeds themselves.
+    let seeds: Vec<_> = (2..=14).map(|r| (0, c(&format!("A{r}")))).collect();
+    for r in 2..=14 {
+        t.wb.sheet_mut(0).unwrap().cells.set(c(&format!("A{r}")), Cell::value(Value::Empty));
+    }
+    assert!(!t.calc.cascade_exceeds(&seeds, 40), "cascade must stay near the cleared rows, not the whole book");
+    t.calc.cells_changed(&mut t.wb, &seeds);
+
+    let reported = *max_total.lock().unwrap();
+    assert!(
+        reported > 0 && reported <= 40,
+        "incremental progress denominator should be |dirty| (~cleared rows), got {reported}"
+    );
+    assert_eq!(t.get("B2"), Value::from(""), "cleared ThisRow ref updates that row");
+    assert_eq!(t.get("B15"), Value::from("R15!"), "other rows stay computed (and were not force-dirtied)");
+    assert_eq!(t.num("Z2"), 200.0, "unrelated formulas are not in the cascade");
+}
+
+/// Whole-column structured refs still depend on the full data body; editing one cell dirties
+/// every formula that reads that column (Excel-like), but not unrelated sheets of ThisRow-only deps.
+#[test]
+fn whole_column_structured_ref_dirties_column_readers_only() {
+    let mut t = T::new();
+    t.set("A1", "Qty");
+    t.set("A2", "1");
+    t.set("A3", "2");
+    t.set("A4", "3");
+    push_table(&mut t, "Q", "A1:A4", &["Qty"], true, false);
+    t.set("C1", "=SUM(Q[Qty])");
+    t.set("C2", "=SUM(Q[Qty])*10");
+    t.set("D1", "=100");
+    t.set("D2", "=D1+1");
+    assert_eq!((t.num("C1"), t.num("C2")), (6.0, 60.0));
+
+    let seeds = [(0, c("A3"))];
+    assert!(!t.calc.cascade_exceeds(&seeds, 10));
+    assert!(t.calc.cascade_exceeds(&seeds, 1), "at least the SUM readers are dirty");
+    t.wb.sheet_mut(0).unwrap().cells.set(c("A3"), Cell::value(Value::Number(20.0)));
+    t.calc.cells_changed(&mut t.wb, &seeds);
+    assert_eq!((t.num("C1"), t.num("C2")), (24.0, 240.0));
+    assert_eq!(t.num("D2"), 101.0);
+}
+
+/// Nested LET + ThisRow structured refs still evaluate per row (regression with static precedents).
+#[test]
+fn nested_let_with_this_row_structured_refs() {
+    let mut t = T::new();
+    t.set("A1", "Codigo");
+    t.set("B1", "Linha");
+    t.set("A2", "MB001");
+    t.set("A3", "MB002");
+    t.set("A4", "MB003");
+    let f = concat!(
+        "=LET(codigo,LinhaTab[@Codigo],IF(codigo=\"\",0,",
+        "LET(achou,LinhaTab[Codigo]=codigo,IF(SUM(--achou)=0,0,MATCH(TRUE,achou,0)))))",
+    );
+    push_table(&mut t, "LinhaTab", "A1:B4", &["Codigo", "Linha"], true, false);
+    t.set("B2", f);
+    t.set("B3", f);
+    t.set("B4", f);
+    assert_eq!(t.num("B2"), 1.0);
+    assert_eq!(t.num("B3"), 2.0);
+    assert_eq!(t.num("B4"), 3.0);
+
+    t.wb.sheet_mut(0).unwrap().cells.set(c("A3"), Cell::value(Value::Empty));
+    t.calc.cells_changed(&mut t.wb, &[(0, c("A3"))]);
+    assert_eq!(t.num("B2"), 1.0);
+    assert_eq!(t.num("B3"), 0.0, "empty ThisRow codigo → early 0");
+    assert_eq!(t.num("B4"), 3.0, "MB003 still at index 3 in the column array");
+}
+
 /// Release timing: `cargo test -p gridcraft-calc measure_f9_incremental_graph --release -- --ignored --nocapture`
 #[test]
 #[ignore = "timing; run with --ignored in release"]
