@@ -631,6 +631,38 @@ fn let_lambda() {
     assert_eq!(t.num("A4"), 14.0);
 }
 
+/// Two rows with the same lookup key must resolve to the same MATCH index (and thus the same
+/// INDEX description). Guards against LET/`val_cache` or ThisRow bugs that only show up when
+/// keys collide rather than when every row differs.
+#[test]
+fn same_lookup_key_two_rows_same_match_index() {
+    let mut t = T::new();
+    t.set("A1", "MB001");
+    t.set("A2", "MB006");
+    t.set("A3", "MB003");
+    t.set("B1", "Alpha");
+    t.set("B2", "Bravo");
+    t.set("B3", "Charlie");
+    let f1 = concat!(
+        "=LET(codigo,C1,",
+        "LET(achou,A$1:A$3=codigo,IF(SUM(--achou)=0,0,MATCH(TRUE,achou,0))))",
+    );
+    let f2 = concat!(
+        "=LET(codigo,C2,",
+        "LET(achou,A$1:A$3=codigo,IF(SUM(--achou)=0,0,MATCH(TRUE,achou,0))))",
+    );
+    t.set("C1", "MB006");
+    t.set("C2", "MB006");
+    t.set("D1", f1);
+    t.set("D2", f2);
+    t.set("E1", "=IF(D1>0,INDEX(B$1:B$3,D1),\"\")");
+    t.set("E2", "=IF(D2>0,INDEX(B$1:B$3,D2),\"\")");
+    assert_eq!(t.num("D1"), 2.0);
+    assert_eq!(t.num("D2"), 2.0, "identical keys must share the first-match index");
+    assert_eq!(t.get("E1"), Value::from("Bravo"));
+    assert_eq!(t.get("E2"), Value::from("Bravo"));
+}
+
 /// Nested LET must not cache a binding that only names an outer LET variable: the AST looks
 /// invariant (no relative ref / ThisRow), but the outer binding can differ per cell. Without
 /// seeding `variant_names` from `env`, PassHost's `val_cache` reused the first row's array

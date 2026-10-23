@@ -40,6 +40,7 @@ e ainda assim reintroduzir o bug.
 | 6 | **Clipboard consume after paste** | Colar de novo cola o mesmo corte/cópia; botão Colar fica ativo sem nova cópia | `consume` clipboard, `clear_clipboard`, paste after success | `clipboard` UI tests; `5ebccdc` |
 | 7 | **Yield / coop** | Barra de progresso “morta”; Cancel imprevisível em fórmulas longas | `PassHost::coop`, `set_coop_interval_ms`, yield ~75 ms | planos Q1; calc hooks |
 | 8 | **Automatic sem truncate >1000** | Automatic corta dirty em 1000 e deixa o livro inconsistente | `needed.truncate(1_000)`, Automatic vs limit explícito | `recalc.rs`; planos “Sem truncate >1000” |
+| 9 | **`recalc_keys` na cascata adiada** | Com `recalc_pending`, Referencia já muda mas Descricao/Linha da mesma linha ficam no lookup anterior (ex.: MB006 + Caterpillar) | `recalc_keys`, `recalc_pending`, `touch_table_formula_rows_for_input_edits` | `mb006_same_key`; `same_lookup_key_two_rows_same_match_index` |
 
 ### Como usar no gate
 

@@ -382,6 +382,12 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
                     None => d.recalc_cascade = Some(changed.clone()),
                 }
             }
+            // Same-row calculated columns (table touch seeds) must not stay stale while the
+            // workbook-wide job waits — otherwise Referencia updates but Descricao/Linha still
+            // show the previous lookup (MB006 next to Caterpillar).
+            if d.calc.graph_is_current() {
+                let _ = d.calc.recalc_keys(&mut wb, &changed);
+            }
         } else if d.defer_structural && (changed.len() > crate::CASCADE_JOB_CELLS || d.calc.cascade_exceeds(&changed, crate::CASCADE_JOB_CELLS)) {
             // A huge cascade (an input cell feeding a big dependency graph) or a huge edit itself
             // (a wide paste: brand-new formulas aren't in the graph yet, so their count is the
@@ -391,6 +397,9 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
             d.recalc_pending = true;
             d.recalc_cascade = Some(changed.clone());
             d.calc.update_nodes(&mut wb, &changed);
+            if d.calc.graph_is_current() {
+                let _ = d.calc.recalc_keys(&mut wb, &changed);
+            }
         } else {
             let _ = d.calc.cells_changed(&mut wb, &changed);
         }

@@ -1564,6 +1564,26 @@ impl Calc {
         let _ = self.apply_node_updates(wb, changed);
     }
 
+    /// Evaluates only the formula keys in `keys` (no dirty-closure / no `graph.dynamic` sweep).
+    ///
+    /// Used when a full Automatic cascade is deferred (`recalc_pending`): the edited row's
+    /// calculated-column formulas (already seeded into `changed` by table touch) must still
+    /// refresh so `Referencia` and `Descricao`/`Linha` cannot diverge on screen. On-demand
+    /// evaluation inside the pass resolves same-row order (e.g. Descricao before Linha).
+    pub fn recalc_keys(&mut self, wb: &mut Workbook, keys: &[Key]) -> bool {
+        if keys.is_empty() {
+            return true;
+        }
+        if !self.graph_valid && !self.rebuild(wb) {
+            return false;
+        }
+        let own: Vec<Key> = keys.iter().copied().filter(|k| self.graph.nodes.contains_key(k)).collect();
+        if own.is_empty() {
+            return true;
+        }
+        self.run(wb, own, false)
+    }
+
     /// Inserts/removes graph nodes for `changed` and applies spill/#NAME? side effects. Returns the
     /// spill ranges cleared when a formula became a constant (seeds for dependents).
     fn apply_node_updates(&mut self, wb: &mut Workbook, changed: &[Key]) -> Vec<(usize, RangeRef)> {
