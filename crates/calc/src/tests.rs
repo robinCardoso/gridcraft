@@ -663,6 +663,26 @@ fn same_lookup_key_two_rows_same_match_index() {
     assert_eq!(t.get("E2"), Value::from("Bravo"));
 }
 
+/// `recalc_keys` must refresh formula seeds even when the dependency graph was structurally
+/// invalidated (deferred rebuild) — otherwise clear/set of the lookup input leaves INDEX stale.
+#[test]
+fn recalc_keys_without_graph_clears_stale_index() {
+    let mut t = T::new();
+    t.set("A1", "MB006");
+    t.set("B1", "Bravo");
+    t.set("C1", "MB006");
+    t.set("D1", "=IF(C1=\"\",\"\",MATCH(C1,A$1:A$1,0))");
+    t.set("E1", "=IF(N(D1)>0,INDEX(B$1:B$1,D1),\"\")");
+    assert_eq!(t.get("E1"), Value::from("Bravo"));
+
+    t.wb.sheet_mut(0).unwrap().cells.set(c("C1"), Cell::value(Value::Empty));
+    t.calc.invalidate_graph();
+    assert!(!t.calc.graph_is_current());
+    assert!(t.calc.recalc_keys(&mut t.wb, &[(0, c("C1")), (0, c("D1")), (0, c("E1"))]));
+    assert_eq!(t.get("D1"), Value::from(""));
+    assert_eq!(t.get("E1"), Value::from(""));
+}
+
 /// Nested LET must not cache a binding that only names an outer LET variable: the AST looks
 /// invariant (no relative ref / ThisRow), but the outer binding can differ per cell. Without
 /// seeding `variant_names` from `env`, PassHost's `val_cache` reused the first row's array

@@ -1568,16 +1568,25 @@ impl Calc {
     ///
     /// Used when a full Automatic cascade is deferred (`recalc_pending`): the edited row's
     /// calculated-column formulas (already seeded into `changed` by table touch) must still
-    /// refresh so `Referencia` and `Descricao`/`Linha` cannot diverge on screen. On-demand
-    /// evaluation inside the pass resolves same-row order (e.g. Descricao before Linha).
+    /// refresh so `Referencia` and `Descricao`/`Linha` cannot diverge on screen — including
+    /// after clear/delete of the input cell. On-demand evaluation inside the pass resolves
+    /// same-row order (e.g. Descricao before Linha).
+    ///
+    /// When the graph was structurally invalidated, skips the O(formulas) rebuild and still
+    /// evaluates workbook formulas present in `keys` (PassHost does not need the dependency
+    /// index for a small same-row seed set).
     pub fn recalc_keys(&mut self, wb: &mut Workbook, keys: &[Key]) -> bool {
         if keys.is_empty() {
             return true;
         }
-        if !self.graph_valid && !self.rebuild(wb) {
-            return false;
-        }
-        let own: Vec<Key> = keys.iter().copied().filter(|k| self.graph.nodes.contains_key(k)).collect();
+        let own: Vec<Key> = if self.graph_valid {
+            keys.iter().copied().filter(|k| self.graph.nodes.contains_key(k)).collect()
+        } else {
+            keys.iter()
+                .copied()
+                .filter(|k| wb.sheet(k.0).and_then(|s| s.cell(k.1)).is_some_and(|c| c.formula.is_some()))
+                .collect()
+        };
         if own.is_empty() {
             return true;
         }

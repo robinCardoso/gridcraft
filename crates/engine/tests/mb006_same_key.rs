@@ -141,3 +141,80 @@ fn pending_recalc_same_row_syncs_before_job() {
     assert_eq!(e16, e21);
     assert!(!e21.contains("CATERPILLAR"), "must not keep stale Caterpillar after MB006: {e21:?}");
 }
+
+fn linha_cleared(s: &Session, a1: &str) -> bool {
+    match cell(s, a1) {
+        Value::Empty => true,
+        Value::Text(t) if t.is_empty() => true,
+        Value::Number(n) if n == 0.0 => true,
+        _ => false,
+    }
+}
+
+fn preco_cleared(s: &Session, a1: &str) -> bool {
+    match cell(s, a1) {
+        Value::Empty => true,
+        Value::Text(t) if t.is_empty() => true,
+        Value::Number(n) if n == 0.0 => true,
+        _ => false,
+    }
+}
+
+/// Clear/Delete on Referencia must wipe Linha/Descricao/Preco immediately — including when a
+/// deferred cascade is already owed (same `recalc_keys` path as typing a new code).
+#[test]
+fn clear_referencia_clears_linha_and_descricao() {
+    let Some(path) = xlsx_path() else {
+        eprintln!("skip: LISTA REDUZIDA.xlsx not found");
+        return;
+    };
+    let mut s = Session::new();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    s.execute("sheet.activate", json!({"name": "COTACAO"})).unwrap();
+
+    s.execute("cell.set", json!({"cell": "D21", "input": "MB006"})).unwrap();
+    assert!(num(&s, "L21") > 0.0, "setup MB006");
+    assert!(!text(&s, "E21").is_empty(), "setup Descricao");
+
+    s.execute("edit.clearContents", json!({"range": "D21"})).unwrap();
+    assert_eq!(text(&s, "D21"), "");
+    assert!(linha_cleared(&s, "L21"), "Linha must clear after Referencia clear, got {:?}", cell(&s, "L21"));
+    assert_eq!(text(&s, "E21"), "", "Descricao must clear with Referencia");
+    assert!(preco_cleared(&s, "J21"), "Preco_Unit must clear, got {:?}", cell(&s, "J21"));
+}
+
+/// After a structural graph invalidate + unpaid cascade, clear must still sync the row (no wait
+/// for the background job) — the hole left when `recalc_keys` required `graph_is_current`.
+#[test]
+fn clear_referencia_with_invalid_graph_syncs_row() {
+    let Some(path) = xlsx_path() else {
+        return;
+    };
+    let mut s = Session::new();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    s.execute("sheet.activate", json!({"name": "COTACAO"})).unwrap();
+
+    s.execute("cell.set", json!({"cell": "D21", "input": "CT103"})).unwrap();
+    assert!(
+        text(&s, "E21").contains("CATERPILLAR") || text(&s, "E21").contains("C7"),
+        "setup CT103"
+    );
+
+    {
+        let d = s.doc_mut().unwrap();
+        d.recalc_pending = true;
+        d.recalc_cascade = None;
+        d.calc.invalidate_graph();
+        assert!(!d.calc.graph_is_current());
+    }
+    s.execute("edit.clearContents", json!({"range": "D21"})).unwrap();
+
+    assert_eq!(text(&s, "D21"), "");
+    assert!(s.doc().unwrap().recalc_pending, "full cascade still owed");
+    assert!(
+        !s.doc().unwrap().calc.graph_is_current(),
+        "must not rebuild the whole graph on the edit path"
+    );
+    assert!(linha_cleared(&s, "L21"), "Linha sync without graph, got {:?}", cell(&s, "L21"));
+    assert_eq!(text(&s, "E21"), "", "Descricao must not keep Caterpillar after clear");
+}
