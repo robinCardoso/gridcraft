@@ -896,6 +896,8 @@ fn paste_text(s: &mut Session, p: &Json, text: &str, as_text: bool) -> Result<Js
         }
         Ok(())
     })?;
+    // Excel pastes once: marching ants and repeat paste from the same copy end here.
+    s.clipboard = None;
     Ok(json!({"rows": h, "cols": w}))
 }
 
@@ -1255,9 +1257,8 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
         *cx.sel = crate::Selection { active: at, anchor: at, ranges: vec![RangeRef::new(at, end)] };
         Ok(())
     })?;
-    if cut_move {
-        s.clipboard = None;
-    }
+    // Copy and cut both end after one paste (cut also drops the source block above).
+    s.clipboard = None;
     Ok(json!({"pasted": s.doc()?.selection.a1()}))
 }
 

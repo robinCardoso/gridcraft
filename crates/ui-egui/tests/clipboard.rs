@@ -158,7 +158,8 @@ fn clicking_the_ribbon_paste_button_or_its_menu_does_not_freeze() {
         assert_eq!(cell(&h, "D4"), Some(Value::from("Name")));
         assert_eq!(cell(&h, "E5"), Some(Value::number(42.0)));
 
-        // The Paste split button's own arrow opens the options menu; its items paste too.
+        // Excel pastes a copy once; copy again before Paste Special.
+        h.state_mut().run("edit.copy", json!({"range": "A1:B2"})).unwrap();
         h.state_mut().run("selection.set", json!({"cell": "G1"})).unwrap();
         h.get_by_role_and_label(Role::Button, "Paste Options").click();
         h.run_steps(3);
@@ -190,11 +191,17 @@ fn value_at(h: &Harness, a1: &str) -> Option<Value> {
 fn system_clipboard(text: &str) -> (Rc<RefCell<(String, usize)>>, Services) {
     let clipboard = Rc::new(RefCell::new((text.to_string(), 0)));
     let read = clipboard.clone();
+    let clear = clipboard.clone();
     let services = Services {
         paste_text: Some(Box::new(move || {
             let mut clipboard = read.borrow_mut();
             clipboard.1 += 1;
-            Some(clipboard.0.clone())
+            let text = clipboard.0.clone();
+            (!text.is_empty()).then_some(text)
+        })),
+        clear_clipboard: Some(Box::new(move || {
+            clear.borrow_mut().0.clear();
+            Ok(())
         })),
         ..Default::default()
     };
@@ -226,8 +233,9 @@ fn ribbon_paste_pastes_the_system_clipboard_like_cmd_v() {
     let sh = h.state().session.active().unwrap().wb.active().unwrap();
     assert_eq!(sh.cell(CellRef::parse("B9").unwrap()).unwrap().formula.as_ref().unwrap().text, "C8*2");
 
-    // Nothing on the system clipboard (an image, say): GridCraft's own copy is pasted.
+    // After one paste the copy is consumed; copy again even when the system clipboard is empty.
     clipboard.borrow_mut().0.clear();
+    h.state_mut().run("edit.copy", json!({"range": "A3"})).unwrap();
     h.state_mut().run("selection.set", json!({"cell": "B12"})).unwrap();
     h.get_by_role_and_label(Role::Button, "Paste").click();
     h.run_steps(2);
@@ -250,7 +258,7 @@ fn paste_menu_items_paste_the_system_clipboard() {
     h.run_steps(2);
     assert_eq!(value_at(&h, "D4"), Some(Value::from("from menu")));
 
-    // The cell's context menu › Paste.
+    // The cell's context menu › Paste (new text on the host clipboard after the first paste cleared it).
     clipboard.borrow_mut().0 = "from cell menu".into();
     h.state_mut().run("selection.set", json!({"cell": "F6"})).unwrap();
     let app = h.state();
@@ -266,7 +274,7 @@ fn paste_menu_items_paste_the_system_clipboard() {
     click_menu_paste(&h);
     h.run_steps(2);
     assert_eq!(value_at(&h, "F6"), Some(Value::from("from cell menu")));
-    assert_eq!(clipboard.borrow().1, 2);
+    assert!(clipboard.borrow().1 >= 2, "host clipboard read at least once per paste");
 }
 
 fn press(h: &mut Harness, key: egui::Key) {
@@ -481,6 +489,33 @@ fn the_cut_text_pastes_again_once_the_clipboard_has_held_other_text() {
     h.input_mut().events.push(Event::Paste(text.replace('\n', "\r\n")));
     h.run_steps(2);
     assert_eq!(value_at(&h, "H1"), Some(Value::from("Name")), "the same text copied afresh pastes");
+}
+
+#[test]
+fn ribbon_paste_is_disabled_after_one_paste_until_new_copy() {
+    let mut h = harness(Services::default());
+    h.state_mut().run("edit.copy", json!({"range": "A1:B2"})).unwrap();
+    h.state_mut().run("selection.set", json!({"cell": "D4"})).unwrap();
+    assert!(h.state().can_paste());
+    h.get_by_role_and_label(Role::Button, "Paste").click();
+    h.run_steps(2);
+    assert_eq!(value_at(&h, "D4"), Some(Value::from("Name")));
+    assert!(!h.state().can_paste(), "Paste disabled after one paste");
+    assert!(h.state().session.clipboard.is_none());
+
+    let before = value_at(&h, "E5");
+    h.get_by_role_and_label(Role::Button, "Paste").click();
+    h.run_steps(2);
+    assert_eq!(value_at(&h, "E5"), before, "second paste leaves the sheet unchanged");
+    assert!(h.state().toast.is_some() || h.state().message.is_some());
+
+    dismiss(&mut h);
+    h.state_mut().run("edit.copy", json!({"range": "A1:B2"})).unwrap();
+    assert!(h.state().can_paste());
+    h.state_mut().run("selection.set", json!({"cell": "G1"})).unwrap();
+    h.get_by_role_and_label(Role::Button, "Paste").click();
+    h.run_steps(2);
+    assert_eq!(value_at(&h, "G1"), Some(Value::from("Name")));
 }
 
 #[test]

@@ -3000,7 +3000,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                 items.insert(6, item);
             }
             let lang = crate::i18n::current(ui.ctx());
-            let can_paste = app.can_paste();
+            let can_paste = app.can_paste_from_host();
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();
@@ -3362,7 +3362,7 @@ fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
                 items.insert(5, item);
             }
             let lang = crate::i18n::current(ui.ctx());
-            let can_paste = app.can_paste();
+            let can_paste = app.can_paste_from_host();
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();

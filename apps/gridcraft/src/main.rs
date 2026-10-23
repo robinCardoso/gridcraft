@@ -150,7 +150,7 @@ fn read_clipboard<T>(
 fn services() -> Services {
     // Keep the owner alive: X11/Wayland serve clipboard data from this handle.
     let clipboard: Rc<RefCell<Option<arboard::Clipboard>>> = Rc::default();
-    let (html_clipboard, text_clipboard) = (clipboard.clone(), clipboard.clone());
+    let (html_clipboard, text_clipboard, clear_clipboard) = (clipboard.clone(), clipboard.clone(), clipboard.clone());
     Services {
         copy_html: Some(Box::new(move |html, text| {
             let mut clipboard = clipboard.borrow_mut();
@@ -161,6 +161,9 @@ fn services() -> Services {
         })),
         paste_html: Some(Box::new(move || read_clipboard(&html_clipboard, |clipboard| clipboard.get().html()))),
         paste_text: Some(Box::new(move || read_clipboard(&text_clipboard, |clipboard| clipboard.get_text()))),
+        clear_clipboard: Some(Box::new(move || {
+            read_clipboard(&clear_clipboard, |clipboard| clipboard.clear()).ok_or_else(|| "clipboard unavailable".to_string())
+        })),
         pick_open: Some(Box::new(|| {
             rfd::FileDialog::new()
                 .add_filter("Spreadsheets", &["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "tsv", "txt", "json", "db", "sqlite", "sqlite3"])

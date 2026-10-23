@@ -754,6 +754,8 @@ fn copy_paste_shifts_formulas() {
     s.execute("selection.set", json!({"range": "C2"})).unwrap();
     s.execute("edit.paste", json!({})).unwrap();
     assert_eq!(v(&s, "C2"), Value::Number(7.0));
+    assert!(s.clipboard.is_none(), "copy is consumed after one paste");
+    assert!(s.execute("edit.paste", json!({})).is_err());
     s.execute("edit.cut", json!({"range": "A1"})).unwrap();
     s.execute("selection.set", json!({"range": "E5"})).unwrap();
     s.execute("edit.paste", json!({})).unwrap();
@@ -3597,6 +3599,7 @@ fn paste_special_validation_copies_the_rule() {
     s.execute("edit.copy", json!({"range": "A1"})).unwrap();
     s.execute("edit.pasteSpecial", json!({"what": "formats", "at": "E5"})).unwrap();
     assert!(ok(&mut s, "E5", "-1"));
+    s.execute("edit.copy", json!({"range": "A1"})).unwrap();
     s.execute("edit.pasteSpecial", json!({"what": "validation", "at": "C3"})).unwrap();
     assert!(!ok(&mut s, "C3", "-1"));
     assert!(ok(&mut s, "C3", "1"));

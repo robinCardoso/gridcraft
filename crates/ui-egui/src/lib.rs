@@ -198,6 +198,8 @@ pub struct Services {
     /// gets it from egui's `Event::Paste`). `None` from the host, or no service (web), pastes
     /// GridCraft's own clipboard.
     pub paste_text: Option<Box<dyn FnMut() -> Option<String>>>,
+    /// Clear the host clipboard after a successful paste (desktop arboard).
+    pub clear_clipboard: Option<Box<dyn FnMut() -> Result<(), String>>>,
     /// Web: deliver a file to the user (name, bytes).
     pub download: Option<Box<dyn Fn(&str, &[u8])>>,
     /// Web: start an asynchronous file pick; the bytes arrive later in `inbox`.
@@ -434,6 +436,15 @@ impl SheetApp {
 
     /// Runs an engine command (or a UI command) and handles UI requests it makes.
     pub fn run(&mut self, id: &str, params: Json) -> Result<Json, String> {
+        let paste_clip = matches!(id, "edit.paste" | "edit.pasteAsText" | "edit.pasteSpecial")
+            .then(|| {
+                params
+                    .get("text")
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+                    .or_else(|| self.session.clipboard.as_ref().map(|c| c.text.clone()))
+            })
+            .flatten();
         let r = self.run_command(id, params);
         // This copy leaves the system clipboard alone: note what it holds, so Paste can tell
         // that GridCraft's copy is newer while that text is still there.
@@ -441,6 +452,9 @@ impl SheetApp {
             self.clipboard_text_at_copy = self.system_clipboard_text();
             self.cut_text = if id == "edit.cut" { self.clipboard_text_at_copy.clone() } else { None };
             self.cancelled_text = None;
+        }
+        if matches!(id, "edit.paste" | "edit.pasteAsText" | "edit.pasteSpecial") && r.is_ok() {
+            self.finish_paste(paste_clip.as_deref());
         }
         r
     }
@@ -849,10 +863,37 @@ impl SheetApp {
         self.session.format_painter = None;
     }
 
+    /// After a successful paste: disable Paste until the next copy/cut and clear the host clipboard.
+    fn finish_paste(&mut self, pasted_text: Option<&str>) {
+        let remembered = pasted_text
+            .map(|t| t.replace("\r\n", "\n"))
+            .or_else(|| self.system_clipboard_text())
+            .filter(|t| !t.is_empty())
+            .or_else(|| self.cut_text.clone());
+        self.cancelled_text = Some(remembered.unwrap_or_default());
+        self.cut_text = None;
+        self.clipboard_text_at_copy = None;
+        if let Some(clear) = &mut self.services.clear_clipboard {
+            let _ = clear();
+        }
+    }
+
     /// Whether anything is available to paste (controls active vs disabled/opaque rendering of
     /// the Paste button without reading the host clipboard on every frame).
     pub fn can_paste(&self) -> bool {
         self.session.clipboard.is_some() || (self.cancelled_text.is_none() && self.cut_text.is_none())
+    }
+
+    /// Like [`can_paste`], but reads the host clipboard once (menus only — not every frame).
+    pub fn can_paste_from_host(&mut self) -> bool {
+        if self.session.clipboard.is_some() {
+            return true;
+        }
+        if let Some(text) = self.system_clipboard_text() {
+            return !Self::same_clipboard_text(Some(&text), self.cancelled_text.as_deref())
+                && !Self::same_clipboard_text(Some(&text), self.cut_text.as_deref());
+        }
+        self.cancelled_text.is_none() && self.cut_text.is_none()
     }
 
     /// Paste text that came from the system clipboard (Cmd/Ctrl+V, or the ribbon and menu Paste),
