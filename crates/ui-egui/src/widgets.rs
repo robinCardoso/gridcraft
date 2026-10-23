@@ -1,7 +1,7 @@
 //! Ribbon-style widgets: icon buttons, large buttons, split buttons, colour palettes, and the
 //! message box / toast overlays.
 
-use egui::{Align2, Color32, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, Color32, Id, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetText, pos2, vec2};
 
 use crate::SheetApp;
 use crate::i18n;
@@ -12,6 +12,25 @@ use crate::theme::{self, Tokens};
 /// Ribbon chrome all flows through these widgets, so translating here localises it in one place.
 fn tr<'a>(ui: &Ui, text: &'a str) -> &'a str {
     i18n::current(ui.ctx()).tr(text)
+}
+
+/// Flat popup / context-menu row with the same green hover as the number-format combo.
+///
+/// Uses [`egui::Button::selectable`] so the fill comes from `visuals.selection` (`Tokens::accent_soft`).
+/// Hover index is stored under `menu_id.with("hover")` (same trick as `editable_combo` in `ribbon.rs`).
+pub fn menu_row(ui: &mut Ui, menu_id: Id, index: i32, text: impl Into<WidgetText>, enabled: bool, min_size: Vec2) -> Response {
+    let key = menu_id.with("hover");
+    let hovered: i32 = ui.ctx().data(|d| d.get_temp(key)).unwrap_or(-1);
+    let resp = ui.add_enabled(enabled, egui::Button::selectable(enabled && hovered == index, text).min_size(min_size));
+    if enabled && resp.hovered() {
+        ui.ctx().data_mut(|d| d.insert_temp(key, index));
+    }
+    resp
+}
+
+/// Clears the hover highlight when a custom popup menu closes (avoids a stale green row on reopen).
+pub fn clear_menu_hover(ui: &Ui, menu_id: Id) {
+    ui.ctx().data_mut(|d| d.remove::<i32>(menu_id.with("hover")));
 }
 
 /// A flat square icon button with hover highlight and tooltip.

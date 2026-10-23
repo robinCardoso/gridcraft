@@ -2968,8 +2968,9 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
 
 fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
     let Some(at) = app.grid.context_menu else { return };
+    let menu_id = egui::Id::new("cell_context");
     let mut close = false;
-    let resp = egui::Area::new(egui::Id::new("cell_context")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+    let resp = egui::Area::new(menu_id).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(200.0);
             let insert_copied = insert_copied_item(app);
@@ -3001,6 +3002,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
             }
             let lang = crate::i18n::current(ui.ctx());
             let can_paste = app.can_paste_from_host();
+            let mut row_i = 0_i32;
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();
@@ -3008,7 +3010,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                 }
                 let is_paste = matches!(id, "edit.paste" | "edit.pasteAsText" | "ui:pasteSpecial");
                 let enabled = !is_paste || can_paste;
-                if ui.add_enabled(enabled, egui::Button::new(lang.tr(label)).frame(false).min_size(vec2(190.0, 20.0))).clicked() {
+                if crate::widgets::menu_row(ui, menu_id, row_i, lang.tr(label), enabled, vec2(190.0, 20.0)).clicked() {
                     close = true;
                     match id {
                         "ui:pasteSpecial" => app.open_dialog("pasteSpecial", json!({})),
@@ -3040,6 +3042,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                         other => app.run_or_alert(other, json!({})),
                     }
                 }
+                row_i += 1;
             }
         });
     });
@@ -3050,6 +3053,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
             && !resp.response.hovered()
             && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !resp.response.rect.contains(p)))
     {
+        crate::widgets::clear_menu_hover(ui, menu_id);
         app.grid.context_menu = None;
     }
 }
@@ -3319,8 +3323,9 @@ fn list_picker(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
 
 fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
     let Some((at, rows)) = app.grid.header_menu else { return };
+    let menu_id = egui::Id::new("header_menu");
     let mut close = false;
-    let response = egui::Area::new(egui::Id::new("header_menu")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+    let response = egui::Area::new(menu_id).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(190.0);
             let insert_copied = insert_copied_item(app);
@@ -3363,6 +3368,7 @@ fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
             }
             let lang = crate::i18n::current(ui.ctx());
             let can_paste = app.can_paste_from_host();
+            let mut row_i = 0_i32;
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();
@@ -3370,7 +3376,7 @@ fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
                 }
                 let is_paste = matches!(id, "edit.paste" | "edit.pasteAsText" | "ui:pasteSpecial");
                 let enabled = !is_paste || can_paste;
-                if ui.add_enabled(enabled, egui::Button::new(lang.tr(label)).frame(false).min_size(vec2(180.0, 20.0))).clicked() {
+                if crate::widgets::menu_row(ui, menu_id, row_i, lang.tr(label), enabled, vec2(180.0, 20.0)).clicked() {
                     close = true;
                     match id {
                         "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),
@@ -3384,10 +3390,12 @@ fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
                         other => app.run_or_alert(other, json!({})),
                     }
                 }
+                row_i += 1;
             }
         });
     });
     if close || popup_dismissed(&response.response, was_open) {
+        crate::widgets::clear_menu_hover(ui, menu_id);
         app.grid.header_menu = None;
     }
 }

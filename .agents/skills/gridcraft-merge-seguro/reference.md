@@ -78,6 +78,15 @@ git checkout --ours -- path/to/file   # só quando o veredito for Manter o nosso
 # Preferível em Combinar: editar manualmente ou reaplicar patch seletivo
 ```
 
-## Documento opcional de divergências
+## Checklist de personalizações (obrigatório)
 
-Se existir `docs/personalizacoes.md`, usar como fonte de intenção ao preencher a coluna Motivo. Não é obrigatório criar o arquivo só para cumprir esta skill.
+Arquivo: [`docs/personalizacoes.md`](../../../docs/personalizacoes.md).
+
+Na Fase 2, **antes** da tabela de vereditos:
+
+1. Abrir o doc.
+2. Para cada path do overlap, grep/diff contra as âncoras da tabela “Regressões recentes” (`needs_formula_eval`, `apply_job`/`revision`, `resolve_struct`, `invalidate_graph`, `recalc_cascade`, clipboard consume, `coop`/yield, `truncate(1_000)` / Automatic).
+3. Se houver match → veredito **Manter o nosso** ou **Combinar**, Motivo com o `#` do item.
+4. No resumo da sessão: “`personalizacoes.md` consultado; itens tocados: … / nenhum”.
+
+O gate de overlap sozinho **não** enumera esses bugs — só paths. A checklist é o que impede regressão silenciosa por auto-merge.

@@ -27,7 +27,12 @@ Arquivos irmãos: [reference.md](reference.md) (comandos de overlap, modelo de t
 >
 > Personalizações **melhores ou intencionais** devem ser **mantidas ou aprimoradas** (trazer o ganho do `main` sobre a base nossa). Não misturar nem aceitar o lado do `main` por conveniência de auto-merge.
 
-Documento opcional recomendado: `docs/personalizacoes.md` (ou equivalente) listando divergências intencionais e o motivo. Consulte-o ao julgar vereditos. **Não criar stub** só por política desta skill — só escrever/atualizar se o usuário pedir ou se já existir e precisar refletir um veredito novo.
+Documento **obrigatório** no gate: [`docs/personalizacoes.md`](../../../docs/personalizacoes.md) — checklist de regressões intencionais (SQLite/PT/clipboard **e** bugs recentes: `Text("")` / `needs_formula_eval`, `apply_job` revision, `resolve_struct`, `invalidate_graph`, `recalc_cascade` seeds, clipboard consume, yield/coop, Automatic sem truncate >1000).
+
+> [!IMPORTANT]
+> O gate de overlap/vereditos **não** lista sozinho esses bugs. Em toda Fase 2 o agente **deve abrir e cruzar** `docs/personalizacoes.md` com o overlap. Sem essa consulta, o gate está incompleto.
+
+Atualizar `docs/personalizacoes.md` quando um novo bug de personalização for fechado e puder regredir por auto-merge.
 
 ---
 
@@ -87,10 +92,11 @@ Significado:
 
 Ao escolher o veredito, use nesta ordem:
 
-1. **Intenção documentada** — Regra Fundamental (§1), playbook (§5), e `docs/personalizacoes.md` se existir.
-2. **Testes de regressão das personalizações** — se o lado do main quebraria clipboard / fórmulas PT / SQLite / Esc-colar, não “Pegar o do main” sem plano de Combinar.
-3. **Tamanho e clareza do diff** — diff pequeno e ortogonal no main favorece Combinar ou Pegar o do main; diff grande que apaga comportamento nosso favorece Manter o nosso ou Combinar cuidadoso.
-4. **Ortogonalidade** — bump de versão, CI, lockfile, docs, deps sem tocar na lógica das personalizações → merge sem medo (veredito implícito: aceitar main nesses paths; ainda listar no overlap se ambos tocaram o mesmo arquivo).
+1. **Checklist de personalizações (obrigatório)** — Abrir [`docs/personalizacoes.md`](../../../docs/personalizacoes.md). Cruzar âncoras/grep da tabela “Regressões recentes” com o overlap e com `git diff $BASE..origin/main -- <path>`. Se o main puder reverter um item da checklist → **Manter o nosso** ou **Combinar** (citar o `#` do item no Motivo).
+2. **Intenção documentada** — Regra Fundamental (§1) e playbook (§5).
+3. **Testes de regressão das personalizações** — se o lado do main quebraria clipboard / fórmulas PT / SQLite / Esc-colar / itens da checklist, não “Pegar o do main” sem plano de Combinar + testes da coluna “Testes” do doc.
+4. **Tamanho e clareza do diff** — diff pequeno e ortogonal no main favorece Combinar ou Pegar o do main; diff grande que apaga comportamento nosso favorece Manter o nosso ou Combinar cuidadoso.
+5. **Ortogonalidade** — bump de versão, CI, lockfile, docs, deps sem tocar na lógica das personalizações → merge sem medo (veredito implícito: aceitar main nesses paths; ainda listar no overlap se ambos tocaram o mesmo arquivo).
 
 ### 3.4 Gate humano (PARAR)
 
@@ -100,11 +106,13 @@ Se o próximo `git merge` (incluindo auto-merge sem conflito de marcadores) for 
 2. Pedir confirmação ao usuário com a lista de overlap pendente e sugestão de veredito.
 3. Só continuar após vereditos preenchidos (ou confirmação explícita do usuário para o conjunto).
 
+Também **PARAR** se a Fase 2 não tiver registrado, no resumo da sessão, que `docs/personalizacoes.md` foi consultado (mesmo quando o overlap estiver vazio — confirmação de “sem risco de checklist”).
+
 Arquivos fora do overlap podem seguir o fluxo normal de merge.
 
 ### 3.5 Registrar o gate na sessão
 
-Antes do merge, deixe explícito no raciocínio/resumo: merge-base, lista de overlap, tabela completa, e quais paths são ortogonais (CI/versão).
+Antes do merge, deixe explícito no raciocínio/resumo: merge-base, lista de overlap, **confirmação de leitura de `docs/personalizacoes.md`**, itens da checklist tocados (se houver), tabela completa de vereditos, e quais paths são ortogonais (CI/versão).
 
 ---
 
@@ -198,7 +206,7 @@ Após resolver conflitos / restaurar intenção e adicionar com `git add`, execu
 Ao executar esta skill, o agente deve:
 
 1. Limpar/verificar working tree → backup → `git fetch`.
-2. **Parar no gate:** listar overlap, montar tabela de vereditos, aplicar critérios; se faltar veredito em path que o merge tocaria → pedir confirmação humana.
+2. **Parar no gate:** ler `docs/personalizacoes.md`, listar overlap, cruzar com a checklist de regressões, montar tabela de vereditos, aplicar critérios; se faltar veredito em path que o merge tocaria → pedir confirmação humana.
 3. Só então `git merge origin/main`.
 4. Resolver conflitos com playbook + vereditos; pós-merge, auditar “Manter o nosso” e restaurar se o main vazou.
-5. Rodar a bateria de testes; commit de merge se OK, senão `merge --abort`.
+5. Rodar a bateria de testes (incluir testes citados em `personalizacoes.md` para itens tocados); commit de merge se OK, senão `merge --abort`.
