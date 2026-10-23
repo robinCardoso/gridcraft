@@ -260,44 +260,44 @@ inteira continuavam no range antigo.
 
 ### 7.3 Pedido / PROCV + Tabela3 (2026-10-23)
 
-**Sintoma:** `10 LISTA SC para Outros.xlsm`, aba **Pedido** — colar códigos em **A6–A14**
-não preenchia **B–L**; a partir da **linha 15** sim.
+**Sintoma:** `10 LISTA SC para Outros.xlsm`, aba **Pedido** — colar códigos em **A6+**
+deixava **C–L** vazios nas linhas do **corpo** da Tabela3; linhas **novas** (expand)
+preenchiam. Mudar estado (A3) ou Quant. (B) “acordava” o ecrã.
 
-**Causa raiz (confirmada no corpus):**
-- Grade de pedido = **Tabela3 `A5:L14`** (não é ORCAMENTO structured).
-- Fórmulas **PROCV/SEERRO** em **C6:C14** vêm do xlsx com resultado cacheado
-  `Text("")` → `Value::is_empty()` é **falso** → `recalc_on_load` / `wb_switch_sheet`
-  não reavaliam até haver cascata.
-- Colar **abaixo da linha 14** dispara **`auto_expand_tables`** (`structural`) e autofilla
-  linhas novas com `Value::Empty` (calculam na hora após recalc).
-- Com **`defer_structural`** (≈59k fórmulas no livro), expand estrutural **invalidava o grafo**
-  mas **`recalc_cascade = None`** → job só podia contar com F9 full; edições enquanto
-  `recalc_pending` **não acumulavam seeds** se `recalc_cascade` estava vazio.
-- Fix anterior **db8b630**: `invalidate_graph` no path estrutural **síncrono** (grafo stale
-  após expand sem rebuild).
+**Causa raiz (duas camadas):**
 
-**Fix (universal):** `engine/src/cmd/mod.rs` `commit`:
-- defer estrutural grava **`recalc_cascade = Some(changed)`** (seeds do paste/expand);
-- com **`recalc_pending`**, se `recalc_cascade` era `None`, inicializa com `changed`.
+1. **Motor / seeds (corpus):** Tabela3 ≈ `A5:L13` (corpo 6–13). PROCV em C–L vem com
+   cache Excel **`Text("")`** (`Value::is_empty()` falso). Expand cria linhas com
+   **`Empty`** → calculam no job. Defer estrutural precisava de **`recalc_cascade`** com
+   seeds do paste + fórmulas da linha (`touch_table_formula_rows_for_input_edits`,
+   `needs_formula_eval`). Commits: **db8b630**, **55f3426**, **c73117e**.
 
-**Complemento (cache `Text("")`):**
-- `model::Cell::needs_formula_eval` — fórmula com `Empty` ou `Text("")` ainda precisa de avaliação;
-- `recalc_on_load` / `recalc_sheet_scoped` / `wb_switch_sheet` usam isso (Excel grava PROCV vazio como `t=str` sem `<v>`);
-- `tables::touch_table_formula_rows_for_input_edits` — colar/editar a 1.ª coluna da tabela inclui as fórmulas da mesma linha em `changed` (seeds do job dirty).
+2. **UI / paint (por que B2/B “funciona” e o paste “não”):** o motor **já** recalculava
+   C6 após o job; a grelha guarda `text_cache` por `(uid, revision, sheet)`.
+   - `Text("")` **entra** no cache (não é `Value::Empty` → não faz `continue` no paint).
+   - Linhas novas `Empty` **não** são cacheadas até terem valor.
+   - `apply_job` instalava o wb do worker **sem** `revision++` → cache hit com `""`
+     nas linhas 6–13; C14+ pintavam fresco. Editar A3/B faz `push_undo` → `revision++`
+     → cache invalidado → parece que “só A3/B disparam cascata”.
+
+**Fix (universal) UI:** `ui-egui` `apply_job` (Calc Ok) → **`d.revision += 1`** após
+aplicar o snapshot, para dropar text/CF caches. Complemento calc: `cells_changed`
+sempre `rebuild` quando `!graph_valid` (também com grafo vazio pós-cancel).
 
 **O que analisar (checklist):**
-- [ ] Há **ListObject**/tabela cujo `range` termina logo acima das linhas “presas”?
-- [ ] Células com fórmula têm **`Text("")` cacheado** vs `Empty`?
-- [ ] Paste/dispara **`structural`** + **`defer_structural`** / job pendente?
-- [ ] Grafo **`graph_is_current`** após expand sem **`invalidate_graph`**?
-- [ ] Job de calc: **`recalc_cascade`** cobre células de entrada coladas?
+- [x] ListObject termina acima das linhas “presas” (corpo vs expand).
+- [x] Cache **`Text("")`** vs `Empty` no xlsx e no paint.
+- [x] Paste + `defer_structural` / `recalc_cascade` com seeds C6+.
+- [x] Job aplica valores mas UI não pinta → **revision** / text_cache.
 
-**Implementado:** §7.3 + testes `pedido_procv_repro.rs`, assert em `structural_commands_defer…`.
+**Implementado:** §7.3 + `pedido_procv_repro.rs` + `pedido_paste_recalc.rs`
+(`ui_calc_job_bumps_revision_so_text_cache_drops_stale_empty`).
 
 **Validar:**
-- `cargo test -p gridcraft-engine --test pedido_procv_repro` (com xlsm em Downloads).
-- Manual: abrir xlsm → Pedido → colar coluna de códigos a partir de A6 → **C6** e **C15**
-  com descrição; F9 se “Calculando…” foi cancelado.
+- `cargo test -p gridcraft-engine --test pedido_procv_repro`
+- `cargo test -p gridcraft-ui-egui --test pedido_paste_recalc`
+- Manual: abrir xlsm → Pedido → colar códigos em A6+ → esperar job → **C6** e **C14**
+  com descrição **sem** precisar editar A3/B.
 
 ### Fora de escopo (mantido)
 

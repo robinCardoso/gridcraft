@@ -1688,8 +1688,10 @@ impl Calc {
     /// Returns `false` only when a background caller cancelled (`Calc::hooks`).
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) -> bool {
         // A structurally invalidated graph must be rebuilt before patching nodes; otherwise
-        // keys/areas from before the edit would mix with the new ones.
-        if !self.graph_valid && !self.graph.is_empty() && !self.rebuild(wb) {
+        // keys/areas from before the edit would mix with the new ones. Rebuild even when the
+        // graph was cleared mid-cancel (`Graph::default`) — skipping left `graph_valid` flipped
+        // true by a partial `apply_node_updates` of only the edit seeds.
+        if !self.graph_valid && !self.rebuild(wb) {
             return false;
         }
         let cleared = self.apply_node_updates(wb, changed);

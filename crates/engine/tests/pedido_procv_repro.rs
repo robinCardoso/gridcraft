@@ -1,5 +1,5 @@
-//! Regression: aba Pedido em "10 LISTA SC para Outros.xlsm" (Tabela3 A5:L14 + PROCV).
-//! Sintoma reportado: códigos colados em A6–A14 não atualizam B–L; linhas 15+ sim.
+﻿//! Regression: aba Pedido em "10 LISTA SC para Outros.xlsm" (Tabela3 + PROCV).
+//! Sintoma: códigos colados em A (linhas do corpo) não atualizam C–L; expand abaixo sim.
 #![allow(clippy::disallowed_methods)]
 
 use gridcraft_core::{CellRef, Value};
@@ -53,7 +53,7 @@ fn pedido_procv_updates_after_paste_in_table_body() {
     );
     assert!(
         matches!(v(&s, "C15"), Value::Text(ref t) if !t.is_empty()),
-        "expanded row C15 must calculate after paste past row 14"
+        "expanded row C15 must calculate after paste past table end"
     );
 }
 
@@ -78,6 +78,8 @@ fn pedido_deferred_table_expand_job_uses_paste_seeds() {
     assert!(d.recalc_pending);
     let cascade = d.recalc_cascade.clone().expect("structural defer records paste seeds");
     assert!(!cascade.is_empty(), "seeds must include pasted input cells");
+    let c6 = (pedido, CellRef::parse("C6").unwrap());
+    assert!(cascade.contains(&c6), "body formula C6 must be a cascade seed");
 
     let (wb, _, _) = gridcraft_engine::recalc_document(&d.wb, d.calc.clone(), None, None, d.calc.seeds(), Some(cascade));
     let sh = wb.sheet(pedido).unwrap();
@@ -87,13 +89,12 @@ fn pedido_deferred_table_expand_job_uses_paste_seeds() {
     assert!(matches!(c15, Value::Text(ref t) if !t.is_empty()));
 }
 
-/// UI path: big workbook + `defer_structural`, paste A6:A23 (inside Tabela3 + expand past L14).
+/// UI path: big workbook + `defer_structural`, paste A6:A23 (inside Tabela3 + expand).
 #[test]
 fn pedido_deferred_paste_a6_a23_fills_table_body_and_expanded_rows() {
     let Some(path) = xlsm_path() else {
         return;
     };
-    // Codes that exist in NACIONAL/IMPORTADA (not a contiguous synthetic range).
     let codes = "11002048\n11002148\n11002248\n11002948\n11003048\n11003148\n11003248\n11003948\n\
 11011030\n11012030\n11013040\n11013140\n11013240\n11013940\n11014040\n11014140\n11014240\n11014940\n";
 
@@ -108,8 +109,11 @@ fn pedido_deferred_paste_a6_a23_fills_table_body_and_expanded_rows() {
     assert!(d.recalc_pending, "structural table expand defers recalc");
     let cascade = d.recalc_cascade.clone().expect("structural defer records paste seeds");
     assert!(!cascade.is_empty());
+    for row in 6..=13u32 {
+        let c = (pedido, CellRef::new(row - 1, 2)); // C6..C13
+        assert!(cascade.contains(&c), "cascade must seed C{row}");
+    }
 
-    // Before the background job, body rows stay stale (cached Text("") from load).
     assert!(
         matches!(v(&s, "C6"), Value::Text(ref t) if t.is_empty()),
         "C6 stale until job: {:?}",
@@ -132,7 +136,7 @@ fn pedido_deferred_paste_a6_a23_fills_table_body_and_expanded_rows() {
     assert!(calc.graph_is_current());
 }
 
-/// Paste only inside Tabela3 body (no row expand past L14).
+/// Paste only inside Tabela3 body (no row expand).
 #[test]
 fn pedido_deferred_paste_inside_table_body_without_expand() {
     let Some(path) = xlsm_path() else {

@@ -733,6 +733,11 @@ impl SheetApp {
                     {
                         d.wb = std::sync::Arc::new(o.wb);
                         d.calc = o.calc;
+                        // Values changed under the same undo revision as the edit that queued the
+                        // job: bump so grid text/CF caches (keyed by revision) drop stale
+                        // `Text("")` paint from before the worker finished — otherwise body rows
+                        // of a table stay blank on screen while expanded Empty rows paint fine.
+                        d.revision = d.revision.saturating_add(1);
                         // The snapshot is fully recomputed: any owed recalculation is paid.
                         d.recalc_pending = false;
                         d.recalc_cascade = None;

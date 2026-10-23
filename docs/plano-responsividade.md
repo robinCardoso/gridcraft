@@ -174,31 +174,26 @@
 
 ## Handoff — próximos passos (para quem continuar o plano)
 
-> ### ⏸️ ONDE PARAMOS — 2026-10-23 (expand tabela + rebuild estrutural)
+> ### ⏸️ ONDE PARAMOS — 2026-10-23 (Pedido Tabela3: paint stale após job)
 >
-> **Fechado agora (código):** após H9 (`resolve_struct` estático), paste/auto-expand de
-> tabela **parava de calcular** nas linhas novas: o path estrutural síncrono chamava
-> `recalc_all` **sem** `invalidate_graph`, então `ensure_graph` (F9 incremental) era no-op
-> e as fórmulas autofilled nunca entravam no grafo (valores Empty). Fix: `invalidate_graph`
-> antes de `recalc_all` em `cmd/mod.rs` `commit` (igual ao path `defer_structural`). Isso
-> também re-pinna Areas de structured refs de coluna inteira à geometria nova da tabela.
-> Testes: `paste_expands_structured_calc_columns_like_cotacao`,
-> `expanding_table_refreshes_whole_column_structured_precedents`,
-> `pasting_column_auto_expands_*` / `typing_below_table_*`.
+> **Fechado agora (código):** colar códigos na Pedido/Tabela3 deixava **C6–C13** em branco
+> no ecrã enquanto **C14+** (expand) preenchiam — o motor já recalculava o corpo no job
+> (seeds + `Text("")`), mas `apply_job` **não** incrementava `revision`, então
+> `text_cache` da grelha mantinha `""` das células com cache Excel `Text("")` (Empty das
+> linhas novas não entrava no cache). Editar A3/B só parecia “disparar” porque
+> `push_undo` bumpa revision. Fix: `revision += 1` ao aplicar Calc Ok; `cells_changed`
+> rebuild sempre se `!graph_valid`. Ver §7.3 em `plano-desempenho-calculo.md`.
 >
-> **Herdado (ainda válido):** H9 structured refs; Q1+Q2; fix LET aninhado; job calc;
-> truncate >1000 removido; Wasm/clang: não tentar.
+> **Herdado:** invalidate estrutural (db8b630); cascade seeds (55f3426); needs_formula_eval
+> + touch_table (c73117e); H9 structured refs; Q1+Q2; job calc; truncate >1000 removido.
 >
 > **PRÓXIMO PASSO RECOMENDADO:**
-> 1. Reteste manual: abrir corpus, paste várias Referencias abaixo de ORCAMENTO —
->    Linha/Descricao devem calcular nas linhas novas (sem F9).
-> 2. Clear na coluna Referencia — progresso/dirty ≪ livro inteiro.
+> 1. Reteste manual Pedido: paste A6+ → C6 e C14 com descrição **sem** tocar A3/B.
+> 2. COTACAO expand (LISTA REDUZIDA) — regressão de paint após job.
 > 3. Medir F9 release com `GRIDCRAFT_CALC_STATS=1` e decidir **Q4** vs **Q3/M3** vs **E1**.
 >
-> **Reteste manual (corpus de exemplo):** abrir `LISTA REDUZIDA.xlsx`, aba `COTACAO` —
-> E16/E17/E18 (e F/J) devem diferir por referência; coluna Linha ≈ 2, 3, 4… como no Excel.
-> Expandir a tabela (colar códigos em Referencia) deve preencher Descricao/Linha nas linhas
-> novas. Clear de um bloco em Referencia não deve reavaliar ~600k fórmulas.
+> **Reteste manual:** `10 LISTA SC para Outros.xlsm` → Pedido → colar códigos em A6.
+> Também: `LISTA REDUZIDA.xlsx` / COTACAO — expand Referencia preenche Descricao/Linha.
 
 
 **Mapa do que já existe (símbolos):**
