@@ -106,7 +106,8 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
 }
 
 fn watch(app: &mut SheetApp, ui: &mut Ui) {
-    if ui.button("Add Watch (active cell)").clicked()
+    let lang = app.ui.language;
+    if ui.button(lang.tr("Add Watch (active cell)")).clicked()
         && let Some(d) = app.session.active()
         && let Some(sh) = d.wb.active()
     {
@@ -115,9 +116,9 @@ fn watch(app: &mut SheetApp, ui: &mut Ui) {
     }
     let list = app.session.run("formulas.watchWindow", json!({})).unwrap_or(Json::Null);
     egui::Grid::new("watch_grid").striped(true).num_columns(4).show(ui, |ui| {
-        ui.strong("Cell");
-        ui.strong("Value");
-        ui.strong("Formula");
+        ui.strong(lang.tr("Cell"));
+        ui.strong(lang.tr("Value"));
+        ui.strong(lang.tr("Formula"));
         ui.label("");
         ui.end_row();
         for w in list.as_array().cloned().unwrap_or_default() {
@@ -134,10 +135,11 @@ fn watch(app: &mut SheetApp, ui: &mut Ui) {
 }
 
 fn selection(app: &mut SheetApp, ui: &mut Ui) {
+    let lang = app.ui.language;
     let list = app.session.run("arrange.selectionPane", json!({})).unwrap_or(Json::Null);
     let items = list.as_array().cloned().unwrap_or_default();
     if items.is_empty() {
-        ui.label(egui::RichText::new("There are no shapes, pictures or charts on this sheet.").italics());
+        ui.label(egui::RichText::new(lang.tr("There are no shapes, pictures or charts on this sheet.")).italics());
     }
     for it in items.iter().rev() {
         let kind = it["kind"].as_str().unwrap_or("").to_string();
@@ -161,12 +163,13 @@ fn selection(app: &mut SheetApp, ui: &mut Ui) {
 }
 
 fn format_chart(app: &mut SheetApp, ui: &mut Ui) {
+    let lang = app.ui.language;
     let Some(id) = app.selected_chart else {
-        ui.label(egui::RichText::new("Select a chart to format it.").italics());
+        ui.label(egui::RichText::new(lang.tr("Select a chart to format it.")).italics());
         return;
     };
     let Some(chart) = app.session.active().and_then(|d| d.wb.active().and_then(|s| s.charts.iter().find(|c| c.id == id).cloned())) else {
-        ui.label("The chart no longer exists.");
+        ui.label(lang.tr("The chart no longer exists."));
         return;
     };
     let theme = app.session.active().map(|d| d.wb.theme.clone()).unwrap_or_default();
@@ -215,14 +218,14 @@ fn format_chart(app: &mut SheetApp, ui: &mut Ui) {
             app.run_or_alert("chart.set", json!({"chart": id, "gridlines": gl}));
         }
         ui.horizontal(|ui| {
-            ui.label("Horizontal axis title:");
+            ui.label(lang.tr("Horizontal axis title:"));
             let field = egui::Id::new(("gridcraft.chart_x_title", id));
             if let Some(xt) = crate::widgets::committed_text(ui, field, chart.x_title.as_deref().unwrap_or(""), None) {
                 app.run_or_alert("chart.set", json!({"chart": id, "xTitle": if xt.is_empty() { Json::Null } else { json!(xt) }}));
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Vertical axis title:");
+            ui.label(lang.tr("Vertical axis title:"));
             let field = egui::Id::new(("gridcraft.chart_y_title", id));
             if let Some(yt) = crate::widgets::committed_text(ui, field, chart.y_title.as_deref().unwrap_or(""), None) {
                 app.run_or_alert("chart.set", json!({"chart": id, "yTitle": if yt.is_empty() { Json::Null } else { json!(yt) }}));
