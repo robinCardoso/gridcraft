@@ -129,6 +129,12 @@ pub trait Host {
         None
     }
     fn set_cached_val(&mut self, _key: u64, _val: Value) {}
+    /// When true, the evaluator times top-level function calls (`GRIDCRAFT_CALC_STATS`).
+    fn fn_timing_active(&self) -> bool {
+        false
+    }
+    /// Records a sampled function call duration in µs (no-op unless stats are on).
+    fn note_fn_timing(&mut self, _name: &str, _us: u64) {}
 }
 
 pub fn hash_expr<H: std::hash::Hasher>(e: &Expr, state: &mut H) {
@@ -375,7 +381,7 @@ impl<'h> Evaluator<'h> {
             Expr::Struct(s) => self.structured(s),
             Expr::Unary(op, x) => self.unary(*op, x),
             Expr::Binary(op, a, b) => self.binary(*op, a, b),
-            Expr::Call(name, args) => self.call(name, args),
+            Expr::Call(name, args) => self.call_timed(name, args),
             Expr::Invoke(callee, args) => {
                 let f = self.eval(callee);
                 match f {
@@ -676,6 +682,25 @@ impl<'h> Evaluator<'h> {
                 let v = self.value(e);
                 v.scalar().to_number()
             }
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)] // Instant only when stats ask for it (native)
+    fn call_timed(&mut self, name: &str, args: &[Expr]) -> Ev {
+        if !self.host.fn_timing_active() {
+            return self.call(name, args);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let t0 = std::time::Instant::now();
+            let r = self.call(name, args);
+            let us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.host.note_fn_timing(name, us);
+            r
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.call(name, args)
         }
     }
 

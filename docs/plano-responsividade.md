@@ -174,44 +174,27 @@
 
 ## Handoff — próximos passos (para quem continuar o plano)
 
-> ### ⏸️ ONDE PARAMOS — 2026-10-23 (Rodada LET aninhado / lookup repetido em tabelas)
+> ### ⏸️ ONDE PARAMOS — 2026-10-23 (1ª sprint desempenho: instrumentação + yield)
 >
-> **Bug fechado (engine, não arquivo).** Reproduzido no corpus `LISTA REDUZIDA.xlsx`
-> (aba de exemplo `COTACAO`): Referencia mudava (MB001, MB002…) mas
-> Descricao/Fornecedor/Preço/Linha repetiam MB001 após `recalc_on_load`. O xlsx está
-> correto: fórmulas usam `ORCAMENTO[[#This Row],…]` / `[@Referencia]`; cache Excel
-> tinha L16=2, L17=3, L18=4 e descrições distintas.
+> **Fechado nesta sprint (código):** Q1 + Q2 de
+> [`plano-desempenho-calculo.md`](./plano-desempenho-calculo.md) — yield/progresso por
+> **tempo** (~75 ms) em `PassHost::coop` / `run_scoped` (barra não “morre”; Cancel no
+> mesmo tick); instrumentação `GRIDCRAFT_CALC_STATS=1` (histograma µs/fórmula, top-20,
+> hit/miss de `range_array`/equality, gap entre reports). Universal (§0): zero special-case
+> por aba/arquivo. Testes: `hooks_eager_coop_*`, `hooks_progress_reports_under_slow_compute`,
+> `hooks_cancel_during_slow_compute`.
 >
-> **Causa:** cache de bindings do `LET` (`PassHost::val_cache`) via `is_expr_invariant`.
-> O LET externo marca `codigo` (ThisRow) como variante; o LET **interno** reiniciava
-> `variant_names` vazio, então `achou = LISTA_PRECO[…] = codigo` parecia invariante
-> (AST só cita o nome) e reutilizava o array da 1ª linha em todas as demais.
-> Não é regressão do truncate Automatic / `recalc_cascade` / job — é o cache do LET
-> (Fase 3) + **padrão universal** de `LET` aninhado (qualquer workbook com o mesmo shape).
->
-> **Fix:** em `eval::let_`, semear `variant_names` com os nomes já em `self.env`
-> (LET/LAMBDA externos) antes de decidir cache.
-> - Código: `calc/src/eval.rs` (`let_`).
-> - Teste: `nested_let_does_not_reuse_outer_binding_across_rows` (`calc/src/tests.rs`).
->
-> **Herdado:** Rodada calc job 1% / 0/N + Cancel (cooperativo + `recalc_cascade`).
-> Truncate >1000 removido; Wasm/clang: não tentar. Não commitir sem pedido do dono.
->
-> **Desempenho / “travou em 42%” (~800k):** o numerador da barra é progresso real
-> (`done/total`; o % da UI usa teto 0,9). Plano acionável — **otimizações universais**
-> no motor (índices `MATCH`/`XLOOKUP`/`COUNTIF*`, yield, dirty subset, paralelismo
-> topológico); **zero** `if sheet_name == "…"`. O antigo “padrão COTACAO” = workload
-> de exemplo (`LET` + coluna=código + `MATCH`/`INDEX`), não special-case de aba:
-> [`docs/plano-desempenho-calculo.md`](./plano-desempenho-calculo.md) (§0).
+> **Herdado (ainda válido):** fix LET aninhado (`variant_names` + `val_cache`); job calc
+> 1%/0/N + Cancel; truncate >1000 removido; Wasm/clang: não tentar.
 >
 > **PRÓXIMO PASSO RECOMENDADO:**
-> 1. Seguir a **1ª sprint** de [`plano-desempenho-calculo.md`](./plano-desempenho-calculo.md)
->    (instrumentar histograma por fórmula + yield por tempo; decidir Q4 vs Q3 vs E1 com dados).
-> 2. (Opcional / paralelo) Índice `COUNTIF`/`SUMIF`/`AVERAGEIFS`/`MAXIFS`/`MINIFS`
->    (extensão do índice *IFS da Fase 3) — item Q3 desse plano.
+> 1. Medir corpus denso em **release** com `GRIDCRAFT_CALC_STATS=1` (F9) e decidir
+>    **Q4** vs **Q3/M3** vs spike **E1** com os números (§7 do plano de desempenho).
+> 2. (Opcional) Índice `COUNTIF`/`SUMIF`/`AVERAGEIFS`/`MAXIFS`/`MINIFS` — Q3.
 >
 > **Reteste manual (corpus de exemplo):** abrir `LISTA REDUZIDA.xlsx`, aba `COTACAO` —
 > E16/E17/E18 (e F/J) devem diferir por referência; coluna Linha ≈ 2, 3, 4… como no Excel.
+> Com stats: stderr deve mostrar `[GRIDCRAFT_CALC_STATS]` ao fim do F9.
 
 
 **Mapa do que já existe (símbolos):**

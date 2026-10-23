@@ -1470,6 +1470,85 @@ fn hooks_progress_advances_past_zero_done() {
     );
 }
 
+/// Time-based yield (Q1): with eager coop, progress reports far more often than the 4096-count
+/// milestones alone — the bar stays alive even when `done` advances slowly.
+#[test]
+fn hooks_eager_coop_reports_finer_than_count_milestones() {
+    let mut wb = chain(2_000);
+    let hooks = Arc::new(CalcHooks::new());
+    hooks.set_coop_eager(true);
+    let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+    let collect = seen.clone();
+    hooks.set_progress(Box::new(move |done, total| {
+        if let Ok(mut v) = collect.lock() {
+            v.push((done, total));
+        }
+    }));
+    let mut calc = Calc::new();
+    calc.set_hooks(hooks);
+    assert!(calc.recalc_all(&mut wb));
+    let reports = seen.lock().unwrap();
+    // Count-only path: start nudge + first + every 4096 + final ≈ a handful for 2k formulas.
+    // Eager coop reports on every compute entry → hundreds of samples.
+    assert!(
+        reports.len() > 50,
+        "eager coop must report finer than count milestones alone: {} reports",
+        reports.len()
+    );
+}
+
+/// Simulated slow formulas still emit progress often enough that the bar does not look dead (Q1).
+#[test]
+#[allow(clippy::disallowed_methods)] // native timing assertion for Q1
+fn hooks_progress_reports_under_slow_compute() {
+    let mut wb = chain(6);
+    let hooks = Arc::new(CalcHooks::new());
+    hooks.set_coop_interval_ms(15);
+    hooks.set_slow_compute_us(30_000); // 30 ms per newly computed formula
+    let stamps = Arc::new(Mutex::new(Vec::<std::time::Instant>::new()));
+    let collect = stamps.clone();
+    hooks.set_progress(Box::new(move |_done, _total| {
+        if let Ok(mut v) = collect.lock() {
+            v.push(std::time::Instant::now());
+        }
+    }));
+    let mut calc = Calc::new();
+    calc.set_hooks(hooks);
+    assert!(calc.recalc_all(&mut wb), "slow compute without cancel must finish");
+    let stamps = stamps.lock().unwrap();
+    assert!(stamps.len() >= 4, "slow pass must report repeatedly: {} stamps", stamps.len());
+    let mut max_gap = std::time::Duration::ZERO;
+    for w in stamps.windows(2) {
+        max_gap = max_gap.max(w[1].saturating_duration_since(w[0]));
+    }
+    // Aceite do plano: progresso pelo menos a cada ~200 ms (folga de CI).
+    assert!(
+        max_gap < std::time::Duration::from_millis(250),
+        "report gap {max_gap:?} exceeds 250 ms under slow load"
+    );
+}
+
+/// Cancel during a slow compute aborts without write-back (cooperative path still live).
+#[test]
+fn hooks_cancel_during_slow_compute() {
+    let mut wb = chain(12);
+    let hooks = Arc::new(CalcHooks::new());
+    hooks.set_coop_interval_ms(10);
+    hooks.set_slow_compute_us(40_000);
+    let cancel_at = hooks.clone();
+    hooks.set_progress(Box::new(move |done, _total| {
+        // Wait until real formula work started (not just rebuild nudges at done==0).
+        if done >= 1 {
+            cancel_at.cancel();
+        }
+    }));
+    let mut calc = Calc::new();
+    calc.set_hooks(hooks.clone());
+    assert!(!calc.recalc_all(&mut wb), "cancel mid slow compute returns incomplete");
+    assert!(hooks.cancelled());
+    assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Empty, "cancelled pass writes nothing back");
+}
+
 /// Fase 3 (docs/plano-responsividade.md): the per-pass range cache keeps ranges apart — the same
 /// coordinates on two sheets are different ranges — and reads the same values as a direct read.
 #[test]

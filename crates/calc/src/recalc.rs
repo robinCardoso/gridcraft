@@ -12,8 +12,11 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 
 /// A fast, non-cryptographic hasher for cell keys (FxHash-style multiply-rotate).
 #[derive(Default, Clone, Copy)]
@@ -417,17 +420,45 @@ impl Graph {
 /// Cooperative hooks a background calculation shares with its owner (docs/plano-responsividade.md,
 /// Fase 3): progress is reported every few hundred formulas, and a cancellation flag the owner
 /// (interface thread) can set stops the evaluation as soon as the next check lands. Shared
+/// Default cooperative progress/cancel interval (docs/plano-desempenho-calculo.md Q1).
+const COOP_MS_DEFAULT: u64 = 75;
+
 /// through `Arc`, so the job can hold it while the [`Calc`] runs on its own thread.
-#[derive(Default)]
 pub struct CalcHooks {
     cancel: AtomicBool,
     /// `(formulas evaluated, total being evaluated)`; a poisoned or replaced callback is skipped.
     progress: Mutex<Option<Box<dyn FnMut(usize, usize) + Send>>>,
+    /// Progress/cancel tick interval in milliseconds (native). Clamped to at least 1 when set via
+    /// [`Self::set_coop_interval_ms`]. Default [`COOP_MS_DEFAULT`].
+    coop_ms: AtomicU64,
+    /// When set, every cooperative check reports (tests: prove time-path without waiting 75 ms).
+    coop_eager: AtomicBool,
+    /// Sleep this many microseconds at the start of each newly computed formula (`0` = off).
+    /// Tests / debug only (`GRIDCRAFT_CALC_SLOW_US` also seeds this when hooks are created).
+    slow_compute_us: AtomicU64,
+}
+
+impl Default for CalcHooks {
+    fn default() -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            progress: Mutex::new(None),
+            coop_ms: AtomicU64::new(COOP_MS_DEFAULT),
+            coop_eager: AtomicBool::new(false),
+            slow_compute_us: AtomicU64::new(0),
+        }
+    }
 }
 
 impl CalcHooks {
     pub fn new() -> Self {
-        Self::default()
+        let h = Self::default();
+        if let Ok(v) = std::env::var("GRIDCRAFT_CALC_SLOW_US")
+            && let Ok(us) = v.parse::<u64>()
+        {
+            h.slow_compute_us.store(us, Ordering::Relaxed);
+        }
+        h
     }
     /// Requests cancellation: the running calculation stops soon after and reports an incomplete run.
     pub fn cancel(&self) {
@@ -441,6 +472,18 @@ impl CalcHooks {
         if let Ok(mut slot) = self.progress.lock() {
             *slot = Some(f);
         }
+    }
+    /// Cooperative report interval in ms (native yield). Values below 1 become 1.
+    pub fn set_coop_interval_ms(&self, ms: u64) {
+        self.coop_ms.store(ms.max(1), Ordering::Relaxed);
+    }
+    /// When `eager`, every coop check reports immediately (unit tests).
+    pub fn set_coop_eager(&self, eager: bool) {
+        self.coop_eager.store(eager, Ordering::Relaxed);
+    }
+    /// Artificial per-formula delay in µs (`0` clears). For tests simulating slow compute.
+    pub fn set_slow_compute_us(&self, us: u64) {
+        self.slow_compute_us.store(us, Ordering::Relaxed);
     }
     /// Reports `(work done, total)` to the progress callback, when one is attached. Engine code
     /// outside a recalculation (Solver, Goal Seek) reports through the same hooks.
@@ -572,6 +615,161 @@ struct PassHost<'a> {
     compute_steps: usize,
     /// Set when hooks request cancel mid-tree; `run_scoped` aborts the pass without write-back.
     aborted: bool,
+    /// Last cooperative report/cancel tick (native). Wasm keeps step-only sampling.
+    #[cfg(not(target_arch = "wasm32"))]
+    last_coop: Instant,
+    /// Optional pass stats (`GRIDCRAFT_CALC_STATS`); off by default so release stays cheap.
+    stats: Option<Box<CalcStats>>,
+}
+
+/// Per-pass calculation stats when `GRIDCRAFT_CALC_STATS` is set (docs/plano-desempenho Q2).
+struct CalcStats {
+    /// Samples of wall µs for each newly computed formula.
+    count: u64,
+    sum_us: u128,
+    max_us: u64,
+    max_key: Option<Key>,
+    /// log₂ buckets: index `i` ≈ `[2^i, 2^{i+1})` µs (last catches overflow).
+    buckets: [u64; 24],
+    /// Slowest formulas (µs, key), ascending — trim to top 20.
+    top: Vec<(u64, Key)>,
+    range_hit: u64,
+    range_miss: u64,
+    eq_hit: u64,
+    eq_build: u64,
+    report_count: u64,
+    max_report_gap_ms: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_report_at: Option<Instant>,
+    /// Sampled top-level function totals: name → (calls, sum_us).
+    fn_calls: HashMap<String, (u64, u128)>,
+    fn_sample_gate: u64,
+}
+
+impl CalcStats {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum_us: 0,
+            max_us: 0,
+            max_key: None,
+            buckets: [0; 24],
+            top: Vec::with_capacity(24),
+            range_hit: 0,
+            range_miss: 0,
+            eq_hit: 0,
+            eq_build: 0,
+            report_count: 0,
+            max_report_gap_ms: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_report_at: None,
+            fn_calls: HashMap::default(),
+            fn_sample_gate: 0,
+        }
+    }
+
+    fn record_compute(&mut self, key: Key, us: u64) {
+        self.count += 1;
+        self.sum_us += u128::from(us);
+        if us >= self.max_us {
+            self.max_us = us;
+            self.max_key = Some(key);
+        }
+        let b = if us <= 1 {
+            0
+        } else {
+            ((63_u32.saturating_sub(us.leading_zeros())) as usize).min(23)
+        };
+        self.buckets[b] += 1;
+        self.top.push((us, key));
+        if self.top.len() > 40 {
+            self.top.sort_unstable_by_key(|(u, _)| *u);
+            let drop_n = self.top.len() - 20;
+            self.top.drain(0..drop_n);
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn record_report(&mut self) {
+        self.report_count += 1;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let now = Instant::now();
+            if let Some(prev) = self.last_report_at {
+                let gap = now.duration_since(prev).as_millis() as u64;
+                self.max_report_gap_ms = self.max_report_gap_ms.max(gap);
+            }
+            self.last_report_at = Some(now);
+        }
+    }
+
+    fn record_fn(&mut self, name: &str, us: u64) {
+        self.fn_sample_gate = self.fn_sample_gate.wrapping_add(1);
+        // Sample ~1/16 of calls so the hot path stays light when stats are on.
+        if !self.fn_sample_gate.is_multiple_of(16) {
+            return;
+        }
+        let e = self.fn_calls.entry(name.to_ascii_uppercase()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += u128::from(us);
+    }
+
+    fn percentile(&self, p: f64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let target = ((self.count as f64) * p).ceil().max(1.0) as u64;
+        let mut acc = 0u64;
+        for (i, &c) in self.buckets.iter().enumerate() {
+            acc += c;
+            if acc >= target {
+                return 1u64 << i.min(63);
+            }
+        }
+        self.max_us
+    }
+
+    fn dump(&mut self) {
+        self.top.sort_unstable_by_key(|(u, _)| std::cmp::Reverse(*u));
+        self.top.truncate(20);
+        let mean = if self.count == 0 { 0 } else { (self.sum_us / u128::from(self.count)) as u64 };
+        let max_at = self.max_key.map(|(s, c)| format!("sheet{s}!{}", c.a1())).unwrap_or_else(|| "-".into());
+        eprintln!(
+            "[GRIDCRAFT_CALC_STATS] formulas={} mean={}us p50={}us p95={}us p99={}us max={}us @ {max_at} reports={} max_report_gap_ms={}",
+            self.count,
+            mean,
+            self.percentile(0.50),
+            self.percentile(0.95),
+            self.percentile(0.99),
+            self.max_us,
+            self.report_count,
+            self.max_report_gap_ms
+        );
+        if !self.top.is_empty() {
+            eprint!("[GRIDCRAFT_CALC_STATS] top:");
+            for (us, (s, c)) in &self.top {
+                eprint!(" {us}us@sheet{s}!{}", c.a1());
+            }
+            eprintln!();
+        }
+        eprintln!(
+            "[GRIDCRAFT_CALC_STATS] range_array hit={} miss={} equality hit={} build={}",
+            self.range_hit, self.range_miss, self.eq_hit, self.eq_build
+        );
+        if !self.fn_calls.is_empty() {
+            let mut ranked: Vec<_> = self.fn_calls.iter().map(|(n, (c, sum))| (sum / u128::from((*c).max(1)), n.as_str(), *c, *sum)).collect();
+            ranked.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+            eprint!("[GRIDCRAFT_CALC_STATS] fn_sample:");
+            for (mean, name, calls, _) in ranked.into_iter().take(12) {
+                eprint!(" {name}~{mean}us×{calls}");
+            }
+            eprintln!();
+        }
+    }
+}
+
+fn calc_stats_enabled() -> bool {
+    std::env::var_os("GRIDCRAFT_CALC_STATS").is_some()
 }
 
 /// Most cells kept materialized per pass: a bigger range is read normally, so one huge array
@@ -601,6 +799,7 @@ fn to_lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
 }
 
 impl<'a> PassHost<'a> {
+    #[allow(clippy::disallowed_methods)] // last_coop Instant is native-only
     fn new(
         wb: &'a Workbook,
         exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
@@ -639,6 +838,85 @@ impl<'a> PassHost<'a> {
             progress_total: progress_total.max(1),
             compute_steps: 0,
             aborted: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_coop: Instant::now(),
+            stats: calc_stats_enabled().then(|| Box::new(CalcStats::new())),
+        }
+    }
+
+    /// Cancel + progress tick by time (~75 ms) or every 256 compute steps (wasm: steps only).
+    #[allow(clippy::disallowed_methods)] // Instant only off wasm
+    fn coop(&mut self) {
+        if self.aborted {
+            return;
+        }
+        let Some(hooks) = self.hooks.as_ref() else { return };
+        self.compute_steps = self.compute_steps.wrapping_add(1);
+        let eager = hooks.coop_eager.load(Ordering::Relaxed);
+        let due = if eager {
+            true
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let ms = hooks.coop_ms.load(Ordering::Relaxed).max(1);
+                self.last_coop.elapsed() >= Duration::from_millis(ms) || self.compute_steps.is_multiple_of(256)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.compute_steps.is_multiple_of(256)
+            }
+        };
+        if !due {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.last_coop = Instant::now();
+        }
+        if hooks.cancelled() {
+            self.aborted = true;
+            return;
+        }
+        // Report even when `done` is unchanged so a long formula does not freeze the bar (Q1).
+        let done = self.results.len().min(self.progress_total);
+        hooks.report(done, self.progress_total);
+        if let Some(stats) = self.stats.as_mut() {
+            stats.record_report();
+        }
+    }
+
+    /// Whether the outer dirty loop should emit a time-based progress report.
+    #[allow(clippy::disallowed_methods)]
+    fn report_due(&self) -> bool {
+        let Some(hooks) = self.hooks.as_ref() else { return false };
+        if hooks.coop_eager.load(Ordering::Relaxed) {
+            return true;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let ms = hooks.coop_ms.load(Ordering::Relaxed).max(1);
+            self.last_coop.elapsed() >= Duration::from_millis(ms)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn mark_reported(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.last_coop = Instant::now();
+        }
+        if let Some(stats) = self.stats.as_mut() {
+            stats.record_report();
+        }
+    }
+
+    fn finish_stats(&mut self) {
+        if let Some(mut stats) = self.stats.take() {
+            stats.dump();
         }
     }
 }
@@ -665,24 +943,16 @@ fn spill_blocked(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool {
 }
 
 impl PassHost<'_> {
+    #[allow(clippy::disallowed_methods)] // optional Instant around compute when stats/slow are on
     fn compute(&mut self, k: Key) -> Value {
         if self.aborted {
             return Value::Empty;
         }
         // On-demand evaluation can recurse through a huge DAG before the top-level dirty loop
-        // checks cancel; sample here so Cancel stops a stuck "0 / N" pass.
-        self.compute_steps = self.compute_steps.wrapping_add(1);
-        if self.compute_steps.is_multiple_of(256)
-            && let Some(hooks) = self.hooks.as_ref()
-        {
-            if hooks.cancelled() {
-                self.aborted = true;
-                return Value::Empty;
-            }
-            let done = self.results.len().min(self.progress_total);
-            if done > 0 {
-                hooks.report(done, self.progress_total);
-            }
+        // checks cancel; time-based coop so Cancel / the bar stay alive inside one formula (Q1).
+        self.coop();
+        if self.aborted {
+            return Value::Empty;
         }
         if let Some(v) = self.results.get(&k) {
             let v = v.clone();
@@ -702,6 +972,13 @@ impl PassHost<'_> {
             self.cycles.push(k);
             return Value::Error(CellError::Circ);
         }
+        if let Some(hooks) = self.hooks.as_ref() {
+            let us = hooks.slow_compute_us.load(Ordering::Relaxed);
+            if us > 0 {
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::sleep(Duration::from_micros(us));
+            }
+        }
         self.in_progress.insert(k);
         self.depth += 1;
         let outer_taint = std::mem::replace(&mut self.taint, false);
@@ -709,10 +986,23 @@ impl PassHost<'_> {
             self.stack.push(k);
         }
         let expr = std::sync::Arc::clone(expr);
+        let timed = self.stats.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = timed.then(Instant::now);
+        #[cfg(target_arch = "wasm32")]
+        let t0: Option<()> = None;
+        let _ = timed;
         let v = {
             let mut ev = Evaluator::new(self, k.0, k.1);
             ev.value(&expr)
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(t0) = t0 {
+            let us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            if let Some(stats) = self.stats.as_mut() {
+                stats.record_compute(k, us);
+            }
+        }
         // A legacy array formula fills the range it was entered in.
         let legacy = self.wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.array);
         let v = match legacy {
@@ -902,7 +1192,13 @@ impl Host for PassHost<'_> {
             return None;
         }
         if let Some((_, _, v)) = self.ranges.iter().find(|(s, r, _)| *s == sheet && *r == range) {
+            if let Some(stats) = self.stats.as_mut() {
+                stats.range_hit += 1;
+            }
             return Some(v.clone());
+        }
+        if let Some(stats) = self.stats.as_mut() {
+            stats.range_miss += 1;
         }
         let data = self.range_values(sheet, range);
         let array = Array::new(range.height() as usize, range.width() as usize, data)?;
@@ -924,10 +1220,21 @@ impl Host for PassHost<'_> {
         }
         let key = (sheet, range);
         if !self.criteria.contains_key(&key) {
+            if let Some(stats) = self.stats.as_mut() {
+                stats.eq_build += 1;
+            }
             let (h, w) = (range.height(), range.width());
             let mut map: HashMap<LookupExactKey, Arc<Vec<u32>>> = HashMap::default();
+            let mut n = 0u32;
             for r in 0..h {
                 for c in 0..w {
+                    n = n.wrapping_add(1);
+                    if n.is_multiple_of(4096) {
+                        self.coop();
+                        if self.aborted {
+                            return None;
+                        }
+                    }
                     let v = self.cell_value(sheet, CellRef::new(range.start.row + r, range.start.col + c));
                     let Some(k) = to_lookup_exact_key(&v) else { continue };
                     let pos = r * w + c;
@@ -940,6 +1247,8 @@ impl Host for PassHost<'_> {
                 }
             }
             self.criteria.insert(key, Arc::new(map));
+        } else if let Some(stats) = self.stats.as_mut() {
+            stats.eq_hit += 1;
         }
         let needle_key = to_lookup_exact_key(needle)?;
         Some(self.criteria.get(&key)?.get(&needle_key).cloned().unwrap_or_else(|| Arc::new(Vec::new())))
@@ -1075,7 +1384,13 @@ impl Host for PassHost<'_> {
         let key = (sheet, search_col, r0, r1);
         if !self.lookup_col_cache.contains_key(&key) {
             let mut map = HashMap::default();
-            for r in r0..=r1 {
+            for (i, r) in (r0..=r1).enumerate() {
+                if i.is_multiple_of(4096) {
+                    self.coop();
+                    if self.aborted {
+                        return None;
+                    }
+                }
                 let val = self.cell_value(sheet, CellRef::new(r, search_col));
                 if let Some(k) = to_lookup_exact_key(&val) {
                     map.entry(k).or_insert(r);
@@ -1104,7 +1419,13 @@ impl Host for PassHost<'_> {
         let key = (sheet, search_row, c0, c1);
         if !self.lookup_row_cache.contains_key(&key) {
             let mut map = HashMap::default();
-            for c in c0..=c1 {
+            for (i, c) in (c0..=c1).enumerate() {
+                if i.is_multiple_of(4096) {
+                    self.coop();
+                    if self.aborted {
+                        return None;
+                    }
+                }
                 let val = self.cell_value(sheet, CellRef::new(search_row, c));
                 if let Some(k) = to_lookup_exact_key(&val) {
                     map.entry(k).or_insert(c);
@@ -1116,6 +1437,14 @@ impl Host for PassHost<'_> {
     }
     fn get_cached_val(&mut self, key: u64) -> Option<Value> {
         self.val_cache.get(&key).cloned()
+    }
+    fn fn_timing_active(&self) -> bool {
+        self.stats.is_some()
+    }
+    fn note_fn_timing(&mut self, name: &str, us: u64) {
+        if let Some(stats) = self.stats.as_mut() {
+            stats.record_fn(name, us);
+        }
     }
     fn set_cached_val(&mut self, key: u64, val: Value) {
         self.val_cache.insert(key, val);
@@ -1178,15 +1507,15 @@ impl Calc {
                     let (areas, dynamic) = precedents(wb, si, &e);
                     self.graph.insert((si, c), Node { areas, dynamic });
                     built += 1;
-                    if built == 1 || built.is_multiple_of(2048) {
-                        if let Some(hooks) = self.hooks.as_ref() {
-                            if hooks.cancelled() {
-                                self.graph = Graph::default();
-                                self.graph_valid = false;
-                                return false;
-                            }
-                            hooks.report(built.min(total), total);
+                    if (built == 1 || built.is_multiple_of(2048))
+                        && let Some(hooks) = self.hooks.as_ref()
+                    {
+                        if hooks.cancelled() {
+                            self.graph = Graph::default();
+                            self.graph_valid = false;
+                            return false;
                         }
+                        hooks.report(built.min(total), total);
                     }
                 }
             }
@@ -1555,22 +1884,25 @@ impl Calc {
                 for (i, k) in dirty.iter().enumerate() {
                     host.compute(*k);
                     if host.aborted {
+                        host.finish_stats();
                         return false;
                     }
                     let Some(hooks) = self.hooks.as_ref() else { continue };
                     if hooks.cancelled() {
+                        host.finish_stats();
                         return false;
                     }
-                    // Fine-grained progress between rounds, so a long pass reports steadily.
-                    // First formula + every 4096 thereafter (was only 4096 — huge workbooks
-                    // looked stuck at 0 % through the opening batch).
-                    if i == 0 || (i + 1).is_multiple_of(4096) {
+                    // Count milestones (first + every 4096) and time-based yield (~75 ms) so the
+                    // bar stays alive while a single expensive formula runs (Q1).
+                    if i == 0 || (i + 1).is_multiple_of(4096) || host.report_due() {
                         hooks.report((done + i + 1).min(total), total);
+                        host.mark_reported();
                     }
                 }
                 done += dirty.len();
                 if let Some(hooks) = self.hooks.as_ref() {
                     hooks.report(done.min(total), total);
+                    host.mark_reported();
                 }
                 if host.iterate && !host.members.is_empty() {
                     let passes = host.iterate_loops(&dirty, wb.calc.max_iterations, wb.calc.max_change);
@@ -1578,6 +1910,7 @@ impl Calc {
                         eprintln!("  iterative calculation: {} passes over {} formulas", passes, host.tainted.len());
                     }
                 }
+                host.finish_stats();
                 (host.results, host.spills, host.cycles)
             };
             self.rng = rng;

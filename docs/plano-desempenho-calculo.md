@@ -68,7 +68,7 @@ Antes de otimizar, separar **três falhas** com o mesmo relato verbal (“travou
 
 1. **Durante o platô em ~42%:** clicar Cancel. Se a barra some em **< 1 s**, o caminho cooperativo está vivo (tipo B/C). Se nada muda, investigar deadlock / UI (tipo A).
 2. **Gerenciador de tarefas:** 1 núcleo saturado + RAM estável → eval single-thread saudável mas lento. RAM subindo sem teto → materialização de arrays / cache de intervalos.
-3. **CLI / release:** mesmo arquivo com `GRIDCRAFT_PROFILE=1` (ou equivalente documentado no motor) e cronometrar `eval N formulas` por rodada de `run_scoped`.
+3. **CLI / release:** `GRIDCRAFT_CALC_STATS=1` (histograma por fórmula + caches) e/ou `GRIDCRAFT_PROFILE=1` (tempos de passada) no motor; cronometrar F9 no corpus denso.
 4. **Painel** Ctrl+Alt+Shift+P: confirmar que frames da UI ficam baixos enquanto o job roda.
 
 ### 2.2 Instrumentação desejada (1ª sprint — ver §7)
@@ -134,8 +134,8 @@ paralelismo topológico, cache `LET` correto (**já feito**), dirty subset — t
 
 | ID | Ação | Efeito esperado | Risco |
 |---|---|---|---|
-| Q1 | **Yield/progresso por tempo**, não só por N: reportar a cada ~50–100 ms mesmo com `done` estável (“ainda em fórmula k”) | Barra deixa de parecer morta; Cancel mais previsível | Baixo |
-| Q2 | **Histograma + top-K fórmulas lentas** sob flag (`GRIDCRAFT_CALC_STATS`) | Transforma H1–H4 em dados | Baixo |
+| Q1 | ✅ **Yield/progresso por tempo** (~75 ms nativo; `PassHost::coop` + `run_scoped`) | Barra deixa de parecer morta; Cancel mais previsível | Baixo |
+| Q2 | ✅ **Histograma + top-K** sob `GRIDCRAFT_CALC_STATS` (stderr ao fim do pass) | Transforma H1–H4 em dados | Baixo |
 | Q3 | **Índice `COUNTIF`/`SUMIF`/`AVERAGEIFS`/`MAXIFS`/`MINIFS`** (extensão do *IFS) | Throughput em **qualquer** livro que use essas formas | Médio (paridade) |
 | Q4 | **Reusar índice de lookup para `MATCH(TRUE, array_bool, 0)` / first-true** quando o array veio de `col = escalares` | Acelera o padrão universal `achou`+`MATCH` (tabelas + igualdade) | Médio |
 | Q5 | **Não invalidar job por scroll/paint**; garantir CF lazy só no viewport (auditar hot path) | Tipo A/H6 | Baixo |
@@ -159,7 +159,8 @@ paralelismo topológico, cache `LET` correto (**já feito**), dirty subset — t
 | E3 | **Compilação / specialize** de fórmulas de coluna idênticas (uma AST, muitos contextos ThisRow) | Grande ganho em tabelas **qualquer** workbook |
 | E4 | **Wasm:** fatias cooperativas por frame (já previsto no plano de responsividade) | Sem threads reais |
 
-Ordem sugerida: **Q1 → Q2 → (Q4 ou Q3 conforme perfil) → M2 → E1**.
+Ordem sugerida: ~~Q1 → Q2~~ → **(Q4 ou Q3 conforme perfil)** → M2 → E1.
+(Q1+Q2 fechados na 1ª sprint — ver §7.)
 
 ---
 
@@ -184,25 +185,37 @@ Não é aceite: “parece mais rápido” sem número; “UI ok” com job que n
 
 ---
 
-## 7. Próximo experimento concreto (1ª sprint)
+## 7. 1ª sprint — instrumentação + yield ✅ (2026-10-23)
 
 **Objetivo:** provar se o platô em ~42% é **cauda de fórmulas** (H1/H2) ou **throughput uniforme** (só falta paralelismo/índice).
 
-### Passos
+### Entregue no código
 
-1. **Instrumentar** (flag off por padrão):
-   - tempo por `compute(k)` → histogram + top 20 chaves;
-   - timestamp do último `hooks.report`;
-   - contadores hit/miss de `range_array` / equality index.
-2. **Rodar** um corpus denso (arquivo do usuário **ou** fixture sintética com o mesmo padrão `LET`/`MATCH`) em **release**, F9, sem outras apps pesadas.
-3. **No platô ~40%:** anotar se `done` congela > 5 s e qual chave está em `in_progress` / top tempo.
-4. **Decisão em dados:**
-   - Se poucas fórmulas dominam → implementar **Q1 + Q4** (first-true / lookup genérico do padrão `achou`).
-   - Se custo uniforme e cache miss alto → **M3 + Q3**.
-   - Se uniforme, cache quente, 1 core → desenhar **E1** (spike de paralelismo em subgrafo independente).
-5. Atualizar este arquivo com números medidos e marcar Q/M feitos.
+| Item | Onde / como |
+|---|---|
+| **Q1** Yield/report por tempo ~75 ms | `PassHost::coop` + `run_scoped` (nativo); wasm permanece por passos (256). API de teste: `CalcHooks::set_coop_interval_ms` / `set_coop_eager` / `set_slow_compute_us`. |
+| **Q2** Stats off por padrão | `GRIDCRAFT_CALC_STATS=1` → stderr: p50/p95/p99/max, top-20 chaves, hit/miss `range_array` + equality, gap máx. entre reports, amostra de funções de topo. |
+| Testes | `hooks_eager_coop_*`, `hooks_progress_reports_under_slow_compute`, `hooks_cancel_during_slow_compute` (`calc/src/tests.rs`). |
 
-### Fora de escopo desta sprint
+### Como ligar (manual / release)
+
+```text
+GRIDCRAFT_CALC_STATS=1  gridcraft.exe   # ou o binário release; F9 no corpus denso
+# opcional (só debug/teste): GRIDCRAFT_CALC_SLOW_US=50000
+```
+
+Procurar linhas `[GRIDCRAFT_CALC_STATS]` no stderr ao fim de cada passada.
+
+### Ainda pendente (decisão em dados — próxima sprint)
+
+1. **Rodar** corpus denso em **release** com `GRIDCRAFT_CALC_STATS=1`, F9.
+2. **No platô ~40%:** anotar se `done` congela > 5 s e o que o top-K / p99 mostram.
+3. **Decisão:**
+   - Poucas fórmulas dominam → **Q4** (first-true / lookup do padrão `achou`); Q1 já feito.
+   - Custo uniforme + cache miss alto → **M3 + Q3**.
+   - Uniforme, cache quente, 1 core → spike **E1**.
+
+### Fora de escopo (mantido)
 
 - Paralelismo completo de produção (E1 full).
 - Reabrir truncate Automatic.
