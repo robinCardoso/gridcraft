@@ -410,6 +410,9 @@ const JAPANESE: &[(&str, &str)] = &[
     ("Interface language", "表示言語"),
     ("Interface size", "表示サイズ"),
     ("Auto", "自動"),
+    // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+    ("Saving…", "保存中…"),
+    ("Calculating…", "計算中…"),
     ("Drag to freeze columns", "ドラッグして列を固定"),
     ("Drag to freeze rows", "ドラッグして行を固定"),
     ("Command\nPalette", "コマンド パレット"),

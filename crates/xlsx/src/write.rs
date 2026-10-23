@@ -186,6 +186,12 @@ fn check_sheet_names(wb: &Workbook) -> Result<(), IoError> {
 }
 
 pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
+    write_xlsx_with(wb, kind, 6)
+}
+
+/// Writes the package with an explicit deflate level: 6 for a manual save, 1 for the fast
+/// AutoSave (docs/plano-responsividade.md, Fase 2 — a background save trades file size for time).
+pub fn write_xlsx_with(wb: &Workbook, kind: XlsxKind, level: i64) -> Result<Vec<u8>, IoError> {
     if wb.sheets.is_empty() {
         return Err(IoError::Format("a workbook needs at least one sheet".into()));
     }
@@ -450,7 +456,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         let _ = write!(ct, "<Override PartName=\"{}\" ContentType=\"{}\"/>", esc_attr(part), esc_attr(t));
     }
     ct.push_str("</Types>");
-    let mut zip = ZipOut::new();
+    let mut zip = ZipOut::with_level(level);
     zip.add("[Content_Types].xml", ct.as_bytes())?;
     // Conventional order: rels, docProps, workbook, the rest.
     let rank = |n: &str| match n {
@@ -462,9 +468,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
     };
     let mut parts = std::mem::take(&mut out.parts);
     parts.sort_by_key(|(n, _)| rank(n));
-    for (name, data) in &parts {
-        zip.add(name, data)?;
-    }
+    zip.add_parts(&parts)?;
     zip.finish()
 }
 

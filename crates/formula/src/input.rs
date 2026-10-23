@@ -77,15 +77,17 @@ const PORTUGUESE: &[(&str, &str)] = &[
 ];
 
 fn unaccent(s: &str) -> String {
-    s.chars().map(|c| match c {
-        'Á' | 'À' | 'Ã' | 'Â' | 'á' | 'à' | 'ã' | 'â' => 'a',
-        'É' | 'È' | 'Ê' | 'é' | 'è' | 'ê' => 'e',
-        'Í' | 'Ì' | 'Î' | 'í' | 'ì' | 'î' => 'i',
-        'Ó' | 'Ò' | 'Õ' | 'Ô' | 'ó' | 'ò' | 'õ' | 'ô' => 'o',
-        'Ú' | 'Ù' | 'Û' | 'ú' | 'ù' | 'û' => 'u',
-        'Ç' | 'ç' => 'c',
-        other => other,
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            'Á' | 'À' | 'Ã' | 'Â' | 'á' | 'à' | 'ã' | 'â' => 'a',
+            'É' | 'È' | 'Ê' | 'é' | 'è' | 'ê' => 'e',
+            'Í' | 'Ì' | 'Î' | 'í' | 'ì' | 'î' => 'i',
+            'Ó' | 'Ò' | 'Õ' | 'Ô' | 'ó' | 'ò' | 'õ' | 'ô' => 'o',
+            'Ú' | 'Ù' | 'Û' | 'ú' | 'ù' | 'û' => 'u',
+            'Ç' | 'ç' => 'c',
+            other => other,
+        })
+        .collect()
 }
 
 impl FormulaLocale {
@@ -197,7 +199,14 @@ pub(crate) fn boolean_alias(name: &str) -> Option<bool> {
     }
 }
 
-fn normalize(expr: &mut Expr, locale: FormulaLocale, known_name: &impl Fn(&str) -> bool, bindings: &mut Vec<String>, depth: usize, display: bool) -> Result<(), ParseError> {
+fn normalize(
+    expr: &mut Expr,
+    locale: FormulaLocale,
+    known_name: &impl Fn(&str) -> bool,
+    bindings: &mut Vec<String>,
+    depth: usize,
+    display: bool,
+) -> Result<(), ParseError> {
     if depth > parser::MAX_DEPTH {
         return Err(ParseError { msg: "formula is nested too deeply".into(), pos: 0 });
     }
@@ -205,9 +214,27 @@ fn normalize(expr: &mut Expr, locale: FormulaLocale, known_name: &impl Fn(&str) 
     match expr {
         Expr::Bool(value) if display => {
             let alias = match locale {
-                FormulaLocale::Es => if *value { "VERDADERO" } else { "FALSO" },
-                FormulaLocale::Pt => if *value { "VERDADEIRO" } else { "FALSO" },
-                FormulaLocale::En => if *value { "TRUE" } else { "FALSE" },
+                FormulaLocale::Es => {
+                    if *value {
+                        "VERDADERO"
+                    } else {
+                        "FALSO"
+                    }
+                }
+                FormulaLocale::Pt => {
+                    if *value {
+                        "VERDADEIRO"
+                    } else {
+                        "FALSO"
+                    }
+                }
+                FormulaLocale::En => {
+                    if *value {
+                        "TRUE"
+                    } else {
+                        "FALSE"
+                    }
+                }
             };
             if !bound(alias, bindings) {
                 *expr = Expr::Name(alias.into());

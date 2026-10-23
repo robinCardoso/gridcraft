@@ -233,7 +233,7 @@ pub fn call(spec: &FnSpec, args: &[Arg], ctx: &mut dyn Ctx) -> Value {
     lift::call_lifted(spec, args, ctx)
 }
 
-pub use criteria::{has_wildcards, lookup_equal};
+pub use criteria::{equality_operand, has_wildcards, lookup_equal};
 pub use lookup::bsearch_last;
 
 #[cfg(test)]

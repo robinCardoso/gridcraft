@@ -157,20 +157,70 @@ pub fn resolve(dir: &str, target: &str) -> String {
 
 pub struct ZipOut {
     zip: zip::ZipWriter<Cursor<Vec<u8>>>,
+    /// Deflate level for every part: 6 (the default) for a manual save, 1 for the fast AutoSave
+    /// (docs/plano-responsividade.md, Fase 2).
+    level: i64,
 }
 
 impl ZipOut {
-    pub fn new() -> ZipOut {
-        ZipOut { zip: zip::ZipWriter::new(Cursor::new(Vec::new())) }
+    /// The manual save's level (6); the AutoSave passes 1 (docs/plano-responsividade.md, Fase 2).
+    pub fn with_level(level: i64) -> ZipOut {
+        ZipOut { zip: zip::ZipWriter::new(Cursor::new(Vec::new())), level }
     }
     pub fn add(&mut self, name: &str, data: &[u8]) -> Result<(), IoError> {
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6))
+            .compression_level(Some(self.level))
             .last_modified_time(zip::DateTime::default())
             .large_file(data.len() as u64 >= u32::MAX as u64);
         self.zip.start_file(name, opts).map_err(|e| IoError::Zip(e.to_string()))?;
         self.zip.write_all(data).map_err(|e| IoError::Zip(e.to_string()))?;
+        Ok(())
+    }
+    /// Adds the parts in order. Natively, parts of 1 MiB or more (big worksheets) are deflated in
+    /// parallel — each into its own one-entry archive — and merged back in the original order, so
+    /// the package is the same as the sequential one (docs/plano-responsividade.md, Fase 2). Wasm
+    /// has no threads and always takes the sequential path.
+    pub fn add_parts(&mut self, parts: &[(String, Vec<u8>)]) -> Result<(), IoError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            const BIG: usize = 1 << 20;
+            let is_big = |d: &[u8]| d.len() >= BIG;
+            if parts.iter().filter(|(_, d)| is_big(d)).count() >= 2 {
+                let level = self.level;
+                let packed: Vec<Option<Result<Vec<u8>, IoError>>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = parts
+                        .iter()
+                        .map(|(n, d)| {
+                            is_big(d).then(|| {
+                                s.spawn(move || {
+                                    let mut z = ZipOut::with_level(level);
+                                    z.add(n, d)?;
+                                    z.finish()
+                                })
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.map(|h| h.join().unwrap_or_else(|_| Err(IoError::Zip("compression thread panicked".into())))))
+                        .collect()
+                });
+                for ((n, d), p) in parts.iter().zip(packed) {
+                    match p {
+                        Some(bytes) => {
+                            let archive = zip::ZipArchive::new(Cursor::new(bytes?)).map_err(|e| IoError::Zip(e.to_string()))?;
+                            self.zip.merge_archive(archive).map_err(|e| IoError::Zip(e.to_string()))?;
+                        }
+                        None => self.add(n, d)?,
+                    }
+                }
+                return Ok(());
+            }
+        }
+        for (n, d) in parts {
+            self.add(n, d)?;
+        }
         Ok(())
     }
     pub fn finish(self) -> Result<Vec<u8>, IoError> {
@@ -191,5 +241,25 @@ mod tests {
         assert_eq!(resolve("a", "../../../x"), "x");
         assert_eq!(split_dir("xl/workbook.xml"), ("xl", "workbook.xml"));
         assert_eq!(split_dir("x.xml"), ("", "x.xml"));
+    }
+
+    #[test]
+    fn parallel_parts_keep_order_and_content() {
+        use std::io::Read;
+        let big = |seed: u8| -> Vec<u8> { (0..(1usize << 20) + 17).map(|i| (i as u8).wrapping_mul(seed).wrapping_add((i >> 9) as u8)).collect() };
+        let parts: Vec<(String, Vec<u8>)> =
+            vec![("a.xml".into(), b"small".to_vec()), ("b.xml".into(), big(3)), ("c.xml".into(), b"also small".to_vec()), ("d.xml".into(), big(7))];
+        let mut z = ZipOut::with_level(1);
+        z.add_parts(&parts).unwrap();
+        let bytes = z.finish().unwrap();
+        let mut ar = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(ar.len(), parts.len());
+        for (i, (name, data)) in parts.iter().enumerate() {
+            let mut f = ar.by_index(i).unwrap();
+            assert_eq!(f.name(), name);
+            let mut got = Vec::new();
+            f.read_to_end(&mut got).unwrap();
+            assert!(&got == data, "{name} differs");
+        }
     }
 }

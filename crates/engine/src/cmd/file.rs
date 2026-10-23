@@ -114,6 +114,63 @@ pub fn load_document(p: &Json, mut progress: Option<Box<dyn FnMut(&str) + Send>>
     Ok((doc, warnings))
 }
 
+/// A save collected on the interface thread — [`SavePlan::prepare`] is an `Arc` clone and two
+/// string checks — and executed as a pure function ([`SavePlan::execute`]: serialization plus the
+/// atomic file write, no `Session`, no UI). The engine command `file.save` runs the same two steps
+/// inline; the interface's JobManager runs `execute` on a background thread
+/// (docs/plano-responsividade.md, Fase 2), so a big workbook saves without freezing the window.
+pub struct SavePlan {
+    /// The snapshot written: the document's workbook at preparation time. Edits meanwhile leave
+    /// the document dirty against exactly this snapshot.
+    pub wb: std::sync::Arc<Workbook>,
+    pub path: String,
+    /// The format to save in: the document's own file keeps the format its content had when
+    /// opened; any other path goes by its extension. `None` fails in `execute` when the
+    /// extension names no format.
+    pub kind: Option<crate::io::FileKind>,
+    /// Deflate level for the package formats: 6 (manual save) or 1 (fast AutoSave,
+    /// docs/plano-responsividade.md, Fase 2 — a background save trades file size for time).
+    pub compression: i64,
+}
+
+/// What a save wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveOutcome {
+    pub path: String,
+    pub bytes: usize,
+}
+
+impl SavePlan {
+    /// Collects the plan for a save to `path` (cheap: no I/O, no serialization).
+    pub fn prepare(d: &DocState, path: String) -> SavePlan {
+        let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
+        SavePlan { wb: d.wb.clone(), path, kind, compression: 6 }
+    }
+
+    /// The long part of a save. Relative paths to linked workbooks are rewritten for the target
+    /// file's folder, the bytes are serialized and written atomically (`write_file`): a process
+    /// that dies halfway never corrupts the workbook. `progress` reports fractions 0..1.
+    pub fn execute(&self, progress: Option<&mut dyn FnMut(f64)>) -> Result<SaveOutcome> {
+        let mut progress = progress;
+        let mut report = |f: f64| {
+            if let Some(cb) = progress.as_mut() {
+                (cb)(f);
+            }
+        };
+        let rebased = crate::io::source_dir(&self.path).and_then(|f| gridcraft_xlsx::rebase_links(&self.wb, &f));
+        let wb = rebased.as_ref().unwrap_or(&self.wb);
+        report(0.05);
+        let bytes = match self.kind {
+            Some(kind) => crate::io::save_bytes_as_level(wb, &self.path, kind, self.compression)?,
+            None => crate::io::save_bytes(wb, &self.path)?,
+        };
+        report(0.9);
+        crate::io::write_file(&self.path, &bytes)?;
+        report(1.0);
+        Ok(SaveOutcome { path: self.path.clone(), bytes: bytes.len() })
+    }
+}
+
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let path = match str_param(p, "path").map(str::to_string).or_else(|| s.active().and_then(|d| d.path.clone())) {
         Some(p) => p,
@@ -138,22 +195,15 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         }
         return Ok(json!({"path": path, "database": true}));
     }
-    // The document's own file keeps the format its content had when opened; any other path
-    // goes by its extension. Relative paths to linked workbooks are rewritten for the new folder.
-    let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
-    let rebased = crate::io::source_dir(&path).and_then(|f| gridcraft_xlsx::rebase_links(&d.wb, &f));
-    let wb = rebased.as_ref().unwrap_or(&d.wb);
-    let bytes = match kind {
-        Some(kind) => crate::io::save_bytes_as(wb, &path, kind)?,
-        None => crate::io::save_bytes(wb, &path)?,
-    };
-    crate::io::write_file(&path, &bytes)?;
+    let plan = SavePlan::prepare(d, path.clone());
+    let outcome = plan.execute(None)?;
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
-    if matches!(kind, Some(crate::io::FileKind::Xlsx | crate::io::FileKind::Json)) {
-        d.saved = d.wb.clone();
-        d.path = Some(path.clone());
+    if matches!(plan.kind, Some(crate::io::FileKind::Xlsx | crate::io::FileKind::Json)) {
+        let d = s.doc_mut()?;
+        d.saved = plan.wb;
+        d.path = Some(outcome.path.clone());
     }
-    Ok(json!({"path": path, "bytes": bytes.len()}))
+    Ok(json!({"path": outcome.path, "bytes": outcome.bytes}))
 }
 
 fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
@@ -187,12 +237,20 @@ fn close(s: &mut Session, p: &Json) -> Result<Json> {
 fn export(s: &mut Session, p: &Json, ext: &str) -> Result<Json> {
     let path = str_param(p, "path").ok_or_else(|| bad("file.export", "missing `path`"))?.to_string();
     let d = s.doc()?;
-    let mut wb = (*d.wb).clone();
-    if p.get("sheet").is_some() {
-        wb.active_sheet = target_sheet(s, p)?;
-    }
+    // Only exporting another sheet touches the workbook (its active sheet); the common case
+    // serializes the snapshot directly (an export is a copy: the document keeps its file).
+    let own;
+    let wb: &Workbook = match p.get("sheet") {
+        Some(_) => {
+            let mut wb = (*d.wb).clone();
+            wb.active_sheet = target_sheet(s, p)?;
+            own = std::sync::Arc::new(wb);
+            &own
+        }
+        None => &d.wb,
+    };
     let target = if path.ends_with(&format!(".{ext}")) { path.clone() } else { format!("{path}.{ext}") };
-    let bytes = crate::io::save_bytes(&wb, &target)?;
+    let bytes = crate::io::save_bytes(wb, &target)?;
     crate::io::write_file(&target, &bytes)?;
     Ok(json!({"path": target, "bytes": bytes.len()}))
 }

@@ -341,22 +341,49 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if !structural {
         check_arrays(&d.wb, &wb)?;
     }
-    if changed.len() <= 200_000 {
+    const MAX_FIT_ROWS: usize = 1_000;
+    if changed.len() <= MAX_FIT_ROWS {
         fit_rows.extend(changed.iter().map(|(s, c)| (*s, c.row)));
     }
     if let Some(t0) = t0 {
         eprintln!("commit: edit {:?}, {} changed", t0.elapsed(), changed.len());
     }
-    if structural {
+    if structural && d.defer_structural {
+        // Fase 3 (docs/plano-responsividade.md): the interface asked for structural commands on
+        // big workbooks to skip the synchronous full recalculation — a background job rebuilds
+        // the graph, recalculates and applies the result. Row/col/sheet shape changes make the
+        // existing nodes unusable; mark them dirty so F9's ensure_graph does a full rebuild.
+        d.recalc_pending = true;
+        d.calc.invalidate_graph();
+    } else if structural {
+        // A full inline recalculation pays the whole debt.
+        d.recalc_pending = false;
         d.calc.recalc_all(&mut wb);
     } else if !changed.is_empty() {
-        d.calc.cells_changed(&mut wb, &changed);
+        if d.recalc_pending {
+            // A full recalculation is already owed; keep nodes in sync when the graph is still
+            // current (cascade deferral) so the job can skip the O(formulas) rebuild. After a
+            // structural invalidate, only the full rebuild is safe.
+            d.calc.update_nodes(&mut wb, &changed);
+        } else if d.defer_structural && (changed.len() > crate::CASCADE_JOB_CELLS || d.calc.cascade_exceeds(&changed, crate::CASCADE_JOB_CELLS)) {
+            // A huge cascade (an input cell feeding a big dependency graph) or a huge edit itself
+            // (a wide paste: brand-new formulas aren't in the graph yet, so their count is the
+            // signal) goes to the background job — same flow as the structural deferral above.
+            // Update nodes now (no evaluate) so F9 reuses the graph.
+            d.recalc_pending = true;
+            d.calc.update_nodes(&mut wb, &changed);
+        } else {
+            d.calc.cells_changed(&mut wb, &changed);
+        }
     }
     if let Some(t0) = t0 {
         eprintln!("commit: + recalc {:?}", t0.elapsed());
     }
     fit_rows.sort_unstable();
     fit_rows.dedup();
+    if fit_rows.len() > MAX_FIT_ROWS {
+        fit_rows.truncate(MAX_FIT_ROWS);
+    }
     for (si, row) in fit_rows {
         auto_row_height(&mut wb, si, row);
     }

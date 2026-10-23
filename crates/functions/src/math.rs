@@ -992,13 +992,7 @@ fn criteria_matches(a: &[Arg], first_pair: usize, rows: usize, cols: usize) -> R
         }
         let scalar = crit.value.scalar();
         let c = Criterion::parse_arg_truncated(&scalar);
-        matches.retain(|&idx| {
-            if let Some(v) = r.data.get(idx) {
-                c.matches(v)
-            } else {
-                false
-            }
-        });
+        matches.retain(|&idx| if let Some(v) = r.data.get(idx) { c.matches(v) } else { false });
     }
     Ok(matches)
 }

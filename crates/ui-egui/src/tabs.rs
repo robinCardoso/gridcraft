@@ -332,6 +332,38 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                             ui.add_space(10.0);
                         }
                     }
+                    // Background jobs (docs/plano-responsividade.md, Fase 1): saving or
+                    // calculating with live progress and a cancel — the window keeps answering
+                    // while a big workbook works on its own thread.
+                    let mut cancel_job = None;
+                    if let Some(d) = app.session.active()
+                        && let Some(job) = app.jobs.status_for(d.uid)
+                    {
+                        ui.ctx().request_repaint();
+                        ui.add_space(8.0);
+                        let pct = (job.progress * 100.0).round() as u32;
+                        let label = match job.kind {
+                            crate::jobs::JobKind::Save { .. } => app.ui.language.tr("Saving…"),
+                            crate::jobs::JobKind::Calc { .. } => app.ui.language.tr("Calculating…"),
+                            crate::jobs::JobKind::Analysis { .. } => app.ui.language.tr("Solving…"),
+                        };
+                        let status = if job.status.is_empty() { String::new() } else { format!(" — {}", job.status) };
+                        let msg = format!("{label} {pct}%{status}");
+                        let title = job.title.clone();
+                        let (bar_rect, resp) = ui.allocate_exact_size(vec2(80.0, 10.0), Sense::hover());
+                        ui.painter().rect_filled(bar_rect, 2.0, t.separator);
+                        let fill_w = (bar_rect.width() * (job.progress as f32).clamp(0.01, 1.0)).max(2.0);
+                        ui.painter().rect_filled(Rect::from_min_size(bar_rect.min, vec2(fill_w, bar_rect.height())), 2.0, t.accent);
+                        ui.add_space(4.0);
+                        resp.on_hover_text(title);
+                        ui.label(egui::RichText::new(msg).font(theme::ui_font(12.0)).color(t.text_dim));
+                        if crate::widgets::icon_button(ui, Icon::Close, t.text_dim, "Cancel", vec2(18.0, 18.0)).clicked() {
+                            cancel_job = Some(job.id);
+                        }
+                    }
+                    if let Some(id) = cancel_job {
+                        app.jobs.cancel(id);
+                    }
                     // Calculation indicator and progress bar (Excel style)
                     if let Some((progress, count, at)) = app.calc_status {
                         let age = if at > 0.0 { crate::now_ms() - at } else { 0.0 };
@@ -346,10 +378,10 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
 
                             ui.add_space(6.0);
                             let pct = (progress * 100.0).round() as u32;
-                            let msg = format!("Calculando: (4 threads): {pct}%");
-                            let tip = format!("{count} fórmulas calculadas");
-                            resp.on_hover_text(&tip);
-                            ui.label(egui::RichText::new(msg).font(theme::ui_font(12.0)).color(t.text_dim)).on_hover_text(tip);
+                            let msg = format!("{} {pct}%", app.ui.language.tr("Calculating…"));
+                            let tip = format!("{count} formulas calculated");
+                            resp.on_hover_text(app.ui.language.tr(&tip));
+                            ui.label(egui::RichText::new(msg).font(theme::ui_font(12.0)).color(t.text_dim)).on_hover_text(app.ui.language.tr(&tip));
                             ui.add_space(8.0);
                         } else {
                             app.calc_status = None;

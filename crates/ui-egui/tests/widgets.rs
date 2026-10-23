@@ -69,9 +69,10 @@ fn big_button_enabled_false_renders_disabled_colors() {
     fonts.families.insert(FontFamily::Name(theme::UI.into()), proportional);
     ctx.set_fonts(fonts);
     let t = theme::Tokens::get(&ctx);
-    let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0))), ..Default::default() }, |ui| {
-        widgets::big_button_enabled(ui, Icon::Paste, "Paste", "Paste", true, false);
-    });
+    let mut output =
+        ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0))), ..Default::default() }, |ui| {
+            widgets::big_button_enabled(ui, Icon::Paste, "Paste", "Paste", true, false);
+        });
     output.textures_delta.clear();
     let shapes: Vec<_> = output.shapes.into_iter().map(|shape| shape.shape).collect();
     let text = shapes.iter().find_map(|s| if let Shape::Text(t) = s { Some(t) } else { None }).expect("text galley found");

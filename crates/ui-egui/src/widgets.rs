@@ -82,6 +82,48 @@ pub fn big_button_enabled(ui: &mut Ui, icon: Icon, label: &str, tip: &str, dropd
     resp.on_hover_text(tr(ui, tip))
 }
 
+/// Large split ribbon button (e.g. Paste): the icon and label run the main action; a separate
+/// arrow centred *below* the label opens the menu. Returns `(main, arrow)` responses.
+pub fn split_big_button(ui: &mut Ui, icon: Icon, label: &str, tip: &str, arrow_tip: &str, enabled: bool) -> (Response, Response) {
+    let t = Tokens::get(ui.ctx());
+    let font = theme::ui_font(11.5);
+    let label = tr(ui, label);
+    let arrow_label = tr(ui, arrow_tip);
+    let text_color = if enabled { t.text } else { t.text_disabled };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text_color);
+    let w = (galley.size().x + 12.0).max(44.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 72.0), Sense::hover());
+    let arrow_h = 14.0;
+    let main_rect = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - arrow_h));
+    let arrow_rect = Rect::from_min_max(pos2(rect.left(), rect.bottom() - arrow_h), rect.max);
+    // Both halves stay clickable even when `enabled` is false: as in `big_button_enabled`, the
+    // flag dims the button and reports it disabled, but a click still reaches the command, which
+    // reports "There is nothing to paste" — the tests pin that behavior.
+    let sense = Sense::click();
+    let main = ui.interact(main_rect, ui.id().with((tip, "split_main")), sense);
+    let arrow = ui.interact(arrow_rect, ui.id().with((tip, "split_arrow")), sense);
+    // The arrow is its own control: it announces a label (accessibility and tests reach it by
+    // name, as the main part does).
+    arrow.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, arrow_label));
+    for (r, resp) in [(main_rect, &main), (arrow_rect, &arrow)] {
+        if enabled && resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(r, 5.0, t.pressed);
+        } else if enabled && resp.hovered() {
+            ui.painter().rect_filled(r, 5.0, t.hover);
+        }
+    }
+    icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.center().x, rect.top() + 21.0), vec2(30.0, 30.0)), icon, text_color);
+    let y = rect.top() + 46.0;
+    ui.painter().galley(pos2(rect.center().x - galley.size().x / 2.0, y - galley.size().y / 2.0), galley, text_color);
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(arrow_rect.center(), vec2(10.0, 10.0)),
+        Icon::Chevron,
+        if enabled { t.text_dim } else { t.text_disabled },
+    );
+    (main.on_hover_text(tr(ui, tip)), arrow.on_hover_text(arrow_label))
+}
+
 /// Small ribbon button: 16px icon with optional label to the right.
 pub fn small_button(ui: &mut Ui, icon: Icon, label: &str, tip: &str, dropdown: bool) -> Response {
     let t = Tokens::get(ui.ctx());
@@ -280,6 +322,9 @@ pub fn color_palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str) ->
 
 pub fn message_box(app: &mut SheetApp, ctx: &egui::Context) {
     let Some((title, msg)) = app.message.clone() else { return };
+    let lang = crate::i18n::current(ctx);
+    let title = lang.tr(&title).to_owned();
+    let msg = lang.tr(&msg).to_owned();
     let mut close = false;
     egui::Modal::new(egui::Id::new("message_box")).show(ctx, |ui| {
         ui.set_width(380.0);
@@ -294,7 +339,7 @@ pub fn message_box(app: &mut SheetApp, ctx: &egui::Context) {
         });
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("  OK  ").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)) {
+            if ui.button(format!("  {}  ", lang.tr("OK"))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)) {
                 close = true;
             }
         });
@@ -391,4 +436,47 @@ pub fn notice_bar(app: &mut SheetApp, ui: &mut Ui) {
     if dismiss {
         app.notice = None;
     }
+}
+
+/// The Fase 0 debug panel (Ctrl+Alt+Shift+P): frame budgets, the slowest engine commands, the
+/// background jobs running this session (docs/plano-responsividade.md).
+pub fn perf_panel(app: &crate::SheetApp, ctx: &egui::Context) {
+    egui::Window::new("Performance (debug)").collapsible(false).default_width(420.0).show(ctx, |ui| {
+        let perf = &app.perf;
+        let text = |ui: &mut Ui, s: String| {
+            ui.label(egui::RichText::new(s).monospace().size(11.0));
+        };
+        text(ui, format!("frame {:.1} ms   grid {:.1} ms   {:.1} fps", perf.frame_ms, perf.grid_ms, perf.fps));
+        if let Some(d) = app.session.active() {
+            let cells: usize = d.wb.sheets.iter().map(|sh| sh.cells.len()).sum();
+            text(ui, format!("workbook {} cells, {} formulas, revision {}", cells, d.calc.graph.len(), d.revision));
+        }
+        text(ui, format!("autosave fires {0:.0} ms after the last edit", crate::AUTOSAVE_DEBOUNCE_MS));
+        ui.separator();
+        ui.label(egui::RichText::new(format!("Slowest engine commands (> {:.0} ms)", crate::SLOW_COMMAND_MS)).size(12.0));
+        if app.perf.slow_commands.is_empty() {
+            text(ui, "none above the budget yet".into());
+        }
+        for (id, ms) in app.perf.slow_commands.iter().take(crate::SLOW_COMMANDS_TOP) {
+            text(ui, format!("{ms:8.1} ms  {id}"));
+        }
+        ui.separator();
+        ui.label(egui::RichText::new(format!("Slow frames (> {:.0} ms)", crate::SLOW_FRAME_MS)).size(12.0));
+        if app.perf.slow_frames.is_empty() {
+            text(ui, "none above the budget yet".into());
+        } else {
+            let last: Vec<String> = app.perf.slow_frames.iter().rev().take(10).map(|ms| format!("{ms:.0}")).collect();
+            text(ui, format!("last: {} ms", last.join(", ")));
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Background jobs").size(12.0));
+        if app.jobs.is_empty() {
+            text(ui, "none".into());
+        }
+        for j in app.jobs.jobs() {
+            let pct = (j.progress * 100.0).round();
+            let status = if j.status.is_empty() { String::new() } else { format!(" ({})", j.status) };
+            text(ui, format!("#{} {} — {:.0}%{}", j.id, j.title, pct, status));
+        }
+    });
 }

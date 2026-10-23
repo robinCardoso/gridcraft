@@ -387,6 +387,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "CSV 파일, 웹 페이지 또는 PDF는 사본이며 통합 문서는 원래 파일을 유지합니다."
         }
         "Save the workbook under another name or in another folder." => "통합 문서를 다른 이름 또는 다른 폴더에 저장합니다.",
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "저장 중…",
+        "Calculating…" => "계산 중…",
+        "Solving…" => "해 찾는 중…",
         "Print Active Sheets" => "활성 시트 인쇄",
         "Print Entire Workbook" => "전체 통합 문서 인쇄",
         "Fit Sheet on One Page" => "한 페이지에 시트 맞추기",

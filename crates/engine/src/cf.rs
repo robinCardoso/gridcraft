@@ -133,15 +133,14 @@ impl CfCache {
         for (idx, cf) in rules {
             let first = cf.ranges.first().map(|r| r.start).unwrap_or(c);
             let st = if rule_needs_stats(&cf.rule) {
-                if !self.stats.contains_key(&idx) {
+                Some(&*self.stats.entry(idx).or_insert_with(|| {
                     let need_counts = matches!(cf.rule, CfRule::Duplicate { .. } | CfRule::Unique { .. });
                     let (sorted, counts) = numbers_in(sh, &cf.ranges, need_counts);
                     let n = sorted.len().max(1) as f64;
                     let avg = sorted.iter().sum::<f64>() / n;
                     let std = (sorted.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / n).sqrt();
-                    self.stats.insert(idx, RuleStats { sorted, avg, std, counts });
-                }
-                self.stats.get(&idx)
+                    RuleStats { sorted, avg, std, counts }
+                }))
             } else {
                 None
             };

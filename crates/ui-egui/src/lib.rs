@@ -20,6 +20,7 @@ mod formula_locale;
 pub mod grid;
 pub mod i18n;
 pub mod icons;
+pub mod jobs;
 pub mod keymap;
 pub mod keytips;
 pub mod outline;
@@ -80,6 +81,16 @@ pub struct UiState {
 
 pub const INTERFACE_SCALE_MIN: u16 = 75;
 pub const INTERFACE_SCALE_MAX: u16 = 200;
+
+/// Fase 0 budgets (docs/plano-responsividade.md): a command past 50 ms and a frame past 100 ms
+/// are logged and kept for the perf panel (Ctrl+Alt+Shift+P). Bad news, not an error: they mark
+/// where the next work goes.
+const SLOW_COMMAND_MS: f64 = 50.0;
+const SLOW_FRAME_MS: f64 = 100.0;
+const SLOW_COMMANDS_TOP: usize = 20;
+const SLOW_FRAMES_TOP: usize = 100;
+/// AutoSave waits this long after the last edit before saving from a background job.
+const AUTOSAVE_DEBOUNCE_MS: f64 = 5000.0;
 
 /// A requested interface size, rounded and clamped to the supported range; `None` when it isn't
 /// a finite number.
@@ -205,12 +216,20 @@ pub struct LoadingTask {
     pub title: String,
     pub path: String,
     pub status: String,
+    /// Engine command params the task loads with: `None` for a file on disk (the retry dialog
+    /// refills `{"path"}`), `Some({"name", "base64"})` when the bytes came through the inbox —
+    /// a password retry reuses those.
+    pub open_params: Option<Json>,
+    /// The load was the password dialog's retry (the user already typed a password): a wrong
+    /// password reopens the dialog with the field cleared instead of a message box.
+    pub retry: bool,
     pub rx: std::sync::mpsc::Receiver<LoadTaskMessage>,
 }
 
 pub enum LoadTaskMessage {
     Status(String),
-    Done(Result<(gridcraft_engine::DocState, Vec<String>), String>),
+    /// `Done` boxes its payload so the small `Status` variant doesn't pad to it.
+    Done(Box<Result<(gridcraft_engine::DocState, Vec<String>), String>>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -218,6 +237,11 @@ pub struct Perf {
     pub frame_ms: f64,
     pub grid_ms: f64,
     pub fps: f64,
+    /// The most recent slow frames (> `SLOW_FRAME_MS`), for the perf panel (Fase 0 of
+    /// docs/plano-responsividade.md: measure).
+    pub slow_frames: Vec<f64>,
+    /// The slowest commands seen this run (> `SLOW_COMMAND_MS`), worst first.
+    pub slow_commands: Vec<(String, f64)>,
     last: f64,
 }
 
@@ -246,6 +270,24 @@ pub struct SheetApp {
     pub ui: UiState,
     /// The window chrome to draw (see [`Chrome`]).
     pub chrome: Chrome,
+    /// Second-plane jobs (save, calculate): long work off the interface thread with progress
+    /// and cancel (docs/plano-responsividade.md, Fases 1–3).
+    pub jobs: jobs::JobManager,
+    /// When commands stop being quick and go to [`SheetApp::jobs`]; tests push to 0 for
+    /// deterministic job routing.
+    pub job_thresholds: jobs::Thresholds,
+    /// (doc uid, revision) of the last [`Session`] change seen — the autosave debounce clock
+    /// (`last_edit_ms`) is measured from the last change, not last check.
+    last_edit: (u64, u64),
+    pub last_edit_ms: f64,
+    /// A manual save while a save of the same document already runs: run once that finishes and
+    /// the document is still dirty (one save job per document, docs/plano-responsividade.md).
+    pending_save_uid: Option<u64>,
+    /// A `file.close` that arrived while a save of that document was still running: the close
+    /// completes when the job ends and the document is clean (Fase 2: "salvar e fechar").
+    pending_close_uid: Option<u64>,
+    /// Debug panel for the frame/commands budgets (Ctrl+Alt+Shift+P).
+    pub perf_panel: bool,
     pub views: HashMap<(u64, usize), SheetView>,
     pub editor: Option<editor::EditState>,
     pub text_box_editor: Option<text_box::EditState>,
@@ -312,6 +354,13 @@ impl SheetApp {
             session,
             ui: UiState::default(),
             chrome: Chrome::default(),
+            jobs: jobs::JobManager::new(),
+            job_thresholds: jobs::Thresholds::default(),
+            last_edit: (0, 0),
+            last_edit_ms: 0.0,
+            pending_save_uid: None,
+            pending_close_uid: None,
+            perf_panel: false,
             views: HashMap::new(),
             editor: None,
             text_box_editor: None,
@@ -423,10 +472,22 @@ impl SheetApp {
         {
             self.commit_text_box_edit()?;
         }
+        // A slow command runs in a background job (docs/plano-responsividade.md, Fases 2–3);
+        // quick ones and everything else keep the inline engine path.
+        if let Some(r) = self.try_job_command(id, &params) {
+            return r;
+        }
         if let Some(r) = self.run_ui_command(id, &params) {
             return r;
         }
+        // Per-command timing (Fase 0): every command is measured off the clock, slow ones logged
+        // and kept for the perf panel (Ctrl+Alt+Shift+P). Desktop-only timing; wasm skips it.
+        #[allow(clippy::disallowed_methods)] // clocks trap only on wasm, and this block is native-only
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = std::time::Instant::now();
         let r = self.session.run(id, params);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.note_command_ms(id, t0.elapsed().as_secs_f64() * 1000.0);
         self.after_engine();
         // The new chart is selected, as after inserting any object, so Delete removes it, not its data.
         if id == "insert.chart"
@@ -441,6 +502,310 @@ impl SheetApp {
             self.deliver_pdf(r);
         }
         r
+    }
+
+    /// Big commands become background jobs (docs/plano-responsividade.md, Fases 2–3):
+    /// `file.save`/`file.saveAs` beyond `job_thresholds.save_cells` and F9 beyond
+    /// `job_thresholds.calc_formulas`. Returns `None` to fall through to the inline engine
+    /// command (small workbooks, PDF/database paths, other commands) — tests and the control
+    /// channel keep their synchronous contract for those.
+    fn try_job_command(&mut self, id: &str, p: &Json) -> Option<Result<Json, String>> {
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
+        match id {
+            "file.save" | "file.saveAs" => self.save_job_attempt(p, false, false),
+            "formulas.calculateNow" => self.calc_job_attempt(true, false),
+            "formulas.calculateSheet" => self.calc_job_attempt(false, false),
+            // Solver / Goal Seek on big workbooks: the iteration runs on a snapshot (Fase 3).
+            "data.solver" => self.analysis_job_attempt(p, true),
+            "data.goalSeek" => self.analysis_job_attempt(p, false),
+            // Closing waits for a save of the document that is still running (Fase 2:
+            // "salvar e fechar"): the close runs when the job ends and the document is clean.
+            "file.close" => self.close_job_deferral(),
+            // Exports of a big workbook serialize the snapshot on a background thread (Fase 2).
+            "file.exportCsv" => self.export_job_attempt(p, "csv"),
+            "file.exportHtml" => self.export_job_attempt(p, "html"),
+            _ => None,
+        }
+    }
+
+    /// CSV/HTML export of a big workbook as a background job (docs/plano-responsividade.md,
+    /// Fase 2: "Exportar… como jobs"). An export is a *copy*: the finished job applies nothing to
+    /// the document, exactly like the inline command (`apply_job` leaves every non-workbook format
+    /// alone). Exporting another sheet (`sheet` param) keeps the inline path: it clones the sheet
+    /// in place and is the rare case.
+    fn export_job_attempt(&mut self, p: &Json, ext: &str) -> Option<Result<Json, String>> {
+        if p.get("sheet").is_some() {
+            return None;
+        }
+        let d = self.session.active()?;
+        let path = p.get("path").and_then(Json::as_str)?.to_string();
+        let cells: usize = d.wb.sheets.iter().map(|sh| sh.cells.len()).sum();
+        if cells < self.job_thresholds.save_cells {
+            return None;
+        }
+        // The engine appends the extension when the path has none; keep the same target.
+        let target = if path.ends_with(&format!(".{ext}")) { path } else { format!("{path}.{ext}") };
+        let kind = gridcraft_engine::io::FileKind::from_path(&target);
+        let plan = gridcraft_engine::cmd::file::SavePlan { wb: d.wb.clone(), path: target.clone(), kind, compression: 6 };
+        self.jobs.spawn_save(plan, d.uid, save_job_title(&target), false);
+        Some(Ok(json!({"path": target, "pending": true})))
+    }
+
+    /// Defers a `file.close` while a save of the same document is in flight; `None` lets the
+    /// engine close right away, as always.
+    fn close_job_deferral(&mut self) -> Option<Result<Json, String>> {
+        let uid = self.session.active()?.uid;
+        if self.jobs.is_saving(uid) || self.pending_save_uid == Some(uid) {
+            self.pending_close_uid = Some(uid);
+            return Some(Ok(json!({"closed": false, "pending": true})));
+        }
+        None
+    }
+
+    /// Completes a `file.close` that waited for a running save (Fase 2: "salvar e fechar"). It
+    /// closes only when the document is still the active one and the save really cleaned it: a
+    /// failed save leaves the document open (its error box is already up).
+    fn finish_pending_close(&mut self, uid: u64) {
+        if self.pending_close_uid != Some(uid) {
+            return;
+        }
+        self.pending_close_uid = None;
+        let Some(d) = self.session.active() else { return };
+        if d.uid != uid || d.is_dirty() {
+            return;
+        }
+        let _ = self.session.run("file.close", json!({"force": true}));
+        self.after_engine();
+    }
+
+    /// The save as a background job when the document is big enough for one to matter. `None`
+    /// means "run the engine command inline as before". `fast` (the AutoSave) trades file size
+    /// for time with deflate level 1 (docs/plano-responsividade.md, Fase 2).
+    fn save_job_attempt(&mut self, p: &Json, autosave: bool, fast: bool) -> Option<Result<Json, String>> {
+        let d = self.session.active()?;
+        let path = p.get("path").and_then(Json::as_str).map(str::to_string).or_else(|| d.path.clone())?;
+        // PDFs go through the print pipeline and databases through their own saver, both inside
+        // the engine command; import-only extensions (and unknown ones) run inline too.
+        if path.to_ascii_lowercase().ends_with(".pdf") || gridcraft_engine::dbfile::is_db_path(&path) {
+            return None;
+        }
+        match gridcraft_engine::io::FileKind::from_path(&path) {
+            Some(
+                gridcraft_engine::io::FileKind::Xlsx
+                | gridcraft_engine::io::FileKind::Json
+                | gridcraft_engine::io::FileKind::Csv
+                | gridcraft_engine::io::FileKind::Tsv
+                | gridcraft_engine::io::FileKind::Html,
+            ) => {}
+            Some(_) | None => return None,
+        }
+        let uid = d.uid;
+        let cells: usize = d.wb.sheets.iter().map(|sh| sh.cells.len()).sum();
+        if cells < self.job_thresholds.save_cells {
+            return None;
+        }
+        if self.jobs.is_saving(uid) {
+            // One save job per document (docs/plano-responsividade.md): a manual save while one
+            // runs queues a follow-up that applies the still-dirty document afterwards.
+            self.pending_save_uid = Some(uid);
+            return Some(Ok(json!({"path": path, "pending": true})));
+        }
+        let mut plan = gridcraft_engine::cmd::file::SavePlan::prepare(d, path.clone());
+        if fast {
+            plan.compression = 1;
+        }
+        let title = save_job_title(&path);
+        self.jobs.spawn_save(plan, uid, title, autosave);
+        Some(Ok(json!({"path": path, "pending": true})))
+    }
+
+    /// F9 / Shift+F9 as a background calculation job when the workbook is big enough for one to
+    /// matter. A repeated F9 cancels the previous calculation job (its result is discarded) and
+    /// requeues on this snapshot — the plan's "cancel a previous grid and requeue". `force`
+    /// bypasses the size gate: it requeues a recalculation the engine already owes
+    /// (`recalc_pending`, Fase 3).
+    fn calc_job_attempt(&mut self, full: bool, force: bool) -> Option<Result<Json, String>> {
+        let d = self.session.active()?;
+        if !force && d.calc.graph.len() < self.job_thresholds.calc_formulas {
+            return None;
+        }
+        let uid = d.uid;
+        if self.jobs.is_calculating(uid) {
+            self.jobs.cancel_calculating(uid);
+        }
+        let seeds = d.calc.seeds();
+        let calc = d.calc.clone();
+        let active_sheet = d.wb.active_sheet;
+        let wb = d.wb.clone();
+        let title = format!("Calculating {}", d.display_title());
+        self.jobs.spawn_calc(uid, wb, calc, full, active_sheet, seeds, title);
+        Some(Ok(json!({"pending": true})))
+    }
+
+    /// Solver / Goal Seek as a background job on big workbooks (docs/plano-responsividade.md,
+    /// Fase 3): the iteration works on a snapshot through a private session, reports progress and
+    /// stops on cancel. Small workbooks keep the inline path (fast, and the synchronous contract
+    /// the tests and the control channel rely on).
+    fn analysis_job_attempt(&mut self, p: &Json, solver: bool) -> Option<Result<Json, String>> {
+        let d = self.session.active()?;
+        if d.calc.graph.len() < self.job_thresholds.calc_formulas {
+            return None;
+        }
+        if solver {
+            let has_objective =
+                ["objective", "setObjective", "set"].iter().any(|k| p.get(*k).and_then(Json::as_str).is_some_and(|t| !t.trim().is_empty()));
+            let saved = p.get("saved").and_then(Json::as_bool) == Some(true)
+                && gridcraft_engine::cmd::solver::saved_model(&d.wb, d.wb.active_sheet).is_some();
+            if !has_objective && !saved {
+                // Opening the Solver (no objective yet) is the dialog: keep it inline.
+                return None;
+            }
+        }
+        let uid = d.uid;
+        if self.jobs.is_analysis(uid) {
+            // The newest request wins: the previous snapshot is stale.
+            self.jobs.cancel_analysis(uid);
+        }
+        let wb = d.wb.clone();
+        let calc = d.calc.clone();
+        let command = if solver { "data.solver" } else { "data.goalSeek" };
+        let title = if solver { "Solver".to_string() } else { "Goal Seek".to_string() };
+        self.jobs.spawn_analysis(uid, wb, calc, command, p.clone(), solver, title);
+        Some(Ok(json!({"pending": true})))
+    }
+
+    /// Applies a finished job (docs/plano-responsividade.md §3.3). Guarded:
+    /// a save is recorded against the document it wrote (found by uid — maybe closed meanwhile);
+    /// a calculation is applied only while the workbook is still exactly the snapshot the job
+    /// took, else it is discarded (an F9 made meanwhile can re-run on the current workbook).
+    /// An autosave's errors log instead of a message box (the debounce retries).
+    pub fn apply_job(&mut self, r: jobs::JobResult) {
+        match r {
+            jobs::JobResult::Save { doc_uid, plan, outcome, autosave } => match outcome {
+                Ok(o) => {
+                    if let Some(d) = self.session.doc_by_uid_mut(doc_uid) {
+                        // What the save genuinely wrote: that snapshot on disk, not the workbook
+                        // as it may be now. Only a full-fidelity format clears the dirty flag
+                        // and becomes the document's file.
+                        if matches!(plan.kind, Some(gridcraft_engine::io::FileKind::Xlsx | gridcraft_engine::io::FileKind::Json)) {
+                            d.saved = plan.wb;
+                            d.path = Some(o.path.clone());
+                        }
+                    }
+                    log::info!("job: saved {} ({} KB)", o.path, o.bytes / 1024);
+                    self.maybe_spawn_pending_save(doc_uid);
+                    self.finish_pending_close(doc_uid);
+                }
+                Err(e) if e == jobs::CANCELLED => self.maybe_spawn_pending_save(doc_uid),
+                Err(e) => {
+                    if autosave {
+                        log::warn!("AutoSave failed: {e}");
+                    } else if self.session.doc_by_uid_mut(doc_uid).is_some() {
+                        self.message = Some(("GridCraft".into(), clean_error(&e)));
+                    }
+                    self.maybe_spawn_pending_save(doc_uid);
+                    self.finish_pending_close(doc_uid);
+                }
+            },
+            jobs::JobResult::Calc { doc_uid, wb, full: _, outcome } => match *outcome {
+                Ok(o) => {
+                    if let Some(d) = self.session.doc_by_uid_mut(doc_uid)
+                        && std::sync::Arc::ptr_eq(&d.wb, &wb)
+                    {
+                        d.wb = std::sync::Arc::new(o.wb);
+                        d.calc = o.calc;
+                        // The snapshot is fully recomputed: any owed recalculation is paid.
+                        d.recalc_pending = false;
+                        self.calc_status = Some((1.0, o.cells, now_ms()));
+                    } else {
+                        log::info!("job: calculation result discarded (the workbook changed during it)");
+                    }
+                }
+                Err(e) if e == jobs::CANCELLED => {}
+                Err(e) => {
+                    // Clear the debt so a failing calculation never requeues forever.
+                    if let Some(d) = self.session.doc_by_uid_mut(doc_uid) {
+                        d.recalc_pending = false;
+                    }
+                    self.message = Some(("GridCraft".into(), clean_error(&e)));
+                }
+            },
+            jobs::JobResult::Analysis { doc_uid, snapshot, solver, outcome } => match *outcome {
+                Ok(o) => {
+                    let current = self.session.doc_by_uid_mut(doc_uid).is_some_and(|d| std::sync::Arc::ptr_eq(&d.wb, &snapshot));
+                    if !current {
+                        // An edit during the solve: its snapshot is stale, so nothing is written.
+                        self.message =
+                            Some(("GridCraft".into(), "The workbook changed during the analysis, so its result was discarded. Run it again.".into()));
+                    } else {
+                        let r = o.result.clone();
+                        let _ = self.session.apply_analysis(doc_uid, o.wb, o.calc, o.command, &o.params);
+                        if solver {
+                            self.open_dialog("solverResults", r);
+                        } else {
+                            self.toast = Some((format!("Goal Seeking found a solution: {}", r["value"]), now_ms()));
+                        }
+                    }
+                }
+                Err(e) if e == jobs::CANCELLED => {}
+                Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e))),
+            },
+        }
+    }
+
+    /// A manual save requested while the document's save job was still running: once it ends and
+    /// the document is still dirty (xlsx, still has its file), save again — now.
+    fn maybe_spawn_pending_save(&mut self, finished_uid: u64) {
+        if self.pending_save_uid != Some(finished_uid) {
+            return;
+        }
+        self.pending_save_uid = None;
+        let Some(d) = self.session.doc_by_uid_mut(finished_uid) else { return };
+        let Some(path) = d.path.clone() else { return };
+        if !d.is_dirty() {
+            return;
+        }
+        if !matches!(
+            gridcraft_engine::io::FileKind::from_path(&path),
+            Some(gridcraft_engine::io::FileKind::Xlsx | gridcraft_engine::io::FileKind::Json)
+        ) {
+            return;
+        }
+        let plan = gridcraft_engine::cmd::file::SavePlan::prepare(d, path.clone());
+        let title = save_job_title(&path);
+        self.jobs.spawn_save(plan, finished_uid, title, false);
+    }
+
+    /// Runs a command and shows its error in a message box (for menu/ribbon clicks).
+    /// Follow the desktop's light/dark choice while the app runs (Linux; the desktop app calls
+    /// this once — tests and embedders don't start the watcher thread).
+    pub fn watch_desktop_theme(&mut self) {
+        self.desktop_theme = desktop_theme::DesktopTheme::start();
+    }
+    /// Records one engine command's duration (Fase 0, docs/plano-responsividade.md): past the
+    /// threshold it is logged and kept — top-N per command — for the perf panel.
+    /// `GRIDCRAFT_PROFILE` prints every command as before (the commit block has its own timings).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn note_command_ms(&mut self, id: &str, ms: f64) {
+        if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
+            eprintln!("cmd {id}: {ms:.1} ms");
+        }
+        if ms <= SLOW_COMMAND_MS {
+            return;
+        }
+        log::warn!("slow command {id}: {ms:.0} ms");
+        let top = &mut self.perf.slow_commands;
+        if let Some(e) = top.iter_mut().find(|e| e.0 == id) {
+            if ms > e.1 {
+                e.1 = ms;
+            }
+        } else {
+            top.push((id.to_string(), ms));
+        }
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        top.truncate(SLOW_COMMANDS_TOP);
     }
 
     /// Copy or cut the selected cells to the system clipboard. Engine-only commands keep
@@ -493,16 +858,14 @@ impl SheetApp {
     /// clipboard is pasted instead, which reports "Nothing to paste.". Other text means the
     /// clipboard has moved on, so the cut's text is forgotten and pastes normally later.
     pub fn paste_external(&mut self, text: String) {
-        if Self::same_clipboard_text(Some(&text), self.cancelled_text.as_deref()) {
-            if self.session.clipboard.is_none() {
-                return self.run_or_alert("edit.paste", json!({}));
-            }
+        if Self::same_clipboard_text(Some(&text), self.cancelled_text.as_deref()) && self.session.clipboard.is_none() {
+            return self.run_or_alert("edit.paste", json!({}));
         }
-        if Self::same_clipboard_text(Some(&text), self.cut_text.as_deref()) {
-            if self.session.clipboard.is_none() {
-                return self.run_or_alert("edit.paste", json!({}));
-            }
-        } else {
+        let cut_matches = Self::same_clipboard_text(Some(&text), self.cut_text.as_deref());
+        if cut_matches && self.session.clipboard.is_none() {
+            return self.run_or_alert("edit.paste", json!({}));
+        }
+        if !cut_matches {
             self.cut_text = None;
             self.cancelled_text = None;
         }
@@ -526,20 +889,18 @@ impl SheetApp {
 
     /// Paste clipboard content strictly as text, preserving leading zeros and setting the text format (@).
     pub fn paste_as_text(&mut self) {
-        if let Some(text) = self.system_clipboard_text() {
-            if self.session.clipboard.is_none() || self.clipboard_text_at_copy.as_ref() != Some(&text) {
-                if Self::same_clipboard_text(Some(&text), self.cancelled_text.as_deref())
-                    || Self::same_clipboard_text(Some(&text), self.cut_text.as_deref())
-                {
-                    if self.session.clipboard.is_none() {
-                        return self.run_or_alert("edit.pasteSpecial", json!({"what": "text"}));
-                    }
-                }
-                self.cut_text = None;
-                self.cancelled_text = None;
-                self.run_or_alert("edit.paste", json!({"text": text, "asText": true}));
-                return;
+        if let Some(text) = self.system_clipboard_text()
+            && (self.session.clipboard.is_none() || self.clipboard_text_at_copy.as_ref() != Some(&text))
+        {
+            let ours = Self::same_clipboard_text(Some(&text), self.cancelled_text.as_deref())
+                || Self::same_clipboard_text(Some(&text), self.cut_text.as_deref());
+            if ours && self.session.clipboard.is_none() {
+                return self.run_or_alert("edit.pasteSpecial", json!({"what": "text"}));
             }
+            self.cut_text = None;
+            self.cancelled_text = None;
+            self.run_or_alert("edit.paste", json!({"text": text, "asText": true}));
+            return;
         }
         self.run_or_alert("edit.pasteSpecial", json!({"what": "text"}));
     }
@@ -573,13 +934,6 @@ impl SheetApp {
             let title = self.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
             dl(&std::path::Path::new(&title).with_extension("pdf").to_string_lossy(), &b);
         }
-    }
-
-    /// Runs a command and shows its error in a message box (for menu/ribbon clicks).
-    /// Follow the desktop's light/dark choice while the app runs (Linux; the desktop app calls
-    /// this once — tests and embedders don't start the watcher thread).
-    pub fn watch_desktop_theme(&mut self) {
-        self.desktop_theme = desktop_theme::DesktopTheme::start();
     }
 
     pub fn run_or_alert(&mut self, id: &str, params: Json) {
@@ -798,8 +1152,37 @@ impl SheetApp {
             }
         }
         if let Some(d) = self.session.active() {
+            if (d.uid, d.revision) != self.last_edit {
+                self.last_edit = (d.uid, d.revision);
+                self.last_edit_ms = now_ms();
+            }
             if d.calc.last_recalc_cells > 0 {
                 self.calc_status = Some((1.0, d.calc.last_recalc_cells, now_ms()));
+            }
+        }
+        // Fase 3 (docs/plano-responsividade.md): structural commands on big workbooks skip the
+        // synchronous full recalculation (`defer_structural`), and a background job recomputes
+        // everything. An edit during a running calculation cancels it; the spawn below requeues
+        // on the newest snapshot, so the last state always converges. Native only: wasm has no
+        // threads to run the job on.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let uid = self.session.active().map(|d| d.uid);
+            let big = self.session.active().is_some_and(|d| !d.defer_structural && d.calc.graph.len() >= self.job_thresholds.calc_formulas);
+            if big
+                && let Some(uid) = uid
+                && let Some(d) = self.session.doc_by_uid_mut(uid)
+            {
+                d.defer_structural = true;
+            }
+            if self.session.active().is_some_and(|d| d.recalc_pending) {
+                let uid = uid.unwrap_or_default();
+                if self.jobs.is_calculating(uid) {
+                    self.jobs.cancel_calculating(uid);
+                }
+                if !self.jobs.is_calculating(uid) {
+                    self.calc_job_attempt(true, true);
+                }
             }
         }
     }
@@ -868,37 +1251,68 @@ impl SheetApp {
             self.after_engine();
             return;
         }
-        let title = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Book").to_string();
+        let title = file_name(path);
+        self.open_document_async(json!({"path": path}), title, Some(path.to_string()), None, false);
+    }
+
+    /// Loads a workbook from bytes (name + base64) on a background thread — the same pure
+    /// `load_document` engine the file open uses, generalized to every open path
+    /// (docs/plano-responsividade.md, Fase 2). On wasm it loads inline (no threads: the
+    /// browser pick was already cooperative); behavior stays no worse than synchronous.
+    pub fn open_bytes_async(&mut self, name: &str, base64: String, password: Option<String>) {
+        let title = file_name(name);
+        self.open_document_async(
+            json!({"name": name, "base64": base64, "password": password}),
+            title,
+            None,
+            Some(json!({"name": name, "base64": base64})),
+            false,
+        );
+    }
+
+    /// The single loader every open goes through (native; Fase 2 unification): `params` is a
+    /// `file.open` params object — `{"path"}` for a file on disk, `{"name","base64"}` (+
+    /// `password`) for bytes. `title` is the modal title, `display` is `Some(path)` for a file on
+    /// disk (recent list) and `None` for bytes; `open_params` is the same object minus `password`,
+    /// kept for a wrong-password retry; `retry` marks a load the password dialog already asked
+    /// about (a wrong password reopens the dialog instead of a message box). On wasm (no threads)
+    /// or when the thread won't start, it falls back to the synchronous open, exactly as before.
+    pub fn open_document_async(&mut self, params: Json, title: String, display: Option<String>, open_params: Option<Json>, retry: bool) {
+        self.backstage = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (tx, rx) = std::sync::mpsc::channel();
-            let path_clone = path.to_string();
             let tx_status = tx.clone();
             let is_pt = self.ui.language == i18n::Language::PtBr;
             let initial_status = if is_pt { "Lendo dados da planilha...".to_string() } else { "Reading spreadsheet data...".to_string() };
-            let spawned = std::thread::Builder::new()
-                .name("gridcraft-loader".into())
-                .spawn(move || {
-                    let res = gridcraft_engine::load_document(
-                        &serde_json::json!({"path": path_clone}),
-                        Some(Box::new(move |msg| {
-                            let _ = tx_status.send(LoadTaskMessage::Status(msg.to_string()));
-                        })),
-                    )
-                    .map_err(|e| e.to_string());
-                    let _ = tx.send(LoadTaskMessage::Done(res));
-                });
+            let task_params = params.clone();
+            let spawned = std::thread::Builder::new().name("gridcraft-loader".into()).spawn(move || {
+                let res = gridcraft_engine::load_document(
+                    &task_params,
+                    Some(Box::new(move |msg| {
+                        let _ = tx_status.send(LoadTaskMessage::Status(msg.to_string()));
+                    })),
+                )
+                .map_err(|e| e.to_string());
+                let _ = tx.send(LoadTaskMessage::Done(Box::new(res)));
+            });
             if spawned.is_ok() {
-                self.loading = Some(LoadingTask {
-                    title,
-                    path: path.to_string(),
-                    status: initial_status,
-                    rx,
-                });
+                self.loading = Some(LoadingTask { title, path: display.clone().unwrap_or_default(), status: initial_status, open_params, retry, rx });
                 return;
             }
         }
-        self.open_path(path);
+        // wasm (no threads) or spawn failure: the synchronous path as before.
+        match self.run("file.open", params) {
+            Ok(r) => match display {
+                Some(path) => self.after_open(Some(&path), &r),
+                None => self.show_open_warnings(&r),
+            },
+            Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
+                self.open_dialog("openPassword", open_params.unwrap_or_else(|| json!({"path": display.unwrap_or_default()})));
+            }
+            Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e))),
+        }
+        self.after_engine();
     }
 
     pub fn open_path(&mut self, path: &str) {
@@ -1144,6 +1558,9 @@ impl SheetApp {
     pub fn logic(&mut self, ctx: &egui::Context) {
         // A keytip control request lives one frame: the ribbon consumes it during `ui`, and
         // anything that never reached a control (collapsed ribbon, tab switch) is dropped.
+        if ctx.input(|i| i.modifiers.ctrl && i.modifiers.alt && i.modifiers.shift && i.key_pressed(egui::Key::P)) {
+            self.perf_panel = !self.perf_panel;
+        }
         self.ui.keytip_invoke = None;
         if self.fonts_han.is_some_and(|han| han != theme::HanOrder::of(self.ui.language)) {
             self.fonts_ready = false;
@@ -1208,6 +1625,12 @@ impl SheetApp {
             ctx.request_repaint();
         }
         control::poll(self, ctx);
+        // Finished background jobs (save, calculate) apply their outcomes, guarded by document
+        // uid and workbook snapshot (docs/plano-responsividade.md §3.3).
+        for r in self.jobs.poll(ctx) {
+            self.apply_job(r);
+            self.after_engine();
+        }
         if let Some(loading) = &mut self.loading {
             ctx.request_repaint();
             let mut done = None;
@@ -1215,21 +1638,40 @@ impl SheetApp {
                 match msg {
                     LoadTaskMessage::Status(s) => loading.status = s,
                     LoadTaskMessage::Done(res) => {
-                        done = Some(res);
+                        done = Some(*res);
                         break;
                     }
                 }
             }
+            // A loader thread that died without reporting (a panic, say) is an error, not a
+            // modal stuck forever: the window must never hang on it.
+            if done.is_none() && matches!(loading.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)) {
+                done = Some(Err("the open stopped unexpectedly".into()));
+            }
             if let Some(res) = done {
                 let path = loading.path.clone();
+                let open_params = loading.open_params.clone();
+                let retry = loading.retry;
                 self.loading = None;
+                let on_disk = open_params.is_none();
                 match res {
                     Ok((doc, warnings)) => match self.session.install_document(doc, warnings) {
-                        Ok(r) => self.after_open(Some(&path), &r),
+                        Ok(r) => self.after_open(on_disk.then_some(path.as_str()), &r),
                         Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e.to_string()))),
                     },
-                    Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
-                        self.open_dialog("openPassword", json!({"path": path}));
+                    Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => match open_params {
+                        // Bytes arrived without a usable password (or a wrong one): the password
+                        // dialog reopens with the same payload.
+                        Some(p) => self.open_dialog("openPassword", p),
+                        None => {
+                            self.open_dialog("openPassword", json!({"path": path}));
+                        }
+                    },
+                    Err(e) if retry && e.contains(gridcraft_engine::io::WRONG_PASSWORD) => {
+                        // The password dialog's own retry: say so, clear the field and stay open
+                        // (as the synchronous flow did) instead of a message box.
+                        self.open_dialog("openPassword", open_params.unwrap_or_else(|| json!({"path": path})));
+                        self.message = Some(("Password".into(), clean_error(&e)));
                     }
                     Err(e) => {
                         self.message = Some(("GridCraft".into(), clean_error(&e)));
@@ -1238,7 +1680,8 @@ impl SheetApp {
                 self.after_engine();
             }
         }
-        // Files read asynchronously (web file picker, dropped files).
+        // Files read asynchronously (web file picker, dropped files): each one parses on its
+        // own thread (docs/plano-responsividade.md, Fase 2 — one open path after another).
         let arrived: Vec<(String, Vec<u8>)> = self
             .services
             .inbox
@@ -1247,18 +1690,7 @@ impl SheetApp {
             .unwrap_or_default();
         for (name, bytes) in arrived {
             let b64 = gridcraft_engine::io::base64_encode(&bytes);
-            match self.run("file.open", json!({"name": &name, "base64": &b64})) {
-                // A file picked from File › Open (web) arrives here: show it, not the Backstage.
-                Ok(r) => {
-                    self.backstage = None;
-                    self.show_open_warnings(&r);
-                }
-                Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
-                    self.backstage = None;
-                    self.open_dialog("openPassword", json!({"name": name, "base64": b64}));
-                }
-                Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e))),
-            }
+            self.open_bytes_async(&name, b64, None);
             self.after_engine();
         }
         if self.session.active().is_none() {
@@ -1320,6 +1752,9 @@ impl SheetApp {
         widgets::message_box(self, &ctx);
         widgets::toast(self, &ctx);
         widgets::loading_modal(self, &ctx);
+        if self.perf_panel {
+            widgets::perf_panel(self, &ctx);
+        }
         control::issue_screenshots(self, &ctx);
         control::collect_screenshots(self, &ctx);
         if !ctx.input(|i| i.focused) {
@@ -1327,6 +1762,16 @@ impl SheetApp {
         }
         let now = now_ms();
         self.perf.frame_ms = now - t0;
+        // Frame watchdog (Fase 0): a frame past the budget is logged with the workbook size and
+        // kept for the perf panel — the signal for where the next work goes.
+        if self.perf.frame_ms > SLOW_FRAME_MS {
+            let cells = self.session.active().map(|d| d.wb.sheets.iter().map(|sh| sh.cells.len()).sum::<usize>()).unwrap_or(0);
+            log::warn!("slow frame: {:.0} ms (active workbook: {cells} cells)", self.perf.frame_ms);
+            self.perf.slow_frames.push(self.perf.frame_ms);
+            if self.perf.slow_frames.len() > SLOW_FRAMES_TOP {
+                self.perf.slow_frames.remove(0);
+            }
+        }
         if self.perf.last > 0.0 {
             let dt = now - self.perf.last;
             if dt > 0.0 {
@@ -1334,16 +1779,25 @@ impl SheetApp {
             }
         }
         self.perf.last = now;
-        // AutoSave: save workbooks that have a file shortly after they change.
+        // AutoSave: save workbooks that have a file a moment after the last edit — debounced,
+        // from a background job, never while the user types, and at most one save job per
+        // document (docs/plano-responsividade.md, Fase 2).
         if self.grid.autosave
             && self.editor.is_none()
             && self.text_box_editor.is_none()
-            && now - self.grid.last_autosave > 2000.0
-            && self.session.active().is_some_and(|d| d.is_dirty() && d.path.as_deref().is_some_and(|p| p.ends_with(".xlsx")))
+            && now - self.last_edit_ms > AUTOSAVE_DEBOUNCE_MS
+            && let Some(d) = self.session.active()
+            && d.is_dirty()
+            && d.path.as_deref().is_some_and(|p| p.ends_with(".xlsx"))
+            && !self.jobs.is_saving(d.uid)
         {
             self.grid.last_autosave = now;
             self.store_view_state();
-            let _ = self.session.run("file.save", json!({}));
+            if self.save_job_attempt(&json!({}), true, true).is_none() {
+                // Below the job threshold: the inline save is likely faster than the machinery.
+                let _ = self.session.run("file.save", json!({}));
+                self.after_engine();
+            }
         }
         // Window title.
         if let Some(d) = self.session.active() {
@@ -1422,6 +1876,18 @@ impl SheetApp {
         }
         sel.active.a1()
     }
+}
+
+/// A save job's title: the file the job writes (the interface translates "Saving…"; the title
+/// keeps the target name for tooltips and logs).
+pub fn save_job_title(path: &str) -> String {
+    let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
+    format!("Saving {name}")
+}
+
+/// The file name to show for a path or a picked name (the loading modal's title).
+pub fn file_name(path_or_name: &str) -> String {
+    std::path::Path::new(path_or_name).file_name().and_then(|n| n.to_str()).unwrap_or("Book").to_string()
 }
 
 /// Strips the engine's error prefixes for message boxes.

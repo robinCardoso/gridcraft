@@ -12,6 +12,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A fast, non-cryptographic hasher for cell keys (FxHash-style multiply-rotate).
 #[derive(Default, Clone, Copy)]
@@ -334,23 +336,17 @@ impl Graph {
     }
 
     /// Optimized closure traversal that dedups whole-column dependents across cells in the same column.
-    pub fn dependents_closure(
-        &self,
-        sheet: usize,
-        c: CellRef,
-        whole_cols_seen: &mut HashSet<(usize, u32)>,
-        mut emit: impl FnMut(Key),
-    ) {
+    pub fn dependents_closure(&self, sheet: usize, c: CellRef, whole_cols_seen: &mut HashSet<(usize, u32)>, mut emit: impl FnMut(Key)) {
         if let Some(v) = self.cell_deps.get(&(sheet, c)) {
             for &k in v {
                 emit(k);
             }
         }
-        if whole_cols_seen.insert((sheet, c.col)) {
-            if let Some(v) = self.whole_col_deps.get(&(sheet, c.col)) {
-                for &k in v {
-                    emit(k);
-                }
+        if whole_cols_seen.insert((sheet, c.col))
+            && let Some(v) = self.whole_col_deps.get(&(sheet, c.col))
+        {
+            for &k in v {
+                emit(k);
             }
         }
         if let Some(v) = self.col_deps.get(&(sheet, c.col)) {
@@ -418,21 +414,107 @@ impl Graph {
     }
 }
 
+/// Cooperative hooks a background calculation shares with its owner (docs/plano-responsividade.md,
+/// Fase 3): progress is reported every few hundred formulas, and a cancellation flag the owner
+/// (interface thread) can set stops the evaluation as soon as the next check lands. Shared
+/// through `Arc`, so the job can hold it while the [`Calc`] runs on its own thread.
+#[derive(Default)]
+pub struct CalcHooks {
+    cancel: AtomicBool,
+    /// `(formulas evaluated, total being evaluated)`; a poisoned or replaced callback is skipped.
+    progress: Mutex<Option<Box<dyn FnMut(usize, usize) + Send>>>,
+}
+
+impl CalcHooks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Requests cancellation: the running calculation stops soon after and reports an incomplete run.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+    /// Sets the progress reporter, called from the calculating thread with `(done, total)`.
+    pub fn set_progress(&self, f: Box<dyn FnMut(usize, usize) + Send>) {
+        if let Ok(mut slot) = self.progress.lock() {
+            *slot = Some(f);
+        }
+    }
+    /// Reports `(work done, total)` to the progress callback, when one is attached. Engine code
+    /// outside a recalculation (Solver, Goal Seek) reports through the same hooks.
+    pub fn report(&self, done: usize, total: usize) {
+        if let Ok(mut slot) = self.progress.lock()
+            && let Some(cb) = slot.as_mut()
+        {
+            cb(done, total);
+        }
+    }
+}
+
+impl std::fmt::Debug for CalcHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CalcHooks").field("cancelled", &self.cancelled()).finish_non_exhaustive()
+    }
+}
+
 /// Calculation state kept beside a workbook.
 #[derive(Clone, Debug)]
 pub struct Calc {
     pub graph: Graph,
+    /// Whether [`Self::graph`] matches the workbook's formulas. Cleared by
+    /// [`Self::invalidate_graph`] (structural edits that skip maintenance); restored by
+    /// [`Self::rebuild`] / [`Self::update_nodes`]. F9's [`Self::ensure_graph`] rebuilds only when
+    /// this is false (docs/plano-responsividade.md, Fase 3 — rebuild incremental).
+    graph_valid: bool,
     rng: u64,
     /// Fixed "now" for deterministic tests; `None` = system clock.
     pub fixed_now: Option<f64>,
     /// Cells whose formulas have errors from cycles.
     pub circular: Vec<Key>,
     pub last_recalc_cells: usize,
+    /// Background cooperation (progress + cancel); `None` = run to completion, as always.
+    pub hooks: Option<Arc<CalcHooks>>,
 }
 
 impl Default for Calc {
     fn default() -> Self {
-        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0 }
+        Calc {
+            graph: Graph::default(),
+            graph_valid: false,
+            rng: 0x9E37_79B9_7F4A_7C15,
+            fixed_now: None,
+            circular: vec![],
+            last_recalc_cells: 0,
+            hooks: None,
+        }
+    }
+}
+
+/// The volatile calculation state a background re-run must carry over (docs/plano-responsividade.md,
+/// Fase 3): the `rand()` stream position and the fixed "now". The dependency graph is carried on
+/// the cloned [`Calc`] when current; otherwise the job rebuilds it. These two seeds must still
+/// match the synchronous result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CalcSeeds {
+    pub rng: u64,
+    pub fixed_now: Option<f64>,
+}
+
+impl Calc {
+    /// The calculation seeds a background re-run must carry over.
+    pub fn seeds(&self) -> CalcSeeds {
+        CalcSeeds { rng: self.rng, fixed_now: self.fixed_now }
+    }
+    pub fn set_seeds(&mut self, seeds: CalcSeeds) {
+        self.rng = seeds.rng;
+        self.fixed_now = seeds.fixed_now;
+    }
+    /// Attaches background cooperation hooks (progress + cancellation), taking effect from the
+    /// next recalculation on.
+    pub fn set_hooks(&mut self, hooks: Arc<CalcHooks>) {
+        self.hooks = Some(hooks);
     }
 }
 
@@ -468,7 +550,26 @@ struct PassHost<'a> {
     lookup_col_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
     lookup_row_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
     val_cache: HashMap<u64, Value>,
+    /// Ranges materialized for this pass: many formulas read the same lookup table or criteria
+    /// range, and arrays are `Arc`, so a hit is a pointer clone
+    /// (docs/plano-responsividade.md, Fase 3 — "cache de range_values por passada").
+    ranges: Vec<(usize, RangeRef, Value)>,
+    /// Cells held by `ranges` (the memory budget for the cache).
+    range_cells: u64,
+    /// Equality index per range for this pass: value key → row-major positions. COUNTIFS/SUMIFS
+    /// over the same big table build it once instead of scanning per criterion
+    /// (docs/plano-responsividade.md, Fase 3).
+    criteria: HashMap<(usize, RangeRef), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
+    /// A cached range would go stale if a spill fills cells during the pass (or the workbook
+    /// already has spills): the cache is off for such workbooks, correctness first.
+    spills_possible: bool,
 }
+
+/// Most cells kept materialized per pass: a bigger range is read normally, so one huge array
+/// cannot blow the budget.
+const RANGE_CACHE_CELLS: u64 = 1_500_000;
+/// Most distinct ranges kept per pass.
+const RANGE_CACHE_ENTRIES: usize = 128;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum LookupExactKey {
@@ -481,10 +582,9 @@ enum LookupExactKey {
 fn to_lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
     match v {
         Value::Text(s) => Some(LookupExactKey::Text(s.to_lowercase())),
-        Value::Number(n) => {
-            let n = if *n == 0.0 { 0.0 } else { *n };
-            Some(LookupExactKey::Number(n.to_bits()))
-        }
+        // Excel compares numbers at 15 significant digits, so the index keys the rounded value:
+        // the map must agree with a linear scan through `lookup_equal`.
+        Value::Number(n) => Some(LookupExactKey::Number(gridcraft_core::exact_number_key(*n))),
         Value::Bool(b) => Some(LookupExactKey::Bool(*b)),
         Value::Empty => Some(LookupExactKey::Empty),
         _ => None,
@@ -515,6 +615,10 @@ impl<'a> PassHost<'a> {
             lookup_col_cache: HashMap::default(),
             lookup_row_cache: HashMap::default(),
             val_cache: HashMap::default(),
+            ranges: Vec::new(),
+            range_cells: 0,
+            criteria: HashMap::default(),
+            spills_possible: wb.sheets.iter().any(|s| !s.spill.is_empty() || !s.spill_ranges.is_empty()),
         }
     }
 }
@@ -751,6 +855,57 @@ impl Host for PassHost<'_> {
         }
         self.wb.sheet(sheet).map(|s| s.value(c)).unwrap_or_default()
     }
+    fn range_array(&mut self, sheet: usize, range: RangeRef) -> Option<Value> {
+        if self.spills_possible || !self.spills.is_empty() {
+            return None;
+        }
+        let cells = u64::from(range.height()) * u64::from(range.width());
+        if cells == 0 || cells > RANGE_CACHE_CELLS {
+            return None;
+        }
+        if let Some((_, _, v)) = self.ranges.iter().find(|(s, r, _)| *s == sheet && *r == range) {
+            return Some(v.clone());
+        }
+        let data = self.range_values(sheet, range);
+        let array = Array::new(range.height() as usize, range.width() as usize, data)?;
+        let value = Value::Array(std::sync::Arc::new(array));
+        if self.ranges.len() < RANGE_CACHE_ENTRIES && self.range_cells + cells <= RANGE_CACHE_CELLS {
+            self.range_cells += cells;
+            self.ranges.push((sheet, range, value.clone()));
+        }
+        Some(value)
+    }
+    fn equality_positions(&mut self, sheet: usize, range: RangeRef, needle: &Value) -> Option<Arc<Vec<u32>>> {
+        // The same guard as the range cache: a spill can fill cells during the pass.
+        if self.spills_possible || !self.spills.is_empty() {
+            return None;
+        }
+        let cells = u64::from(range.height()) * u64::from(range.width());
+        if cells == 0 || cells > RANGE_CACHE_CELLS {
+            return None;
+        }
+        let key = (sheet, range);
+        if !self.criteria.contains_key(&key) {
+            let (h, w) = (range.height(), range.width());
+            let mut map: HashMap<LookupExactKey, Arc<Vec<u32>>> = HashMap::default();
+            for r in 0..h {
+                for c in 0..w {
+                    let v = self.cell_value(sheet, CellRef::new(range.start.row + r, range.start.col + c));
+                    let Some(k) = to_lookup_exact_key(&v) else { continue };
+                    let pos = r * w + c;
+                    match map.entry(k) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => Arc::make_mut(e.get_mut()).push(pos),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(Arc::new(vec![pos]));
+                        }
+                    }
+                }
+            }
+            self.criteria.insert(key, Arc::new(map));
+        }
+        let needle_key = to_lookup_exact_key(needle)?;
+        Some(self.criteria.get(&key)?.get(&needle_key).cloned().unwrap_or_else(|| Arc::new(Vec::new())))
+    }
     fn range_values(&mut self, sheet: usize, range: RangeRef) -> Vec<Value> {
         let (h, w) = (range.height() as usize, range.width() as usize);
         let mut out = vec![Value::Empty; h * w];
@@ -941,7 +1096,19 @@ impl Calc {
         now_serial()
     }
 
-    /// Rebuilds the graph from scratch.
+    /// Whether the dependency graph is known to match the workbook's formulas (safe to skip a
+    /// full rebuild on F9).
+    pub fn graph_is_current(&self) -> bool {
+        self.graph_valid
+    }
+
+    /// Marks the graph unusable until the next [`Self::rebuild`] (structural edits that defer
+    /// recalculation: row/col insert/delete, sheet rename, etc.).
+    pub fn invalidate_graph(&mut self) {
+        self.graph_valid = false;
+    }
+
+    /// Rebuilds the graph from scratch and marks it current.
     pub fn rebuild(&mut self, wb: &Workbook) {
         self.graph = Graph::default();
         for (si, sheet) in wb.sheets.iter().enumerate() {
@@ -955,90 +1122,32 @@ impl Calc {
             }
         }
         self.graph.settle();
+        self.graph_valid = true;
     }
 
-    /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
-    pub fn recalc_all(&mut self, wb: &mut Workbook) {
+    /// Ensures the graph matches `wb`: no-op when [`Self::graph_is_current`], otherwise a full
+    /// [`Self::rebuild`]. Used by F9 so a workbook whose graph was kept up to date by
+    /// [`Self::cells_changed`] / [`Self::update_nodes`] skips the O(formulas) rebuild.
+    pub fn ensure_graph(&mut self, wb: &Workbook) {
+        if self.graph_valid {
+            return;
+        }
         self.rebuild(wb);
-        // Spills are laid out again from the formulas where they are now (a structural edit moves
-        // or deletes the formulas, not the values they spilled).
-        for i in 0..wb.sheets.len() {
-            if wb.sheet(i).is_some_and(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty())
-                && let Some(sh) = wb.sheet_mut(i)
-            {
-                sh.spill.clear();
-                sh.spill_ranges.clear();
-            }
-        }
-        let all: Vec<Key> = self.graph.nodes.keys().copied().collect();
-        self.run(wb, all, true);
     }
 
-    /// Recalculates after loading: builds the dependency graph and only evaluates formulas
-    /// that do not already have a computed value or require dynamic-array spilling.
-    /// Formulas whose values were pre-calculated and saved by Excel are preserved instantly.
-    pub fn recalc_on_load(&mut self, wb: &mut Workbook) {
-        self.rebuild(wb);
-        for i in 0..wb.sheets.len() {
-            if wb.sheet(i).is_some_and(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty())
-                && let Some(sh) = wb.sheet_mut(i)
-            {
-                sh.spill.clear();
-                sh.spill_ranges.clear();
-            }
+    /// Updates graph nodes for `changed` cells only (insert/remove precedents), without evaluating.
+    /// Keeps the graph current when evaluation is deferred to a background F9 job. No-op when the
+    /// graph was [`Self::invalidate_graph`]'d — only a full rebuild is safe then.
+    pub fn update_nodes(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        if !self.graph_valid {
+            return;
         }
-        let mut needed: Vec<Key> = Vec::new();
-        for &k in self.graph.nodes.keys() {
-            if let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1)) {
-                if cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()) {
-                    needed.push(k);
-                }
-            }
-        }
-        if !needed.is_empty() {
-            if needed.len() > 1_000 {
-                let active = wb.active_sheet;
-                needed.retain(|k| k.0 == active || wb.sheet(k.0).and_then(|s| s.cell(k.1)).is_some_and(|c| c.formula.as_ref().is_some_and(|f| f.array.is_some())));
-                needed.sort_by_key(|k| (k.1.row, k.1.col));
-                needed.truncate(1_000);
-                if !needed.is_empty() {
-                    self.run_scoped(wb, needed, false, Some(active));
-                }
-            } else {
-                self.run(wb, needed, false);
-            }
-        }
+        let _ = self.apply_node_updates(wb, changed);
     }
 
-    /// Recalculates uncomputed formulas on the given sheet, up to `limit` formulas.
-    /// If `limit == 0`, all uncomputed formulas on the sheet are recalculated.
-    pub fn recalc_sheet_scoped(&mut self, wb: &mut Workbook, sheet: usize, limit: usize) {
-        let mut needed: Vec<Key> = Vec::new();
-        for &k in self.graph.nodes.keys() {
-            if k.0 == sheet {
-                if let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1)) {
-                    if cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()) {
-                        needed.push(k);
-                    }
-                }
-            }
-        }
-        if !needed.is_empty() {
-            needed.sort_by_key(|k| (k.1.row, k.1.col));
-            if limit > 0 && needed.len() > limit {
-                needed.truncate(limit);
-            }
-            self.run_scoped(wb, needed, false, Some(sheet));
-        }
-    }
-
-    /// Recalculates all uncomputed formulas on the given sheet.
-    pub fn recalc_sheet(&mut self, wb: &mut Workbook, sheet: usize) {
-        self.recalc_sheet_scoped(wb, sheet, 0);
-    }
-
-    /// Updates the graph for cells whose content changed and recalculates what depends on them.
-    pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
+    /// Inserts/removes graph nodes for `changed` and applies spill/#NAME? side effects. Returns the
+    /// spill ranges cleared when a formula became a constant (seeds for dependents).
+    fn apply_node_updates(&mut self, wb: &mut Workbook, changed: &[Key]) -> Vec<(usize, RangeRef)> {
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
         for &k in changed {
             let formula = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.clone());
@@ -1068,6 +1177,99 @@ impl Calc {
             }
         }
         self.graph.settle();
+        self.graph_valid = true;
+        cleared
+    }
+
+    /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
+    pub fn recalc_all(&mut self, wb: &mut Workbook) {
+        self.ensure_graph(wb);
+        // Spills are laid out again from the formulas where they are now (a structural edit moves
+        // or deletes the formulas, not the values they spilled).
+        for i in 0..wb.sheets.len() {
+            if wb.sheet(i).is_some_and(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty())
+                && let Some(sh) = wb.sheet_mut(i)
+            {
+                sh.spill.clear();
+                sh.spill_ranges.clear();
+            }
+        }
+        let all: Vec<Key> = self.graph.nodes.keys().copied().collect();
+        self.run(wb, all, true);
+    }
+
+    /// Recalculates after loading: builds the dependency graph and only evaluates formulas
+    /// that do not already have a computed value or require dynamic-array spilling.
+    /// Formulas whose values were pre-calculated and saved by Excel are preserved instantly.
+    pub fn recalc_on_load(&mut self, wb: &mut Workbook) {
+        self.rebuild(wb);
+        for i in 0..wb.sheets.len() {
+            if wb.sheet(i).is_some_and(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty())
+                && let Some(sh) = wb.sheet_mut(i)
+            {
+                sh.spill.clear();
+                sh.spill_ranges.clear();
+            }
+        }
+        let mut needed: Vec<Key> = Vec::new();
+        for &k in self.graph.nodes.keys() {
+            if let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1))
+                && (cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()))
+            {
+                needed.push(k);
+            }
+        }
+        if !needed.is_empty() {
+            if needed.len() > 1_000 {
+                let active = wb.active_sheet;
+                needed.retain(|k| {
+                    k.0 == active || wb.sheet(k.0).and_then(|s| s.cell(k.1)).is_some_and(|c| c.formula.as_ref().is_some_and(|f| f.array.is_some()))
+                });
+                needed.sort_by_key(|k| (k.1.row, k.1.col));
+                needed.truncate(1_000);
+                if !needed.is_empty() {
+                    self.run_scoped(wb, needed, false, Some(active));
+                }
+            } else {
+                self.run(wb, needed, false);
+            }
+        }
+    }
+
+    /// Recalculates uncomputed formulas on the given sheet, up to `limit` formulas.
+    /// If `limit == 0`, all uncomputed formulas on the sheet are recalculated.
+    pub fn recalc_sheet_scoped(&mut self, wb: &mut Workbook, sheet: usize, limit: usize) {
+        let mut needed: Vec<Key> = Vec::new();
+        for &k in self.graph.nodes.keys() {
+            if k.0 == sheet
+                && let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1))
+                && (cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()))
+            {
+                needed.push(k);
+            }
+        }
+        if !needed.is_empty() {
+            needed.sort_by_key(|k| (k.1.row, k.1.col));
+            if limit > 0 && needed.len() > limit {
+                needed.truncate(limit);
+            }
+            self.run_scoped(wb, needed, false, Some(sheet));
+        }
+    }
+
+    /// Recalculates all uncomputed formulas on the given sheet.
+    pub fn recalc_sheet(&mut self, wb: &mut Workbook, sheet: usize) {
+        self.recalc_sheet_scoped(wb, sheet, 0);
+    }
+
+    /// Updates the graph for cells whose content changed and recalculates what depends on them.
+    pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        // A structurally invalidated graph must be rebuilt before patching nodes; otherwise
+        // keys/areas from before the edit would mix with the new ones.
+        if !self.graph_valid && !self.graph.is_empty() {
+            self.rebuild(wb);
+        }
+        let cleared = self.apply_node_updates(wb, changed);
         if wb.calc.mode == CalcMode::Manual {
             // Only the edited formulas themselves are evaluated.
             let own: Vec<Key> = changed.iter().copied().filter(|k| self.graph.nodes.contains_key(k)).collect();
@@ -1119,17 +1321,51 @@ impl Calc {
         let dirty = self.dirty_closure(wb, &seeds);
         let t1 = prof_now();
         let n = dirty.len();
-        if n > 1_000 {
-            let active = wb.active_sheet;
-            let mut active_dirty: Vec<Key> = dirty.into_iter().filter(|k| k.0 == active).collect();
-            active_dirty.sort_by_key(|k| (k.1.row, k.1.col));
-            self.run_scoped(wb, active_dirty, false, Some(active));
-        } else {
-            self.run(wb, dirty, false);
-        }
+        // Automatic must cascade the full dirty set — including other sheets. Truncating to the
+        // active sheet when n > 1_000 left cross-sheet dependents stale and made formulas on the
+        // active sheet that read those sheets look "static" until a tab switch's scoped refill.
+        // Large cascades are deferred by the engine (`defer_structural` + `CASCADE_JOB_CELLS` →
+        // `recalc_pending` / F9 job), not discarded here. Load may still scope (`recalc_on_load`).
+        self.run(wb, dirty, false);
         if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
             eprintln!("recalc: {} seeds, closure {} cells {:.1} ms, run {:.1} ms", seeds.len(), n, t1 - t0, prof_now() - t1);
         }
+    }
+
+    /// Whether the recalculation cascade from `seeds` would evaluate more than `limit` formulas.
+    /// Counts with an early exit, so a small edit costs a bounded walk while a huge one is
+    /// detected fast (docs/plano-responsividade.md, Fase 3: cascades past the limit go to a
+    /// background job instead of blocking the interface thread).
+    pub fn cascade_exceeds(&self, seeds: &[Key], limit: usize) -> bool {
+        if limit == 0 {
+            return true;
+        }
+        let mut seen: HashSet<Key> = HashSet::default();
+        let mut queue: VecDeque<Key> = VecDeque::new();
+        let mut whole_cols_seen: HashSet<(usize, u32)> = HashSet::default();
+        let mut count = 0usize;
+        let push = |k: Key, queue: &mut VecDeque<Key>, seen: &mut HashSet<Key>, count: &mut usize| {
+            if seen.insert(k) {
+                *count += 1;
+                queue.push_back(k);
+            }
+        };
+        for &k in seeds {
+            if self.graph.nodes.contains_key(&k) {
+                push(k, &mut queue, &mut seen, &mut count);
+            }
+            self.graph.dependents_closure(k.0, k.1, &mut whole_cols_seen, |d| push(d, &mut queue, &mut seen, &mut count));
+        }
+        for &k in &self.graph.dynamic {
+            push(k, &mut queue, &mut seen, &mut count);
+        }
+        while let Some(k) = queue.pop_front() {
+            if count > limit {
+                return true;
+            }
+            self.graph.dependents_closure(k.0, k.1, &mut whole_cols_seen, |d| push(d, &mut queue, &mut seen, &mut count));
+        }
+        count > limit
     }
 
     fn dirty_closure(&self, _wb: &Workbook, seeds: &[Key]) -> Vec<Key> {
@@ -1168,14 +1404,22 @@ impl Calc {
     }
 
     /// Evaluates the dirty set, optionally scoped to a single sheet to avoid cascading recalculation across massive workbooks on load.
-    fn run_scoped(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool, scope_sheet: Option<usize>) {
+    /// Returns `false` only when a background caller cancelled the calculation (`Calc::hooks`);
+    /// the workbook is then left as it was for the evaluated subset.
+    fn run_scoped(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool, scope_sheet: Option<usize>) -> bool {
         let mut dynamic_again = !self.graph.dynamic.is_empty();
+        // Progress denominator: every formula in the graph (a full recalc evaluates all of it;
+        // an incremental one evaluates no more than its dirty set and what spills re-open).
+        let total = self.graph.len().max(dirty.len()).max(1);
+        let mut done = 0usize;
         for _round in 0..8 {
             if dirty.is_empty() {
                 break;
             }
             // Row-major order is a good topological guess; on-demand evaluation fixes the rest.
-            dirty.sort_by_key(|(s, c)| (*s, c.row, c.col));
+            // Active/scoped sheet cells are evaluated first so visible cells update earlier.
+            let target_sheet = scope_sheet.or(Some(wb.active_sheet));
+            dirty.sort_by_key(|(s, c)| (target_sheet.is_some_and(|ts| *s != ts), *s, c.row, c.col));
             let mut exprs: HashMap<Key, std::sync::Arc<Expr>> = HashMap::with_capacity_and_hasher(dirty.len(), Default::default());
             for k in &dirty {
                 if let Some(e) = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.expr_arc()) {
@@ -1188,8 +1432,20 @@ impl Calc {
             let (results, spills, cycles) = {
                 let mut host = PassHost::new(wb, &exprs, &mut rng, now);
                 host.iterate = wb.calc.iterative;
-                for k in &dirty {
+                for (i, k) in dirty.iter().enumerate() {
                     host.compute(*k);
+                    let Some(hooks) = self.hooks.as_ref() else { continue };
+                    if hooks.cancelled() {
+                        return false;
+                    }
+                    // Fine-grained progress between rounds, so a long pass reports steadily.
+                    if (i + 1).is_multiple_of(4096) {
+                        hooks.report((done + i + 1).min(total), total);
+                    }
+                }
+                done += dirty.len();
+                if let Some(hooks) = self.hooks.as_ref() {
+                    hooks.report(done.min(total), total);
                 }
                 if host.iterate && !host.members.is_empty() {
                     let passes = host.iterate_loops(&dirty, wb.calc.max_iterations, wb.calc.max_change);
@@ -1301,6 +1557,7 @@ impl Calc {
                 dirty.retain(|k| k.0 == sh);
             }
         }
+        true
     }
 }
 

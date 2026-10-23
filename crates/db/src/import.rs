@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+use quick_xml::Reader;
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesRef, BytesStart, Event};
-use quick_xml::Reader;
 use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, params_from_iter};
 
@@ -264,11 +264,7 @@ pub fn clean_formula(text: &str) -> String {
 }
 
 fn strip_param_prefix(n: String) -> String {
-    if let Some(rest) = n.strip_prefix("_xlpm.") {
-        rest.to_string()
-    } else {
-        n
-    }
+    if let Some(rest) = n.strip_prefix("_xlpm.") { rest.to_string() } else { n }
 }
 
 struct CellState {
@@ -392,14 +388,7 @@ fn stream_sheet<R: BufRead>(rd: R, shared: &[String], on_row: &mut dyn FnMut(u32
                                     if !raw_f.is_empty() {
                                         let clean = clean_formula(raw_f);
                                         let expr = gridcraft_formula::parse(&clean).ok();
-                                        shared_formulas.insert(
-                                            si,
-                                            SharedFormula {
-                                                anchor: (cell_row_0, cell_col_0),
-                                                expr,
-                                                text: clean.clone(),
-                                            },
-                                        );
+                                        shared_formulas.insert(si, SharedFormula { anchor: (cell_row_0, cell_col_0), expr, text: clean.clone() });
                                         formula = Some(clean);
                                     } else if let Some(sh) = shared_formulas.get(&si) {
                                         let dr = cell_row_0 as i64 - sh.anchor.0 as i64;
@@ -607,9 +596,8 @@ fn import_into(
             let mut insert_cell_stmt = conn.prepare_cached(
                 "INSERT OR REPLACE INTO _gc_cells (sheet, row, col, val_type, val_num, val_text, formula) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-            let mut insert_formula_stmt = conn.prepare_cached(
-                "INSERT OR REPLACE INTO _gc_formulas (sheet, row, col, formula) VALUES (?1, ?2, ?3, ?4)",
-            )?;
+            let mut insert_formula_stmt =
+                conn.prepare_cached("INSERT OR REPLACE INTO _gc_formulas (sheet, row, col, formula) VALUES (?1, ?2, ?3, ?4)")?;
 
             stream_sheet(rd, shared, &mut |row_no, cells, formulas| {
                 formula_cells += formulas;
@@ -627,15 +615,7 @@ fn import_into(
                         Some(Sql::Text(t)) => (Some("s"), None, Some(t.clone())),
                         _ => (None, None, None),
                     };
-                    insert_cell_stmt.execute(rusqlite::params![
-                        sheet,
-                        row_0,
-                        col_0,
-                        v_type,
-                        v_num,
-                        v_text,
-                        c.formula.as_deref(),
-                    ])?;
+                    insert_cell_stmt.execute(rusqlite::params![sheet, row_0, col_0, v_type, v_num, v_text, c.formula.as_deref(),])?;
                     if let Some(f) = &c.formula {
                         insert_formula_stmt.execute(rusqlite::params![sheet, row_0, col_0, f])?;
                     }
@@ -666,7 +646,7 @@ fn import_into(
                 }
                 conn.prepare_cached(sql)?.execute(params_from_iter(params))?;
                 rows += 1;
-                if rows % 25_000 == 0 {
+                if rows.is_multiple_of(25_000) {
                     progress(sheet, rows);
                 }
                 Ok(())

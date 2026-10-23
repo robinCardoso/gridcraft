@@ -1,3 +1,7 @@
+// Local machine-only benchmark (times a real workbook on this desktop); the wasm clock lint
+// doesn't apply: this test target never builds in the web app.
+#![allow(clippy::disallowed_methods)]
+
 use std::time::Instant;
 
 #[test]
@@ -28,13 +32,14 @@ fn test_inspect_cotacao_table() {
                 println!("    Col {}: name={}, formula={:?}", ci, c.name, c.formula);
             }
         }
-        for r in [14, 15, 16] { // Excel rows 15, 16, 17
+        for r in [14, 15, 16] {
+            // Excel rows 15, 16, 17
             for c in 0..12 {
                 let cell_ref = gridcraft_core::CellRef::new(r, c);
                 let cell = sh0.cell(cell_ref);
                 let f_str = cell.and_then(|x| x.formula.as_ref()).map(|f| &f.text);
                 let v_str = cell.map(|x| &x.value);
-                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r+1, c, cell_ref.a1(), f_str, v_str);
+                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r + 1, c, cell_ref.a1(), f_str, v_str);
             }
         }
     }
@@ -57,7 +62,7 @@ fn test_inspect_cotacao_table() {
                 let cell = sh1.cell(cell_ref);
                 let f_str = cell.and_then(|x| x.formula.as_ref()).map(|f| &f.text);
                 let v_str = cell.map(|x| &x.value);
-                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r+1, c, cell_ref.a1(), f_str, v_str);
+                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r + 1, c, cell_ref.a1(), f_str, v_str);
             }
         }
     }
@@ -71,7 +76,7 @@ fn test_inspect_cotacao_table() {
     println!("--- DETAILED EVAL OF F3 AND I3 ---");
     let sh1_idx = 1;
     let f3_ref = gridcraft_core::CellRef::new(2, 5);
-    
+
     // Test 1: LISTA_PRECO[@Referencia]
     let v1 = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, "LISTA_PRECO[@Referencia]");
     println!("Eval LISTA_PRECO[@Referencia] at F3: {:?}", v1);
@@ -82,17 +87,23 @@ fn test_inspect_cotacao_table() {
 
     // Test 3: PRECO_LIQUIDO[[#All],[Fornecedor]]
     let v3 = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, "PRECO_LIQUIDO[[#All],[Fornecedor]]");
-    println!("Eval PRECO_LIQUIDO[[#All],[Fornecedor]]: {:?}", match &v3 {
-        gridcraft_core::Value::Array(a) => format!("Array of {} elements", a.data.len()),
-        other => format!("{:?}", other),
-    });
+    println!(
+        "Eval PRECO_LIQUIDO[[#All],[Fornecedor]]: {:?}",
+        match &v3 {
+            gridcraft_core::Value::Array(a) => format!("Array of {} elements", a.data.len()),
+            other => format!("{:?}", other),
+        }
+    );
 
     // Test 4: REGRA_CST[]
     let v4 = gridcraft_calc::evaluate(&wb, sh1_idx, f3_ref, "REGRA_CST[]");
-    println!("Eval REGRA_CST[]: {:?}", match &v4 {
-        gridcraft_core::Value::Array(a) => format!("Array of {} elements", a.data.len()),
-        other => format!("{:?}", other),
-    });
+    println!(
+        "Eval REGRA_CST[]: {:?}",
+        match &v4 {
+            gridcraft_core::Value::Array(a) => format!("Array of {} elements", a.data.len()),
+            other => format!("{:?}", other),
+        }
+    );
 
     // Test 5: Full F3 formula
     let f3_cell = wb.sheet(sh1_idx).unwrap().cell(f3_ref);
@@ -127,7 +138,7 @@ fn test_inspect_cotacao_table() {
                 let cell = sh1.cell(cell_ref);
                 let f_str = cell.and_then(|x| x.formula.as_ref()).map(|f| &f.text);
                 let v_str = cell.map(|x| &x.value);
-                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r+1, c, cell_ref.a1(), f_str, v_str);
+                println!("  Row {}, Col {} ({}): formula={:?}, val={:?}", r + 1, c, cell_ref.a1(), f_str, v_str);
             }
         }
         // Assert that row 3 (index 2) calculated accurately

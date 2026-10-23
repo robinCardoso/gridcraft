@@ -385,6 +385,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "Un fichier CSV, une page web ou un PDF est une copie : le classeur conserve son propre fichier."
         }
         "Save the workbook under another name or in another folder." => "Enregistrer le classeur sous un autre nom ou dans un autre dossier.",
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "Enregistrement…",
+        "Calculating…" => "Calcul…",
+        "Solving…" => "Résolution…",
         "Print Active Sheets" => "Imprimer les feuilles actives",
         "Print Entire Workbook" => "Imprimer tout le classeur",
         "Fit Sheet on One Page" => "Ajuster la feuille sur une page",

@@ -1,7 +1,7 @@
 //! Table styles: how a cell inside a table looks (our own palettes, keyed by the familiar
 //! `TableStyleLight1…21 / Medium1…28 / Dark1…11` names so files round-trip).
 
-use gridcraft_core::{CellRef, RangeRef, MAX_ROWS};
+use gridcraft_core::{CellRef, MAX_ROWS, RangeRef};
 use gridcraft_model::*;
 
 /// (family, number) from a style name, e.g. `TableStyleMedium2` → ("Medium", 2).
@@ -262,11 +262,7 @@ pub(crate) fn write_totals(sh: &mut gridcraft_model::Sheet, ti: usize) {
         let c = CellRef::new(row, t.range.start.col + i as u32);
         if let Some(code) = col.totals.subtotal_code() {
             let f = format!("=SUBTOTAL({code},{}[{}])", t.name, col.name);
-            sh.set_cell(c, Cell {
-                formula: Some(std::sync::Arc::new(Formula::new(&f))),
-                value: gridcraft_core::Value::Empty,
-                style: sh.style_id(c),
-            });
+            sh.set_cell(c, Cell { formula: Some(std::sync::Arc::new(Formula::new(&f))), value: gridcraft_core::Value::Empty, style: sh.style_id(c) });
         } else if let Some(l) = &col.totals_label {
             sh.set_value(c, gridcraft_core::Value::text(l.as_str()));
         } else {
@@ -311,18 +307,14 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
 
             // Find contiguous non-empty rows extending beyond data_end
             let Some(sh) = cx.wb.sheet(si) else { continue };
-            let has_content = |c: CellRef| -> bool {
-                sh.cell(c).is_some_and(|cl| !cl.value.is_empty() || cl.formula.is_some())
-            };
+            let has_content = |c: CellRef| -> bool { sh.cell(c).is_some_and(|cl| !cl.value.is_empty() || cl.formula.is_some()) };
 
             let mut curr_end = data_end;
             while curr_end + 1 < MAX_ROWS {
                 let next_row = curr_end + 1;
 
                 // Stop if next_row intersects any other table on this sheet
-                if sh.tables.iter().enumerate().any(|(other_ti, other)| {
-                    other_ti != ti && other.range.contains(CellRef::new(next_row, c0))
-                }) {
+                if sh.tables.iter().enumerate().any(|(other_ti, other)| other_ti != ti && other.range.contains(CellRef::new(next_row, c0))) {
                     break;
                 }
 
@@ -356,11 +348,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
             for (col_idx, table_col) in t.columns.iter().enumerate() {
                 let col = c0 + col_idx as u32;
                 let template_cell = CellRef::new(old_template_row, col);
-                let template_formula = if old_template_row >= data_start {
-                    sh.cell(template_cell).and_then(|c| c.formula.clone())
-                } else {
-                    None
-                };
+                let template_formula = if old_template_row >= data_start { sh.cell(template_cell).and_then(|c| c.formula.clone()) } else { None };
                 let col_formula_str = table_col.formula.clone();
                 col_formulas.push((template_formula, col_formula_str));
                 col_styles.push(sh.style_id(template_cell));
@@ -377,7 +365,7 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                 for (col_idx, (template_formula, col_formula_str)) in col_formulas.iter().enumerate() {
                     let col = c0 + col_idx as u32;
                     let target_cell = CellRef::new(r, col);
-                    let is_empty = shm.cell(target_cell).map_or(true, |c| c.value.is_empty() && c.formula.is_none());
+                    let is_empty = shm.cell(target_cell).is_none_or(|c| c.value.is_empty() && c.formula.is_none());
                     let style = col_styles[col_idx];
 
                     if is_empty {
@@ -404,21 +392,16 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         };
 
                         if let Some(formula) = new_formula {
-                            shm.set_cell(target_cell, Cell {
-                                value: gridcraft_core::Value::Empty,
-                                formula: Some(std::sync::Arc::new(formula)),
-                                style,
-                            });
+                            shm.set_cell(
+                                target_cell,
+                                Cell { value: gridcraft_core::Value::Empty, formula: Some(std::sync::Arc::new(formula)), style },
+                            );
                             new_touched.push(target_cell);
                         } else if shm.style_id(target_cell) != style {
                             if let Some(cl) = shm.cells.get_mut(target_cell) {
                                 cl.style = style;
                             } else {
-                                shm.set_cell(target_cell, Cell {
-                                    value: gridcraft_core::Value::Empty,
-                                    formula: None,
-                                    style,
-                                });
+                                shm.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula: None, style });
                             }
                         }
                     }
@@ -439,10 +422,10 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
             }
 
             // Update sheet autofilter range if it was matching the old table range
-            if let Some(af) = shm.autofilter.as_mut() {
-                if af.range == old_table_range {
-                    af.range.end.row = new_end_row;
-                }
+            if let Some(af) = shm.autofilter.as_mut()
+                && af.range == old_table_range
+            {
+                af.range.end.row = new_end_row;
             }
 
             for cell in new_touched {

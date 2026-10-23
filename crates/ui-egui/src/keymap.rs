@@ -97,7 +97,10 @@ pub fn lookup(key: Key, physical: Option<Key>, m: Modifiers, mac: bool) -> Optio
         L if cmd && mac => run("home.alignLeft"),
         L if ctrl && mac => Shortcut::Dialog("defineName", json!({})),
         U if ctrl && mac && !s => Shortcut::Edit,
-        L if cmd => run("insert.table"),
+        // Windows/Linux Ctrl+L opens Find & Replace on the Find tab (Excel's pt-BR binding;
+        // Ctrl+T keeps Insert Table). macOS keeps Cmd+L = Align Left and Ctrl+L = Define Name
+        // above, as Excel for Mac does.
+        L if cmd => Shortcut::Dialog("find", json!({})),
         E if cmd && mac && !s => run("home.alignCenter"),
         E if ctrl && mac && !s => run("edit.flashFill"),
         F if cmd && s && !mac => Shortcut::Dialog("formatCells", json!({"tab": "Font"})),

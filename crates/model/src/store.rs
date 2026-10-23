@@ -1,7 +1,8 @@
 //! Copy-on-write sparse cell storage.
 //!
-//! Cells live in bands of 64 rows, each band behind an `Arc`. Cloning a store (an undo snapshot)
-//! copies only the band pointers; editing a cell copies just its band.
+//! Cells live in bands of 64 rows, each band behind an `Arc`. The band map itself sits behind an
+//! `Arc` too: cloning a store (Sheet clone / undo snapshot) copies one pointer; editing a cell
+//! copies the band map once, then just the touched band.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,6 +14,19 @@ use crate::cell::Cell;
 
 const BAND: u32 = 64;
 
+/// Whether two cells carry the same user-facing content for undo history: formula text/array and
+/// style always count; the cached value counts only when neither side has a formula (constants).
+fn content_eq(a: &Cell, b: &Cell) -> bool {
+    if a.style != b.style || a.formula != b.formula {
+        return false;
+    }
+    match (&a.formula, &b.formula) {
+        (Some(_), Some(_)) => true,
+        (None, None) => a.value == b.value,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Band {
     /// row → (col → cell)
@@ -20,27 +34,46 @@ struct Band {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CellStore {
+struct Inner {
     bands: BTreeMap<u32, Arc<Band>>,
     len: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CellStore {
+    inner: Arc<Inner>,
+}
+
+impl PartialEq for CellStore {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) || *self.inner == *other.inner
+    }
 }
 
 impl CellStore {
     pub fn new() -> Self {
         Self::default()
     }
+    fn inner_mut(&mut self) -> &mut Inner {
+        Arc::make_mut(&mut self.inner)
+    }
     pub fn len(&self) -> usize {
-        self.len
+        self.inner.len
     }
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.inner.len == 0
+    }
+    /// Whether `self` and `other` still share the same band map (true after clone, false after either mutates).
+    pub fn shares_storage_with(&self, other: &CellStore) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
     pub fn get(&self, c: CellRef) -> Option<&Cell> {
-        self.bands.get(&(c.row / BAND))?.rows.get(&c.row)?.get(&c.col)
+        self.inner.bands.get(&(c.row / BAND))?.rows.get(&c.row)?.get(&c.col)
     }
-    /// Mutable access (copies the band if shared).
+    /// Mutable access (copies the store and band if shared).
     pub fn get_mut(&mut self, c: CellRef) -> Option<&mut Cell> {
-        let band = self.bands.get_mut(&(c.row / BAND))?;
+        let inner = self.inner_mut();
+        let band = inner.bands.get_mut(&(c.row / BAND))?;
         if !band.rows.get(&c.row).is_some_and(|r| r.contains_key(&c.col)) {
             return None;
         }
@@ -52,14 +85,16 @@ impl CellStore {
             self.remove(c);
             return;
         }
-        let band = Arc::make_mut(self.bands.entry(c.row / BAND).or_default());
+        let inner = self.inner_mut();
+        let band = Arc::make_mut(inner.bands.entry(c.row / BAND).or_default());
         if band.rows.entry(c.row).or_default().insert(c.col, cell).is_none() {
-            self.len += 1;
+            inner.len += 1;
         }
     }
     pub fn remove(&mut self, c: CellRef) -> Option<Cell> {
         let key = c.row / BAND;
-        let band = self.bands.get_mut(&key)?;
+        let inner = self.inner_mut();
+        let band = inner.bands.get_mut(&key)?;
         if !band.rows.get(&c.row).is_some_and(|r| r.contains_key(&c.col)) {
             return None;
         }
@@ -70,40 +105,46 @@ impl CellStore {
             b.rows.remove(&c.row);
         }
         if b.rows.is_empty() {
-            self.bands.remove(&key);
+            inner.bands.remove(&key);
         }
         if old.is_some() {
-            self.len -= 1;
+            inner.len -= 1;
         }
         old
     }
     /// Cells in `r`, row-major. Efficient for sparse data: skips empty bands and rows.
     pub fn iter_range(&self, r: RangeRef) -> impl Iterator<Item = (CellRef, &Cell)> + '_ {
         let (b0, b1) = (r.start.row / BAND, r.end.row / BAND);
-        self.bands.range(b0..=b1).flat_map(move |(_, band)| {
+        self.inner.bands.range(b0..=b1).flat_map(move |(_, band)| {
             band.rows
                 .range(r.start.row..=r.end.row)
                 .flat_map(move |(row, cols)| cols.range(r.start.col..=r.end.col).map(move |(col, cell)| (CellRef::new(*row, *col), cell)))
         })
     }
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, &Cell)> + '_ {
-        self.bands
+        self.inner
+            .bands
             .values()
             .flat_map(|band| band.rows.iter().flat_map(|(row, cols)| cols.iter().map(move |(col, cell)| (CellRef::new(*row, *col), cell))))
     }
     /// Cells of one row in `c0..=c1`.
     pub fn row(&self, row: u32, c0: u32, c1: u32) -> impl Iterator<Item = (u32, &Cell)> + '_ {
-        self.bands.get(&(row / BAND)).and_then(|b| b.rows.get(&row)).into_iter().flat_map(move |cols| cols.range(c0..=c1).map(|(c, cell)| (*c, cell)))
+        self.inner
+            .bands
+            .get(&(row / BAND))
+            .and_then(|b| b.rows.get(&row))
+            .into_iter()
+            .flat_map(move |cols| cols.range(c0..=c1).map(|(c, cell)| (*c, cell)))
     }
     /// Smallest range containing every stored cell, `None` when empty.
     pub fn used_range(&self) -> Option<RangeRef> {
-        let first_band = self.bands.values().next()?;
-        let last_band = self.bands.values().next_back()?;
+        let first_band = self.inner.bands.values().next()?;
+        let last_band = self.inner.bands.values().next_back()?;
         let r0 = *first_band.rows.keys().next()?;
         let r1 = *last_band.rows.keys().next_back()?;
         let mut c0 = u32::MAX;
         let mut c1 = 0;
-        for band in self.bands.values() {
+        for band in self.inner.bands.values() {
             for cols in band.rows.values() {
                 if let (Some(a), Some(b)) = (cols.keys().next(), cols.keys().next_back()) {
                     c0 = c0.min(*a);
@@ -121,16 +162,29 @@ impl CellStore {
         self.get(c).is_some_and(|cell| !cell.value.is_empty() || cell.formula.is_some())
     }
     /// Positions whose cells differ between `self` and `other` (stored on one side only, or not
-    /// equal). Bands both stores share are skipped, so comparing an edited copy with the store
-    /// it was cloned from only visits the bands the edit touched.
+    /// equal). Stores that share the same inner `Arc`, and bands both stores share, are skipped.
     pub fn diff(&self, other: &CellStore) -> Vec<CellRef> {
+        self.diff_by(other, |a, b| a != b)
+    }
+
+    /// Like [`Self::diff`], but formula cells compare by formula and style only — cached values
+    /// from recalculation are ignored. Used for undo-by-diff so a cascade of value updates does
+    /// not inflate the patch to every dependent cell.
+    pub fn content_diff(&self, other: &CellStore) -> Vec<CellRef> {
+        self.diff_by(other, |a, b| !content_eq(a, b))
+    }
+
+    fn diff_by(&self, other: &CellStore, differ: impl Fn(&Cell, &Cell) -> bool) -> Vec<CellRef> {
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return Vec::new();
+        }
         let empty = Band::default();
-        let mut keys: Vec<u32> = self.bands.keys().chain(other.bands.keys()).copied().collect();
+        let mut keys: Vec<u32> = self.inner.bands.keys().chain(other.inner.bands.keys()).copied().collect();
         keys.sort_unstable();
         keys.dedup();
         let mut out = Vec::new();
         for k in keys {
-            let (a, b) = (self.bands.get(&k), other.bands.get(&k));
+            let (a, b) = (self.inner.bands.get(&k), other.inner.bands.get(&k));
             if let (Some(a), Some(b)) = (a, b)
                 && Arc::ptr_eq(a, b)
             {
@@ -139,8 +193,9 @@ impl CellStore {
             let (a, b) = (a.map_or(&empty, |x| x), b.map_or(&empty, |x| x));
             for (row, cols) in &a.rows {
                 for (col, cell) in cols {
-                    if b.rows.get(row).and_then(|r| r.get(col)) != Some(cell) {
-                        out.push(CellRef::new(*row, *col));
+                    match b.rows.get(row).and_then(|r| r.get(col)) {
+                        Some(other) if !differ(cell, other) => {}
+                        _ => out.push(CellRef::new(*row, *col)),
                     }
                 }
             }
@@ -170,6 +225,16 @@ impl CellStore {
             let nr = c.row as i64 + delta;
             if (0..gridcraft_core::MAX_ROWS as i64).contains(&nr) {
                 self.set(CellRef::new(nr as u32, c.col), cell);
+            }
+        }
+    }
+    /// Moves every cell to the row `f` gives for its current row (cells mapped to `None` or off
+    /// the sheet are dropped) in one pass — the batch form of many [`Self::shift_rows`] calls.
+    pub fn remap_rows(&mut self, f: impl Fn(u32) -> Option<u32>) {
+        let old = std::mem::take(self);
+        for (c, cell) in old.iter() {
+            if let Some(nr) = f(c.row).filter(|r| *r < gridcraft_core::MAX_ROWS) {
+                self.set(CellRef::new(nr, c.col), cell.clone());
             }
         }
     }
@@ -245,6 +310,19 @@ mod tests {
     }
 
     #[test]
+    fn clone_shares_inner_until_edit() {
+        let mut s = CellStore::new();
+        for r in 0..10_000 {
+            s.set(c(r, 0), Cell::value((r as f64).into()));
+        }
+        let snap = s.clone();
+        assert!(std::sync::Arc::ptr_eq(&s.inner, &snap.inner));
+        s.set(c(5, 0), Cell::value(99.0.into()));
+        assert!(!std::sync::Arc::ptr_eq(&s.inner, &snap.inner));
+        assert_eq!(snap.get(c(5, 0)).unwrap().value, Value::Number(5.0));
+    }
+
+    #[test]
     fn diff_visits_changed_bands() {
         let mut s = CellStore::new();
         for r in 0..1000 {
@@ -256,6 +334,18 @@ mod tests {
         s.set(c(700, 3), Cell::value("new".into()));
         s.remove(c(900, 0));
         assert_eq!(snap.diff(&s), [c(5, 0), c(700, 3), c(900, 0)]);
+    }
+
+    #[test]
+    fn content_diff_skips_formula_value_churn() {
+        let mut s = CellStore::new();
+        s.set(c(0, 0), Cell { value: 1.0.into(), formula: Some(std::sync::Arc::new(crate::cell::Formula::new("=1+1"))), style: Default::default() });
+        let snap = s.clone();
+        s.get_mut(c(0, 0)).unwrap().value = 2.0.into();
+        assert!(s.content_diff(&snap).is_empty());
+        assert_eq!(s.diff(&snap), [c(0, 0)]);
+        s.get_mut(c(0, 0)).unwrap().formula = Some(std::sync::Arc::new(crate::cell::Formula::new("=2+2")));
+        assert_eq!(s.content_diff(&snap), [c(0, 0)]);
     }
 
     #[test]

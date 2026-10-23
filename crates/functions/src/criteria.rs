@@ -128,15 +128,8 @@ impl Criterion {
         } else if let Some(e) = CellError::parse(rest) {
             Operand::Error(e)
         } else {
-            let tokens = if has_wildcards(rest) {
-                Some(tokenize(rest))
-            } else {
-                None
-            };
-            Operand::Text {
-                pat: rest.to_string(),
-                tokens,
-            }
+            let tokens = if has_wildcards(rest) { Some(tokenize(rest)) } else { None };
+            Operand::Text { pat: rest.to_string(), tokens }
         };
         Criterion { op, operand, bare_empty: false }
     }
@@ -247,7 +240,6 @@ fn cmp_op(op: Op, o: Ordering) -> bool {
     }
 }
 
-
 fn tokenize(pattern: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut it = pattern.chars();
@@ -276,6 +268,23 @@ fn lower_chars(s: &str) -> Vec<char> {
 }
 
 /// Whether the pattern contains an unescaped wildcard.
+/// The operand of a pure equality criterion (`"x"`, `"=x"`, a number, a boolean) with no
+/// wildcards, for hosts that index a range by value (`COUNTIFS`/`SUMIFS` over a big table).
+/// `None` for comparisons, wildcards, blanks, errors and over-long criteria, where a linear
+/// scan is the accurate answer (and the only one that reports Excel's errors).
+pub fn equality_operand(crit: &Value) -> Option<Value> {
+    let c = Criterion::parse_arg(crit).ok()?;
+    if c.op != Op::Eq || c.bare_empty {
+        return None;
+    }
+    match c.operand {
+        Operand::Number(n) => Some(Value::Number(n)),
+        Operand::Bool(b) => Some(Value::Bool(b)),
+        Operand::Text { pat, tokens: None } => Some(Value::Text(pat.into())),
+        _ => None,
+    }
+}
+
 pub fn has_wildcards(pattern: &str) -> bool {
     if !pattern.bytes().any(|b| b == b'*' || b == b'?' || b == b'~') {
         return false;

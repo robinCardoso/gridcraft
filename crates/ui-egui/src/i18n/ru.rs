@@ -387,6 +387,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "CSV-файл, веб-страница или PDF — это копия: книга остаётся в своём файле."
         }
         "Save the workbook under another name or in another folder." => "Сохранить книгу под другим именем или в другой папке.",
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "Сохранение…",
+        "Calculating…" => "Вычисление…",
+        "Solving…" => "Поиск решения…",
         "Print Active Sheets" => "Напечатать активные листы",
         "Print Entire Workbook" => "Напечатать всю книгу",
         "Fit Sheet on One Page" => "Вписать лист на одну страницу",

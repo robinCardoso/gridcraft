@@ -646,14 +646,20 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
     for _ in 0..steps {
         let Some(e) = d.undo.pop() else { break };
         // Redo goes back to the undone edit's cells, not wherever the user clicked before undoing (#1855).
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: e.selection.clone() };
+        let cur = crate::HistoryEntry {
+            label: e.label.clone(),
+            state: crate::invert_history_state(e.state.clone(), &d.wb),
+            selection: e.selection.clone(),
+        };
         d.redo.push(cur);
         label = e.label.clone();
-        d.wb = e.wb;
+        crate::apply_history_state(d, &e.state);
         d.selection = e.selection;
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
-    d.calc.rebuild(&d.wb);
+    // Diff cell steps already refreshed nodes via `cells_changed` in `apply_history_state`.
+    // Snapshot steps invalidated the graph; rebuild only then (same skip as F9's `ensure_graph`).
+    d.calc.ensure_graph(&d.wb);
     d.revision += 1;
     Ok(json!({"undone": label}))
 }
@@ -665,14 +671,18 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
     let now = d.wb.clone();
     for _ in 0..steps {
         let Some(e) = d.redo.pop() else { break };
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone() };
+        let cur = crate::HistoryEntry {
+            label: e.label.clone(),
+            state: crate::invert_history_state(e.state.clone(), &d.wb),
+            selection: d.selection.clone(),
+        };
         d.undo.push(cur);
         label = e.label.clone();
-        d.wb = e.wb;
+        crate::apply_history_state(d, &e.state);
         d.selection = e.selection;
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
-    d.calc.rebuild(&d.wb);
+    d.calc.ensure_graph(&d.wb);
     d.revision += 1;
     Ok(json!({"redone": label}))
 }
@@ -829,8 +839,7 @@ fn paste_as_text(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn paste(s: &mut Session, p: &Json) -> Result<Json> {
-    let as_text = bool_param(p, "asText").or_else(|| bool_param(p, "as_text")).unwrap_or(false)
-        || str_param(p, "what") == Some("text");
+    let as_text = bool_param(p, "asText").or_else(|| bool_param(p, "as_text")).unwrap_or(false) || str_param(p, "what") == Some("text");
 
     let clip_text = s.clipboard.as_ref().map(|c| c.text.clone());
     // External text (from the system clipboard) when it differs from ours, or when asText is requested.
@@ -853,11 +862,7 @@ fn paste_text(s: &mut Session, p: &Json, text: &str, as_text: bool) -> Result<Js
     let at = cell_param_on(s, p, "at", sheet)?.unwrap_or(s.doc()?.selection.current().start);
     let rows: Vec<Vec<String>> = parse_tsv(text);
     // The HTML flavour, when the host passed it: the number behind each cell's shown text.
-    let html = if as_text {
-        Vec::new()
-    } else {
-        str_param(p, "html").map(crate::clip_html::table_cells).unwrap_or_default()
-    };
+    let html = if as_text { Vec::new() } else { str_param(p, "html").map(crate::clip_html::table_cells).unwrap_or_default() };
     let h = rows.len();
     let w = rows.iter().map(Vec::len).max().unwrap_or(0);
     edit(s, |cx| {
@@ -1258,10 +1263,20 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
 
 /// Applies a reference adjustment to every cell formula and defined name in the workbook.
 pub(crate) fn rewrite_all_formulas(wb: &mut gridcraft_model::Workbook, target: &str, e: &gridcraft_formula::adjust::Edit) {
+    rewrite_all_formulas_edits(wb, target, std::slice::from_ref(e));
+}
+
+/// [`rewrite_all_formulas`] for several edits (oldest first) in one pass: each formula is parsed and
+/// printed once instead of once per edit.
+pub(crate) fn rewrite_all_formulas_edits(wb: &mut gridcraft_model::Workbook, target: &str, edits: &[gridcraft_formula::adjust::Edit]) {
     use gridcraft_formula::adjust::Edit;
+    if edits.is_empty() {
+        return;
+    }
     // Rows and columns inserted or deleted on the target sheet move its legacy array ranges too
     // (a cut moves its arrays itself).
-    let moves_arrays = matches!(e, Edit::Insert { .. } | Edit::Delete { .. } | Edit::InsertCells { .. } | Edit::DeleteCells { .. });
+    let moves_arrays =
+        edits.iter().any(|e| matches!(e, Edit::Insert { .. } | Edit::Delete { .. } | Edit::InsertCells { .. } | Edit::DeleteCells { .. }));
     for si in 0..wb.sheets.len() {
         let host = wb.sheets.get(si).map(|s| s.name.clone()).unwrap_or_default();
         let keys: Vec<(CellRef, std::sync::Arc<Formula>)> =
@@ -1273,10 +1288,10 @@ pub(crate) fn rewrite_all_formulas(wb: &mut gridcraft_model::Workbook, target: &
         let Some(sheet) = wb.sheet_mut(si) else { continue };
         for (c, f) in keys {
             let Some(expr) = f.expr() else { continue };
-            let new = gridcraft_formula::adjust::adjust(expr, &host, target, e);
+            let new = gridcraft_formula::adjust::adjust_edits(expr, &host, target, edits);
             let text = gridcraft_formula::print(&new);
             let array = match f.array {
-                Some(a) if on_target => super::sheet::map_range(a, e),
+                Some(a) if on_target => edits.iter().try_fold(a, super::sheet::map_range),
                 a => a,
             };
             if (text != f.text || array != f.array)
@@ -1291,7 +1306,7 @@ pub(crate) fn rewrite_all_formulas(wb: &mut gridcraft_model::Workbook, target: &
     for n in wb.names.iter_mut() {
         if let Ok(expr) = gridcraft_formula::parse(&n.formula) {
             // Names are workbook-level: unqualified refs don't occur; qualified ones adjust.
-            let new = gridcraft_formula::adjust::adjust(expr, "\u{0}", target, e);
+            let new = gridcraft_formula::adjust::adjust_edits(expr, "\u{0}", target, edits);
             n.formula = gridcraft_formula::print(&new);
         }
     }
@@ -1562,8 +1577,15 @@ fn find(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(EngineError::Other(format!("We couldn't find what you were looking for: {what}")));
     }
     if all {
-        let list: Vec<Json> =
-            hits.iter().map(|(si, c, t)| json!({"sheet": d.wb.sheet(*si).map(|s| s.name.clone()), "cell": c.a1(), "value": t})).collect();
+        let list: Vec<Json> = hits
+            .iter()
+            .map(|(si, c, t)| {
+                // The formula travels with the hit so the results table can show Value *and*
+                // Formula (the engine's own input text, "=…"), as the reference dialog does.
+                let formula = d.wb.sheet(*si).filter(|sh| sh.cell(*c).is_some_and(|cell| cell.formula.is_some())).map(|sh| sh.input_text(*c));
+                json!({"sheet": d.wb.sheet(*si).map(|s| s.name.clone()), "cell": c.a1(), "value": t, "formula": formula})
+            })
+            .collect();
         return Ok(json!({"count": list.len(), "results": list}));
     }
     // Next hit after the active cell.

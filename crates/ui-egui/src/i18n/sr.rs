@@ -379,6 +379,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "CSV fajl, veb stranica ili PDF su kopija: radna sveska zadržava svoj fajl."
         }
         "Save the workbook under another name or in another folder." => "Sačuvaj radnu svesku pod drugim imenom ili u drugoj fascikli.",
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "Čuvanje…",
+        "Calculating…" => "Proračun…",
+        "Solving…" => "Rešavanje…",
         "Print Active Sheets" => "Štampaj aktivne listove",
         "Print Entire Workbook" => "Štampaj celu radnu svesku",
         "Fit Sheet on One Page" => "Uklopi list na jednu stranicu",

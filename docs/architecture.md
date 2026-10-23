@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (created from the code on main; supersedes the local-only plan/architecture.md for committed docs) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-22 · **Last updated:** 2026-10-22 · **Change:** minor (added the never-freeze pattern) · **Target:** Microsoft Excel (Microsoft 365)
 
 How GridCraft is built today. Rules for contributors are in [`AGENTS.md`](../AGENTS.md).
 
@@ -16,12 +16,12 @@ including tests, 2026-10-10.
 | L0 | `numfmt` | ~2.1k | Excel number-format codes (sections, conditions, colours, dates, elapsed time, fractions, scientific, fill), General, `TEXT()`; en-US only |
 | L1 | `formula` | ~1.7k | Tokenizer, parser, AST, printer (A1 and R1C1), reference adjustment for copy, fill and structural edits |
 | L1 | `functions` | ~13.4k | The function library: `FnSpec` registry (name, arity, category, scalar args, signature, description) and pure implementations; automatic array lifting |
-| L2 | `model` | ~2.2k | Workbook, sheets, copy-on-write cell store (64-row bands behind `Arc`), interned styles, names, tables, CF, validation, comments, charts, shapes, images, sparklines, print settings, protection |
+| L2 | `model` | ~2.2k | Workbook, sheets, copy-on-write cell store (`CellStore` behind an `Arc` of 64-row bands), interned styles, names, tables, CF, validation, comments, charts, shapes, images, sparklines, print settings, protection |
 | L2 | `calc` | ~2.9k | Evaluator (references, names, tables, LET/LAMBDA, special forms like OFFSET/INDIRECT/SUBTOTAL) and dependency-graph recalculation with dynamic arrays, spills and cycle detection; single-threaded |
 | L2 | `xlsx` | ~10.7k | XLSX read/write (transitional and strict read), CSV/TSV, XLSB and ODS data import, PivotTable caches, DrawingML charts and drawings; byte slices only (WASM-safe); lenient reader that reports warnings |
 | L2 | `pdf` | ~1k | Small PDF 1.7 writer (14 standard fonts, vectors, images) for print and export |
 | L3 | `chart` | ~2.9k | Toolkit-free chart layout to drawing primitives, a rasterizer, sparklines |
-| L5 | `engine` | ~17.7k | `Session`: open workbooks, selection, history (COW snapshots), clipboard, fill, sort, filter, PivotTables, what-if, print, file I/O (`io.rs`), and the command registry (`cmd/*`, 313 commands) with the Excel ribbon catalog (`catalog.rs`) |
+| L5 | `engine` | ~17.7k | `Session`: open workbooks, selection, history (cell/meta diffs or COW snapshots), clipboard, fill, sort, filter, PivotTables, what-if, print, file I/O (`io.rs`), and the command registry (`cmd/*`, 313 commands) with the Excel ribbon catalog (`catalog.rs`) |
 | L6 | `ui-egui` | ~11.6k | Excel-style UI (title bar, QAT, ribbon, formula bar, virtualised grid, editor, tabs, status bar, dialogs, task panes, chart view) and the control channel |
 | L6 | `mcp` | ~1.4k | MCP server over stdio (hand-written JSON-RPC), headless or bridged to a running app |
 | L7 | `apps/gridcraft`, `apps/gridcraft-cli`, `apps/gridcraft-web` | ~2.2k | Desktop (eframe/wgpu), CLI (`info`, `convert`, `eval`, `cat`, `run`, `commands`, `functions`, `mcp`, `send`), web (WASM via trunk) |
@@ -34,7 +34,7 @@ including tests, 2026-10-10.
    enabled, run, journal, undoable }`; ids follow Excel's ribbon (`home.bold`, `insert.chart`,
    `data.sortAscending`) plus primitives (`cell.set`, `selection.set`, `range.setValues`).
    `Session::execute` catches escaped panics and restores the workbook (never-crash guard).
-2. **Edits** change the model through copy-on-write bands; undo keeps the previous snapshot.
+2. **Edits** change the model through copy-on-write bands; undo keeps a cell/meta diff when possible, else a COW snapshot.
 3. **Recalc** marks dependents of changed cells dirty through the dependency graph (with range
    nodes for range dependents), evaluates in topological order, spills dynamic arrays and reports
    `#SPILL!`/cycles. Volatile functions are always dirty.
@@ -57,6 +57,39 @@ macOS universal, Windows x64/x86/arm64, Linux x86_64/aarch64/riscv64 (AppImage, 
 rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 `.github/workflows/release.yml`; see [`releasing.md`](releasing.md).
 
+## Never freeze the UI
+
+No user action may block the interface thread for more than ~50 ms (a frame is 16 ms); the
+frame watchdog logs frames over 100 ms. Short commands run inline; long work runs in the
+background with progress and a cancel button. Plan and history:
+[`plano-responsividade.md`](plano-responsividade.md).
+
+- **Jobs** (`ui-egui/src/jobs.rs`): `JobManager` runs one `std::thread` per job with an `mpsc`
+  channel and an `AtomicBool` for cancellation; `poll` runs every frame. On wasm the work runs
+  inside the frame behind the same API. Kinds: save, export (CSV/HTML), calculation, analysis
+  (Solver, Goal Seek). Opens use the single async loader `open_document_async` in `lib.rs`.
+- **Pure engine steps, no `Session`**: `SavePlan::prepare` (cheap, UI thread) and
+  `SavePlan::execute` (serialise + atomic write; `file.save` runs both inline), `recalc_document`
+  with `CalcHooks` (progress, cancel) and `CalcSeeds` (same result as a synchronous recalc), and
+  `run_analysis` on a private session over a snapshot. Jobs work on an `Arc<Workbook>` snapshot.
+- **Applying results is guarded**: a result applies only if the document uid, the snapshot
+  (`Arc::ptr_eq`) and the format still match. An edit during a calculation cancels it and queues
+  a new one. `saved` is the snapshot actually written, so `is_dirty` stays right when edits land
+  mid-save. Only one save job runs per document; AutoSave waits 5 s after the last edit and
+  writes with deflate level 1 (manual save uses 6).
+- **Deferred recalculation**: when the interface turns on `defer_structural` (graph above
+  `job_thresholds.calc_formulas`), structural commands and cascades over `CASCADE_JOB_CELLS`
+  (5 000) set `recalc_pending` instead of recalculating; the calculation job settles it and
+  `formulas.calculateNow` settles it inline. The CLI, tests and the control channel never turn
+  it on, so their contract stays synchronous (as does `app.open` over control/MCP).
+- **Guard rails**: `cargo xtask layers` includes a freeze guard that bans `save_bytes`,
+  `recalc_all`, `recalc_sheet`, `cells_changed`, `write_file` and `dbfile::save` in
+  `crates/ui-egui/src` **and in the desktop shell** (`apps/gridcraft/src`), and `load_document`
+  outside `lib.rs`. The CLI is a batch engine client (like the engine), so it is not scanned.
+  Cheap `std::fs` metadata reads (recent files, fonts, theme, screenshots) are allowed on
+  purpose. `cargo xtask perf [--rows N] [--budget MS]` runs every command over a generated corpus
+  and fails past the budget; Ctrl+Alt+Shift+P shows the slowest commands at run time.
+
 ## Known architectural gaps
 
 - No threading in calc (see [hardware-parity.md](hardware-parity.md)).
@@ -69,3 +102,4 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-10 | major | Created from the code on main: crates, layers, data flow, agent control, known gaps |
+| 2026-10-22 | minor | Added "Never freeze the UI": jobs, SavePlan, deferred recalculation, apply guards, freeze guard and perf budget |

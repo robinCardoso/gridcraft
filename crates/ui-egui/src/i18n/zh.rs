@@ -379,6 +379,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Download" => "下载",
         "A CSV file, web page or PDF is a copy: the workbook keeps its own file." => "CSV 文件、网页或 PDF 只是副本：工作簿仍保留其原文件。",
         "Save the workbook under another name or in another folder." => "以其他名称或在其他文件夹中保存工作簿。",
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "正在保存…",
+        "Calculating…" => "正在计算…",
+        "Solving…" => "正在求解…",
         "Print Active Sheets" => "打印活动工作表",
         "Print Entire Workbook" => "打印整个工作簿",
         "Fit Sheet on One Page" => "将工作表调整为一页",

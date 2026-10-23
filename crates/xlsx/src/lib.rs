@@ -138,6 +138,12 @@ pub fn write_xlsx_as(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> 
     write::write_xlsx(wb, kind)
 }
 
+/// Writes a workbook as the given member of the `.xlsx` family with an explicit deflate level:
+/// 6 for a manual save, 1 for the fast AutoSave (docs/plano-responsividade.md, Fase 2).
+pub fn write_xlsx_with(wb: &Workbook, kind: XlsxKind, level: i64) -> Result<Vec<u8>, IoError> {
+    write::write_xlsx_with(wb, kind, level)
+}
+
 /// CSV import options.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CsvOptions {

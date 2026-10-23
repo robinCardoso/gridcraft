@@ -49,6 +49,24 @@ fn err(e: CellError) -> Ev {
     Ev::V(Value::Error(e))
 }
 
+/// The intersection of two ascending position lists (the COUNTIFS/SUMIFS fast path).
+fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
 /// What the evaluator needs from its surroundings.
 pub trait Host {
     fn workbook(&self) -> &Workbook;
@@ -75,6 +93,18 @@ pub trait Host {
     /// until `f` returns false. `false` when this host can't (callers use `range_values`).
     fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
         false
+    }
+    /// The range's values as an array, memoized for the pass when the host can: the same range is
+    /// often read by many formulas (a lookup table, a SUMIFS criteria range). `None` falls back to
+    /// [`Host::range_values`]. Values are stable within a pass, so a hit is exact.
+    fn range_array(&mut self, _sheet: usize, _range: RangeRef) -> Option<Value> {
+        None
+    }
+    /// Positions (row-major, 0-based) of the range's cells equal to `needle`, from a per-pass
+    /// equality index; `None` when the host does not index it (the caller scans). Used by the
+    /// COUNTIFS/SUMIFS fast path (docs/plano-responsividade.md, Fase 3).
+    fn equality_positions(&mut self, _sheet: usize, _range: RangeRef, _needle: &Value) -> Option<std::sync::Arc<Vec<u32>>> {
+        None
     }
     /// Exact lookup index for a range column: returns the first matching row for `needle`,
     /// or None if not found.
@@ -159,7 +189,14 @@ pub fn is_expr_invariant(e: &Expr, variant_names: &std::collections::HashSet<&st
                 _ => {}
             },
             Expr::Name(n) if variant_names.contains(n.as_str()) => ok = false,
-            Expr::Call(n, _) if matches!(n.as_str(), "ROW" | "COLUMN" | "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY" | "INDIRECT" | "OFFSET" | "CELL") => ok = false,
+            Expr::Call(n, _)
+                if matches!(
+                    n.as_str(),
+                    "ROW" | "COLUMN" | "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY" | "INDIRECT" | "OFFSET" | "CELL"
+                ) =>
+            {
+                ok = false
+            }
             Expr::Unary(UnOp::At, _) => ok = false,
             _ => {}
         }
@@ -267,6 +304,12 @@ impl<'h> Evaluator<'h> {
         let (h, w) = (range.height() as usize, range.width() as usize);
         if (h as u64) * (w as u64) > MAX_CELLS {
             return Value::Error(CellError::Num);
+        }
+        // The same range is read by many formulas (lookup tables, SUMIFS criteria): a host that
+        // keeps it materialized turns every later read into a pointer clone
+        // (docs/plano-responsividade.md, Fase 3 — "cache de range_values por passada").
+        if let Some(v) = self.host.range_array(a.sheet, range) {
+            return v;
         }
         let data = self.host.range_values(a.sheet, range);
         Array::new(h, w, data).map(Value::from).unwrap_or(Value::Error(CellError::Value))
@@ -618,7 +661,6 @@ impl<'h> Evaluator<'h> {
         self.value(e)
     }
 
-
     // ------------------------------------------------------------------ calls
 
     fn arg_ev(&mut self, args: &[Expr], i: usize) -> Option<Ev> {
@@ -798,9 +840,8 @@ impl<'h> Evaluator<'h> {
                     let search_col = area.range.start.col;
                     let return_col = area.range.start.col + idx as u32;
                     let match_row = if approx {
-                        let keys: Vec<Value> = (trimmed.start.row..=trimmed.end.row)
-                            .map(|r| self.host.cell_value(area.sheet, CellRef::new(r, search_col)))
-                            .collect();
+                        let keys: Vec<Value> =
+                            (trimmed.start.row..=trimmed.end.row).map(|r| self.host.cell_value(area.sheet, CellRef::new(r, search_col))).collect();
                         gridcraft_functions::bsearch_last(&needle, &keys, false).map(|i| trimmed.start.row + i as u32)
                     } else {
                         self.host.lookup_find_row(area.sheet, search_col, trimmed.start.row, trimmed.end.row, &needle)
@@ -814,9 +855,8 @@ impl<'h> Evaluator<'h> {
                     let search_row = area.range.start.row;
                     let return_row = area.range.start.row + idx as u32;
                     let match_col = if approx {
-                        let keys: Vec<Value> = (trimmed.start.col..=trimmed.end.col)
-                            .map(|c| self.host.cell_value(area.sheet, CellRef::new(search_row, c)))
-                            .collect();
+                        let keys: Vec<Value> =
+                            (trimmed.start.col..=trimmed.end.col).map(|c| self.host.cell_value(area.sheet, CellRef::new(search_row, c))).collect();
                         gridcraft_functions::bsearch_last(&needle, &keys, false).map(|i| trimmed.start.col + i as u32)
                     } else {
                         self.host.lookup_find_col(area.sheet, search_row, trimmed.start.col, trimmed.end.col, &needle)
@@ -827,6 +867,40 @@ impl<'h> Evaluator<'h> {
                     let val = self.host.cell_value(area.sheet, CellRef::new(return_row, c));
                     Ev::V(if val.is_empty() { Value::Number(0.0) } else { val })
                 }
+            }
+            "MATCH" if args.len() == 3 => {
+                // Exact match over a one-row / one-column reference: indexed like exact VLOOKUP.
+                // Anything unusual (array needle, blank/error needle, other match types) takes
+                // the generic path below.
+                let exact = matches!(args.get(2), Some(e) if !matches!(e, Expr::Missing))
+                    && matches!(self.value(&args[2]).scalar(), Value::Number(n) if n == 0.0);
+                if exact
+                    && let Ev::R(areas) = self.eval(&args[1])
+                    && let [area] = areas.as_slice()
+                {
+                    let area = *area;
+                    let (h, w) = (area.range.height(), area.range.width());
+                    if (h == 1 || w == 1) && self.host.workbook().sheet(area.sheet).is_some() {
+                        let x = self.arg_val(args, 0).unwrap_or_default();
+                        if !matches!(x, Value::Array(_) | Value::Error(_) | Value::Empty) {
+                            let trimmed = self.trim(&area);
+                            let pos = if w == 1 {
+                                self.host
+                                    .lookup_find_row(area.sheet, area.range.start.col, trimmed.start.row, trimmed.end.row, &x)
+                                    .map(|r| r - area.range.start.row)
+                            } else {
+                                self.host
+                                    .lookup_find_col(area.sheet, area.range.start.row, trimmed.start.col, trimmed.end.col, &x)
+                                    .map(|c| c - area.range.start.col)
+                            };
+                            return match pos {
+                                Some(p) => Ev::V(Value::number(p as f64 + 1.0)),
+                                None => err(CellError::NA),
+                            };
+                        }
+                    }
+                }
+                self.builtin(name, args)
             }
             "ROW" | "COLUMN" => {
                 let is_row = name == "ROW";
@@ -973,8 +1047,93 @@ impl<'h> Evaluator<'h> {
                 self.host.note_volatile();
                 self.builtin(name, args)
             }
+            "COUNTIFS" | "SUMIFS" => {
+                // Pure equality criteria over plain references answer through the per-pass
+                // equality index instead of scanning the table per criterion per formula
+                // (docs/plano-responsividade.md, Fase 3). Any other shape falls back.
+                if let Some(v) = self.ifs_indexed(name, args) {
+                    return v;
+                }
+                self.builtin(name, args)
+            }
             _ => self.builtin(name, args),
         }
+    }
+
+    /// COUNTIFS/SUMIFS over plain references with pure equality criteria: the host's per-pass
+    /// equality index gives the matching positions, so the table is scanned once per pass instead
+    /// of once per criterion in every formula (docs/plano-responsividade.md, Fase 3). The shape
+    /// is the one the functions validate against (the sum range for SUMIFS, the first criteria
+    /// range for COUNTIFS); anything outside it falls back to the functions.
+    fn ifs_indexed(&mut self, name: &str, args: &[Expr]) -> Option<Ev> {
+        let sum = name == "SUMIFS";
+        let first = if sum { 1 } else { 0 };
+        if args.len() < first + 2 || !(args.len() - first).is_multiple_of(2) {
+            return None;
+        }
+        let sum_area = if sum { Some(self.ref_range(&args[0])?) } else { None };
+        let mut pairs: Vec<((usize, RangeRef), Value)> = Vec::with_capacity((args.len() - first) / 2);
+        let mut i = first;
+        while i + 1 < args.len() {
+            let range = self.ref_range(&args[i])?;
+            // The functions read a criterion as the materialised argument's scalar.
+            let crit = self.value(&args[i + 1]).scalar();
+            pairs.push((range, crit));
+            i += 2;
+        }
+        let (_, range0) = if let Some(s) = sum_area { s } else { pairs.first()?.0 };
+        let shape = (range0.height(), range0.width());
+        if shape.0 == 0 || shape.1 == 0 {
+            return None;
+        }
+        if pairs.iter().any(|(r, _)| (r.1.height(), r.1.width()) != shape) {
+            return None;
+        }
+        let mut needles = Vec::with_capacity(pairs.len());
+        for (_, crit) in &pairs {
+            needles.push(gridcraft_functions::equality_operand(crit)?);
+        }
+        let mut positions: Option<Arc<Vec<u32>>> = None;
+        for (i, ((sheet, range), _)) in pairs.iter().enumerate() {
+            let found = self.host.equality_positions(*sheet, *range, &needles[i])?;
+            positions = Some(match positions.take() {
+                None => found,
+                Some(prev) => Arc::new(intersect(&prev, &found)),
+            });
+            if positions.as_ref().is_some_and(|p| p.is_empty()) {
+                break;
+            }
+        }
+        let positions = positions.unwrap_or_default();
+        match sum_area {
+            None => Some(Ev::V(Value::number(positions.len() as f64))),
+            Some((sheet, range)) => {
+                let w = shape.1;
+                let mut total = 0.0;
+                for p in positions.iter() {
+                    let cell = CellRef::new(range.start.row + p / w, range.start.col + p % w);
+                    match self.host.cell_value(sheet, cell) {
+                        Value::Number(n) => total += n,
+                        Value::Error(e) => return Some(err(e)),
+                        _ => {}
+                    }
+                }
+                if total.is_finite() { Some(Ev::V(Value::number(if total == 0.0 { 0.0 } else { total }))) } else { Some(err(CellError::Num)) }
+            }
+        }
+    }
+
+    /// The reference a range argument names, trimmed the way `area_value` trims it (so shapes
+    /// and positions match the materialised arrays).
+    fn ref_range(&mut self, e: &Expr) -> Option<(usize, RangeRef)> {
+        if !matches!(e, Expr::Ref(_)) {
+            return None;
+        }
+        let Ev::R(areas) = self.eval(e) else { return None };
+        let [area] = areas.as_slice() else { return None };
+        let cells = u64::from(area.range.height()) * u64::from(area.range.width());
+        let range = if cells > FULL_SIZE_CELLS { self.trim(area) } else { area.range };
+        Some((area.sheet, range))
     }
 
     fn builtin(&mut self, name: &str, args: &[Expr]) -> Ev {

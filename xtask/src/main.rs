@@ -24,7 +24,12 @@ commands:
   ci              fmt --check, clippy -D warnings, test, assets, layers, wasm, parity --check
                   (stops at the first failure; the parity check runs only if docs/parity-checklist.md exists)
   assets          check that every icon/image/font/sample file is attributed in ATTRIBUTION.md
-  layers          enforce the crate dependency layering (AGENTS.md \"Layering\")
+  layers          enforce the crate dependency layering (AGENTS.md \"Layering\") + the freeze
+                  guard: the interface layer never serializes or recalculates inline
+  perf [--budget MS] [--rows N]
+                  run the command-budget test on a generated corpus (default: 2 000 ms per
+                  command, 2 000 rows) and fail on the first command past the budget
+                  (docs/plano-responsividade.md, Fase 6)
   wasm            cargo check --target wasm32-unknown-unknown for the L0-L5 crates (+ gridcraft-web)
   parity [--check] [--out PATH]
                   write docs/parity-checklist.md from gridcraft_engine::catalog (implemented vs missing ids)
@@ -43,6 +48,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("assets") => assets::run(&root()),
         Some("layers") => cmd_layers(),
+        Some("perf") => cmd_perf(&rest),
         Some("wasm") => cmd_wasm(),
         Some("ci") => cmd_ci(),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
@@ -115,14 +121,97 @@ fn cmd_layers() -> Result<(), String> {
     println!();
     if violations.is_empty() {
         println!("OK: {} crates, no layering violations.", crates.len());
-        Ok(())
     } else {
         println!("{} violation(s):", violations.len());
         for v in &violations {
             println!("  - {v}");
         }
-        Err(format!("{} layering violation(s)", violations.len()))
+        return Err(format!("{} layering violation(s)", violations.len()));
     }
+    freeze_guard(&root())
+}
+
+/// Fase 6 of docs/plano-responsividade.md: the interface layer never serializes a workbook,
+/// never recalculates the graph and never writes workbook files inline — long work goes through
+/// `crates/ui-egui/src/jobs.rs`, and opens through the two documented async paths in `lib.rs`
+/// (`open_path_async` / `open_bytes_async`). A grep keeps the rule from eroding. Cheap
+/// filesystem metadata (recent files, fonts, desktop theme, screenshots) stays allowed: it is
+/// already threaded or per-frame cheap.
+fn freeze_guard(root: &Path) -> Result<(), String> {
+    let banned = ["save_bytes", "recalc_all", "recalc_sheet", "cells_changed", "write_file", "dbfile::save"];
+    let mut hits: Vec<String> = Vec::new();
+    // The interface layer and its desktop shell: long engine work goes through `jobs.rs` (or the
+    // documented async open paths), never inline here. The CLI is a batch engine client, like the
+    // engine itself, so it is not scanned.
+    for src in [root.join("crates/ui-egui/src"), root.join("apps/gridcraft/src")] {
+        walk_rs(&src, &mut |file, line_no, line| {
+            for symbol in &banned {
+                if line.contains(symbol) {
+                    hits.push(format!("{}:{line_no}: `{symbol}` in the interface layer", file.display()));
+                }
+            }
+            if line.contains("load_document") && !file.ends_with("lib.rs") {
+                hits.push(format!("{}:{line_no}: `load_document` outside the documented async open paths", file.display()));
+            }
+        });
+    }
+    println!();
+    if hits.is_empty() {
+        println!("OK: freeze guard — the interface layer does no inline serialization or recalculation.");
+        Ok(())
+    } else {
+        println!("{} freeze-guard violation(s):", hits.len());
+        for h in &hits {
+            println!("  - {h}");
+        }
+        Err(format!("{} freeze-guard violation(s)", hits.len()))
+    }
+}
+
+/// Visits every `.rs` file under `dir` (recursive) with its 1-based lines.
+fn walk_rs(dir: &Path, f: &mut dyn FnMut(&std::path::Path, usize, &str)) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_rs(&path, f);
+        } else if path.extension().is_some_and(|e| e == "rs")
+            && let Ok(body) = std::fs::read_to_string(&path)
+        {
+            for (i, line) in body.lines().enumerate() {
+                f(&path, i + 1, line);
+            }
+        }
+    }
+}
+
+/// `cargo xtask perf [--budget MS] [--rows N]`: the command-budget test over a generated corpus,
+/// failing on the first command past the budget (Fase 6 of docs/plano-responsividade.md).
+fn cmd_perf(rest: &[&str]) -> Result<(), String> {
+    let mut budget = 2_000u64;
+    let mut rows = 2_000u64;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--budget" => {
+                budget = rest.get(i + 1).and_then(|v| v.parse().ok()).ok_or("--budget needs a number of milliseconds")?;
+                i += 1;
+            }
+            "--rows" => {
+                rows = rest.get(i + 1).and_then(|v| v.parse().ok()).ok_or("--rows needs a number of rows")?;
+                i += 1;
+            }
+            other => return Err(format!("unknown flag `{other}`; use --budget MS --rows N")),
+        }
+        i += 1;
+    }
+    let mut c = cargo();
+    c.env("GRIDCRAFT_BUDGET_MS", budget.to_string());
+    c.env("GRIDCRAFT_BUDGET_ROWS", rows.to_string());
+    c.args(["test", "-p", "gridcraft-engine", "--lib", "every_command_stays_within_budget", "--", "--nocapture"]);
+    run(c, &format!("cargo test -p gridcraft-engine --lib every_command_stays_within_budget (budget {budget} ms, corpus {rows} rows)"))?;
+    println!("\nperf: every command within the {budget} ms budget on the {rows}-row corpus.");
+    Ok(())
 }
 
 /// Workspace packages that must build for wasm32: every L0–L5 crate, plus the web app once it

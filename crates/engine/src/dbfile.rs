@@ -32,11 +32,7 @@ mod native {
     }
 
     /// Streams `xlsx` into a new database at `out` with progress reports; returns one line per table.
-    pub fn import_xlsx_with_progress(
-        xlsx: &str,
-        out: &str,
-        progress: &mut dyn FnMut(&str, u64),
-    ) -> Result<(Vec<(String, u64, usize)>, Vec<String>)> {
+    pub fn import_xlsx_with_progress(xlsx: &str, out: &str, progress: &mut dyn FnMut(&str, u64)) -> Result<(Vec<(String, u64, usize)>, Vec<String>)> {
         let report = gridcraft_db::import_xlsx(std::path::Path::new(xlsx), std::path::Path::new(out), progress)
             .map_err(|e| EngineError::Other(format!("We can't convert '{xlsx}': {e}")))?;
         Ok((report.tables.into_iter().map(|t| (t.sheet, t.rows, t.columns)).collect(), report.warnings))
@@ -77,4 +73,3 @@ mod web {
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{import_xlsx, import_xlsx_with_progress, open, save};
-

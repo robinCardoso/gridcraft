@@ -301,6 +301,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "Soubor CSV, webová stránka nebo PDF je kopie: sešit si ponechá svůj vlastní soubor."
         }
         "Save the workbook under another name or in another folder." => "Uloží sešit pod jiným názvem nebo do jiné složky.",
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "Ukládání…",
+        "Calculating…" => "Výpočet…",
+        "Solving…" => "Řešení…",
         "Print Active Sheets" => "Vytisknout aktivní listy",
         "Print Entire Workbook" => "Vytisknout celý sešit",
         "Fit Sheet on One Page" => "Přizpůsobit list na jednu stránku",

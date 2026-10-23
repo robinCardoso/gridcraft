@@ -389,6 +389,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "Um arquivo CSV, página da Web ou PDF é uma cópia: a pasta de trabalho mantém o próprio arquivo."
         }
         "Save the workbook under another name or in another folder." => "Salve a pasta de trabalho com outro nome ou em outra pasta.",
+        // Background jobs (docs/plano-responsividade.md): os indicadores da barra de status.
+        "Saving…" => "Salvando…",
+        "Calculating…" => "Calculando…",
+        "Solving…" => "Resolvendo…",
         "Print Active Sheets" => "Imprimir planilhas ativas",
         "Print Entire Workbook" => "Imprimir toda a pasta de trabalho",
         "Fit Sheet on One Page" => "Ajustar planilha em uma página",
@@ -482,6 +486,8 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Shift cells up" => "Deslocar células para cima",
         "Entire row" => "Linha inteira",
         "Entire column" => "Coluna inteira",
+        "This operation isn't allowed: it would shift cells in a table on your worksheet." =>
+            "Esta operação não é permitida: ela deslocaria células em uma tabela da planilha.",
         "Row height (pixels):" => "Altura da linha (pixels):",
         "Column width (characters):" => "Largura da coluna (caracteres):",
         "Standard column width (pixels):" => "Largura padrão da coluna (pixels):",

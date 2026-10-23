@@ -155,9 +155,13 @@ pub struct GridState {
     pub used_range_cache: Option<((u64, u64, usize), Option<RangeRef>)>,
     /// Conditional formatting cache, cached per (doc uid, revision, sheet).
     pub cf_cache: Option<((u64, u64, usize), CfCache)>,
+    /// Formatted cell text cache for visible cells, cached per (doc uid, revision, sheet).
+    pub text_cache: Option<((u64, u64, usize), TextCache)>,
     /// A one-finger touch drag in progress: it pans the sheet instead of selecting.
     pub touch_pan: bool,
 }
+
+pub type TextCache = std::collections::HashMap<(CellRef, u32), (String, Option<Color32>, bool, Option<(char, usize)>)>;
 
 /// Ctrl+wheel zoom for one (doc uid, sheet). egui eases a notch in over several frames and
 /// fine-grained wheels send parts of one, so the turning is counted in notches, and each whole
@@ -777,12 +781,17 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         Some((k, cache)) if k == key => cache,
         _ => CfCache::new(),
     };
+    let mut tc = match app.grid.text_cache.take() {
+        Some((k, cache)) if k == key => cache,
+        _ => TextCache::new(),
+    };
     let quads = if geo.paper.is_some() {
-        crate::paper_view::paint_pages(app, &painter, &geo, &wb, si, sh, &sel, outline, &mut cf, &t)
+        crate::paper_view::paint_pages(app, &painter, &geo, &wb, si, sh, &sel, outline, &mut cf, &mut tc, &t)
     } else {
-        paint_panes(app, &painter, &geo, &wb, si, sh, &sel, outline, &mut cf, &t)
+        paint_panes(app, &painter, &geo, &wb, si, sh, &sel, outline, &mut cf, &mut tc, &t)
     };
     app.grid.cf_cache = Some((key, cf));
+    app.grid.text_cache = Some((key, tc));
     // Objects above cells.
     let objects = crate::chartview::paint_objects(app, &painter.with_clip_rect(geo.cells), &geo, &wb, si, sh);
     paint_overlays(app, ui, &painter.with_clip_rect(geo.cells), &geo, &wb, si, sh, &sel);
@@ -849,6 +858,7 @@ fn paint_panes(
     sel: &gridcraft_engine::Selection,
     outline: Rect,
     cf: &mut CfCache,
+    tc: &mut TextCache,
     t: &Tokens,
 ) -> Vec<((u32, u32), (u32, u32), Rect)> {
     // Quadrants: (rows, cols, clip).
@@ -872,7 +882,7 @@ fn paint_panes(
             continue;
         }
         let p = painter.with_clip_rect(*clip);
-        paint_quadrant(&p, geo, wb, si, sh, *rows, *cols, cf, t);
+        paint_quadrant(&p, geo, wb, si, sh, *rows, *cols, cf, tc, t);
         paint_selection(&p, geo, sh, sel, outline, t, app, *rows, *cols);
     }
     // Freeze lines.
@@ -896,7 +906,9 @@ fn vertical_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, sh: &Sheet, geo: &G
     let scroll = app.view().scroll.y;
     let last = {
         let key = app.session.active().map(|d| (d.uid, d.revision, d.wb.active_sheet)).unwrap_or((0, 0, 0));
-        let r = if let Some((k, r)) = &app.grid.used_range_cache && *k == key {
+        let r = if let Some((k, r)) = &app.grid.used_range_cache
+            && *k == key
+        {
             *r
         } else {
             let r = sh.used_range();
@@ -959,7 +971,9 @@ pub(crate) fn horizontal_scrollbar(app: &mut SheetApp, ui: &mut egui::Ui, track:
     let scroll = app.view().scroll.x;
     let last = {
         let key = app.session.active().map(|d| (d.uid, d.revision, d.wb.active_sheet)).unwrap_or((0, 0, 0));
-        let r = if let Some((k, r)) = &app.grid.used_range_cache && *k == key {
+        let r = if let Some((k, r)) = &app.grid.used_range_cache
+            && *k == key
+        {
             *r
         } else {
             let r = sh.used_range();
@@ -1117,6 +1131,7 @@ pub(crate) fn paint_quadrant(
     rows: (u32, u32),
     cols: (u32, u32),
     cf: &mut CfCache,
+    tc: &mut TextCache,
     t: &Tokens,
 ) {
     let z = geo.z;
@@ -1247,7 +1262,13 @@ pub(crate) fn paint_quadrant(
         // Digits fit by the cell's own font and size, not the default 11pt (9pt marks in narrow columns).
         let char_w = p.layout_no_wrap("0".to_string(), font.clone(), Color32::PLACEHOLDER).size().x.max(1.0);
         let avail_w = rect.right() - text_left;
-        let (mut text, ncolor, numeric, fill_char) = display_text(wb, sh, c, &v, st, avail_w / z.max(0.1) * z, char_w);
+        let width_key = if st.num_fmt.as_str() == "General" && matches!(v, Value::Number(_)) {
+            ((avail_w / z.max(0.1) * z - 4.0) / char_w).floor().max(1.0) as u32
+        } else {
+            0
+        };
+        let (mut text, ncolor, numeric, fill_char) =
+            tc.entry((c, width_key)).or_insert_with(|| display_text(wb, sh, c, &v, st, avail_w / z.max(0.1) * z, char_w)).clone();
         if sh.show_formulas && sh.cell(c).is_some_and(|cell| cell.formula.is_some()) {
             text = crate::formula_locale::display(&text, crate::i18n::current(p.ctx()).formula_locale(), wb, si);
         }
@@ -2662,8 +2683,8 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
         resp.request_focus();
     }
     let other_focus = ctx.memory(|m| m.focused()).is_some_and(|f| f != resp.id && (editing || !stale.contains(&f)));
-    // An open filter menu owns the keyboard even when a click inside it left focus on nothing (#1516).
-    if editing || app.dialog.is_some() || other_focus || app.message.is_some() || app.grid.filter_menu.is_some() {
+    // An open filter menu or validation list owns the keyboard even when a click inside it left focus on nothing (#1516).
+    if editing || app.dialog.is_some() || other_focus || app.message.is_some() || app.grid.filter_menu.is_some() || app.grid.list_picker.is_some() {
         return;
     }
     if ctx.memory(|m| m.focused()).is_none() {
@@ -3188,23 +3209,109 @@ fn list_picker(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
         return;
     };
     let items = gridcraft_engine::cmd::data::list_items(&wb, si, &dv);
+    let current = sh.value(c).display();
     let r = geo.cell_rect(sh, c);
+    let width = r.width().max(100.0);
     let (at, pivot) = (geo.mirror_pos(r.left_bottom()), if geo.rtl { Align2::RIGHT_TOP } else { Align2::LEFT_TOP });
+    let search_key = egui::Id::new("dv_list_search");
+    let sel_key = egui::Id::new("dv_list_sel");
+    // Type-to-filter: typed characters narrow the list (substring, case-insensitive), like the
+    // ribbon editable combos. No separate search field — the open list owns the keyboard.
+    let mut search: String = if was_open { ui.ctx().data_mut(|d| d.get_temp(search_key)).unwrap_or_default() } else { String::new() };
+    let mut sel: i32 = if was_open { ui.ctx().data_mut(|d| d.get_temp(sel_key)).unwrap_or(0) } else { 0 };
+    let prev_search = search.clone();
+    let (mut down, mut up, mut enter, mut backspace) = (false, false, false, false);
+    let mut typed = String::new();
+    ui.input(|i| {
+        down = i.key_pressed(egui::Key::ArrowDown);
+        up = i.key_pressed(egui::Key::ArrowUp);
+        enter = i.key_pressed(egui::Key::Enter);
+        backspace = i.key_pressed(egui::Key::Backspace);
+        for e in &i.events {
+            if let egui::Event::Text(t) = e
+                && t.chars().all(|ch| !ch.is_control())
+                && !t.is_empty()
+            {
+                typed.push_str(t);
+            }
+        }
+    });
+    if !typed.is_empty() {
+        search.push_str(&typed);
+    }
+    if backspace {
+        search.pop();
+    }
+    if down || up || enter || backspace || !typed.is_empty() {
+        ui.ctx().input_mut(|i| {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::ArrowDown | egui::Key::ArrowUp | egui::Key::Enter | egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } | egui::Event::Text(_)
+                )
+            });
+        });
+    }
+    let lower = search.to_lowercase();
+    let filtered: Vec<usize> =
+        items.iter().enumerate().filter(|(_, it)| lower.is_empty() || it.to_lowercase().contains(&lower)).map(|(i, _)| i).collect();
+    if !was_open || search != prev_search {
+        // Open or fresh needle: prefer the current cell value among matches, else the first match.
+        sel = filtered.iter().position(|&i| items[i] == current).map(|i| i as i32).unwrap_or(0);
+    }
+    if !filtered.is_empty() {
+        let n = filtered.len() as i32;
+        if down {
+            sel = (sel + 1).rem_euclid(n);
+        }
+        if up {
+            sel = (sel - 1).rem_euclid(n);
+        }
+        sel = sel.clamp(0, n - 1);
+    } else {
+        sel = 0;
+    }
     let mut close = false;
+    let mut picked: Option<String> = None;
+    if enter && !filtered.is_empty() {
+        picked = Some(items[filtered[sel as usize]].clone());
+        close = true;
+    }
     let response = egui::Area::new(egui::Id::new("dv_list")).fixed_pos(at).pivot(pivot).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).inner_margin(2.0).show(ui, |ui| {
-            ui.set_min_width(r.width().max(100.0));
+            ui.set_min_width(width);
             egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                for it in &items {
-                    if ui.add(egui::Button::new(it.as_str()).frame(false).min_size(vec2(r.width().max(100.0), 18.0))).clicked() {
-                        app.run_or_alert("cell.set", json!({"cell": c.a1(), "input": it}));
+                for (fi, &i) in filtered.iter().enumerate() {
+                    let it = &items[i];
+                    let row = ui.add(egui::Button::selectable(fi as i32 == sel, it.as_str()).frame(false).min_size(vec2(width, 18.0)));
+                    if row.clicked() {
+                        picked = Some(it.clone());
                         close = true;
+                    }
+                    if row.hovered() {
+                        sel = fi as i32;
                     }
                 }
             });
         });
     });
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(search_key, search);
+        d.insert_temp(sel_key, sel);
+    });
+    if let Some(it) = picked {
+        app.run_or_alert("cell.set", json!({"cell": c.a1(), "input": it}));
+        close = true;
+    }
     if close || popup_dismissed(&response.response, was_open) {
+        ui.ctx().data_mut(|d| {
+            d.remove::<String>(search_key);
+            d.remove::<i32>(sel_key);
+        });
         app.grid.list_picker = None;
     }
 }

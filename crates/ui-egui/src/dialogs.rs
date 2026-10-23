@@ -633,7 +633,19 @@ impl Dialog {
             }
             "insertFunction" => Dialog::custom("insertFunction", "Formula Builder", json!({"category": "Most Recently Used"})),
             "find" => {
-                let mut d = Dialog::custom("find", "Find and Replace", json!({"what": "", "with": "", "within": "sheet", "lookIn": "formulas"}));
+                // Open with the last search prefilled, as Excel does (the engine records it in
+                // `Session::last_find`); the default keys cover a first use.
+                let mut values = json!({"what": "", "with": "", "within": "sheet", "lookIn": "formulas", "byColumns": false});
+                if let Some(last) = app.session.last_find.clone()
+                    && let (Some(base), Some(last)) = (values.as_object_mut(), last.as_object())
+                {
+                    for (k, v) in last {
+                        if k != "all" {
+                            base.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                let mut d = Dialog::custom("find", "Find and Replace", values);
                 d.tab = if p("replace").as_bool() == Some(true) { "Replace".into() } else { "Find".into() };
                 d
             }
@@ -1194,8 +1206,13 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                         }
                         // File operations must include the cell the user is still editing (as the File > Save menu item already does).
                         if ui.button("Save").clicked() && app.commit_edit(0, 0, false, false) {
+                            let uid = app.session.active().map(|x| x.uid);
                             app.run_or_alert("file.save", json!({}));
-                            if app.session.active().is_some_and(|x| !x.is_dirty()) {
+                            // Inline saves are done here; a background save (big workbook) is still
+                            // running, and its close waits for the job (SheetApp::finish_pending_close).
+                            let clean = app.session.active().is_some_and(|x| !x.is_dirty());
+                            let saving = uid.is_some_and(|u| app.jobs.is_saving(u));
+                            if clean || saving {
                                 app.run_or_alert("file.close", json!({"force": true}));
                             }
                             open = false;
@@ -1220,7 +1237,7 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                     ui.label(egui::RichText::new("Recent").strong());
                     for path in app.ui.recent.clone() {
                         if ui.link(&path).clicked() {
-                            app.open_path(&path);
+                            app.open_path_async(&path);
                             open = false;
                         }
                     }
@@ -1258,27 +1275,40 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
         confirm = false;
     }
     if confirm && let Some(cmd) = d.command {
-        let params = build_params(&d);
-        match app.run(cmd, params) {
-            Ok(r) => {
-                open = false;
-                if d.name == "solver" {
-                    app.open_dialog("solverResults", r);
-                } else if d.name == "openPassword" {
-                    let path = d.values.get("path").and_then(Json::as_str).map(str::to_string);
-                    app.after_open(path.as_deref(), &r);
+        if d.name == "openPassword" {
+            // The one async loader (Fase 2 unification): a big encrypted workbook parses off the
+            // interface thread. The dialog closes and the loading task reopens it (field cleared)
+            // for a wrong password; success reads exactly as File › Open.
+            let params = build_params(&d);
+            let display = params.get("path").and_then(Json::as_str).map(str::to_string);
+            let open_params = if display.is_some() {
+                None
+            } else {
+                let mut p = params.clone();
+                if let Some(m) = p.as_object_mut() {
+                    m.remove("password");
                 }
+                Some(p)
+            };
+            let source = display.clone().unwrap_or_else(|| params.get("name").and_then(Json::as_str).unwrap_or("Book").to_string());
+            app.open_document_async(params, crate::file_name(&source), display, open_params, true);
+            open = false;
+        } else {
+            let params = build_params(&d);
+            match app.run(cmd, params) {
+                Ok(r) => {
+                    open = false;
+                    // A background Solver answers "pending": its job opens the results dialog.
+                    if d.name == "solver" && r.get("pending").and_then(Json::as_bool) != Some(true) {
+                        app.open_dialog("solverResults", r);
+                    }
+                }
+                // Data Analysis asks before replacing data in its output range.
+                Err(e) if d.name == "analysisToolPak" && e.contains(gridcraft_engine::cmd::analysis::OVERWRITE_ERROR) => {
+                    d.values.insert("askOverwrite".into(), json!(true));
+                }
+                Err(e) => app.message = Some((d.title.clone(), crate::clean_error(&e))),
             }
-            // Data Analysis asks before replacing data in its output range.
-            Err(e) if d.name == "analysisToolPak" && e.contains(gridcraft_engine::cmd::analysis::OVERWRITE_ERROR) => {
-                d.values.insert("askOverwrite".into(), json!(true));
-            }
-            // A wrong password: say so, clear the field and stay open for another try.
-            Err(e) if d.name == "openPassword" => {
-                d.values.insert("password".into(), json!(""));
-                app.message = Some((d.title.clone(), crate::clean_error(&e)));
-            }
-            Err(e) => app.message = Some((d.title.clone(), crate::clean_error(&e))),
         }
     } else if confirm {
         open = false;
@@ -1390,12 +1420,13 @@ fn form(ui: &mut egui::Ui, d: &mut Dialog, confirm: &mut bool, open: &mut bool) 
 
 /// Draws a dialog's `fields`, editing its values.
 fn form_fields(ui: &mut egui::Ui, d: &mut Dialog) {
+    let lang = crate::i18n::current(ui.ctx());
     egui::Grid::new("form").num_columns(1).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
         for f in d.fields.clone() {
             match f {
                 Field::Text { key, label } => {
                     ui.vertical(|ui| {
-                        ui.label(label);
+                        ui.label(lang.tr(label));
                         let mut s = d
                             .values
                             .get(key)
@@ -1415,17 +1446,17 @@ fn form_fields(ui: &mut egui::Ui, d: &mut Dialog) {
                 Field::Password { key, label } => {
                     // Masked as typed (Excel shows dots); "Show password" reveals it on purpose.
                     ui.vertical(|ui| {
-                        ui.label(label);
+                        ui.label(lang.tr(label));
                         let mut s = d.values.get(key).and_then(Json::as_str).unwrap_or_default().to_string();
                         if ui.add(egui::TextEdit::singleline(&mut s).password(!d.show_password).desired_width(320.0)).changed() {
                             d.values.insert(key.into(), json!(s));
                         }
-                        ui.checkbox(&mut d.show_password, "Show password");
+                        ui.checkbox(&mut d.show_password, lang.tr("Show password"));
                     });
                 }
                 Field::Number { key, label } => {
                     ui.horizontal(|ui| {
-                        ui.label(label);
+                        ui.label(lang.tr(label));
                         let mut n = d.values.get(key).and_then(Json::as_f64).unwrap_or(0.0);
                         if ui.add(egui::DragValue::new(&mut n).speed(0.5)).changed() {
                             d.values.insert(key.into(), json!(n));
@@ -1434,20 +1465,20 @@ fn form_fields(ui: &mut egui::Ui, d: &mut Dialog) {
                 }
                 Field::Choice { key, label, options } => {
                     ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(label).strong());
+                        ui.label(egui::RichText::new(lang.tr(label)).strong());
                         let cur = d.values.get(key).and_then(Json::as_str).unwrap_or("").to_string();
                         if d.name == "dataValidation" {
-                            let selected = options.iter().find(|(val, _)| *val == cur).map(|(_, text)| *text).unwrap_or("");
+                            let selected = options.iter().find(|(val, _)| *val == cur).map(|(_, text)| lang.tr(text)).unwrap_or("");
                             egui::ComboBox::from_id_salt(("dataValidation", key)).selected_text(selected).width(300.0).show_ui(ui, |ui| {
                                 for (val, text) in options {
-                                    if ui.selectable_label(cur == val, text).clicked() {
+                                    if ui.selectable_label(cur == val, lang.tr(text)).clicked() {
                                         d.set_value(key, json!(val));
                                     }
                                 }
                             });
                         } else {
                             for (val, text) in options {
-                                if ui.radio(cur == val, text).clicked() {
+                                if ui.radio(cur == val, lang.tr(text)).clicked() {
                                     d.set_value(key, json!(val));
                                 }
                             }
@@ -1456,12 +1487,12 @@ fn form_fields(ui: &mut egui::Ui, d: &mut Dialog) {
                 }
                 Field::Check { key, label } => {
                     let mut b = d.values.get(key).and_then(Json::as_bool).unwrap_or(false);
-                    if ui.checkbox(&mut b, label).changed() {
+                    if ui.checkbox(&mut b, lang.tr(label)).changed() {
                         d.values.insert(key.into(), json!(b));
                     }
                 }
                 Field::Note(t) => {
-                    ui.label(egui::RichText::new(t).small());
+                    ui.label(egui::RichText::new(lang.tr(&t)).small());
                 }
             }
             ui.end_row();
@@ -1755,18 +1786,9 @@ fn insert_function(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confir
     let locale = app.ui.language.formula_locale();
     let list = gridcraft_engine::cmd::formulas::function_list();
     let raw_search = d.search.trim().trim_start_matches('=').trim();
-    let q: String = raw_search.chars().map(|c| match c {
-        'Á' | 'À' | 'Ã' | 'Â' | 'á' | 'à' | 'ã' | 'â' => 'a',
-        'É' | 'È' | 'Ê' | 'é' | 'è' | 'ê' => 'e',
-        'Í' | 'Ì' | 'Î' | 'í' | 'ì' | 'î' => 'i',
-        'Ó' | 'Ò' | 'Õ' | 'Ô' | 'ó' | 'ò' | 'õ' | 'ô' => 'o',
-        'Ú' | 'Ù' | 'Û' | 'ú' | 'ù' | 'û' => 'u',
-        'Ç' | 'ç' => 'c',
-        other => other,
-    }).collect::<String>().to_ascii_lowercase();
-
-    let unaccent = |s: &str| -> String {
-        s.chars().map(|c| match c {
+    let q: String = raw_search
+        .chars()
+        .map(|c| match c {
             'Á' | 'À' | 'Ã' | 'Â' | 'á' | 'à' | 'ã' | 'â' => 'a',
             'É' | 'È' | 'Ê' | 'é' | 'è' | 'ê' => 'e',
             'Í' | 'Ì' | 'Î' | 'í' | 'ì' | 'î' => 'i',
@@ -1774,7 +1796,23 @@ fn insert_function(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confir
             'Ú' | 'Ù' | 'Û' | 'ú' | 'ù' | 'û' => 'u',
             'Ç' | 'ç' => 'c',
             other => other,
-        }).collect::<String>().to_ascii_lowercase()
+        })
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    let unaccent = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                'Á' | 'À' | 'Ã' | 'Â' | 'á' | 'à' | 'ã' | 'â' => 'a',
+                'É' | 'È' | 'Ê' | 'é' | 'è' | 'ê' => 'e',
+                'Í' | 'Ì' | 'Î' | 'í' | 'ì' | 'î' => 'i',
+                'Ó' | 'Ò' | 'Õ' | 'Ô' | 'ó' | 'ò' | 'õ' | 'ô' => 'o',
+                'Ú' | 'Ù' | 'Û' | 'ú' | 'ù' | 'û' => 'u',
+                'Ç' | 'ç' => 'c',
+                other => other,
+            })
+            .collect::<String>()
+            .to_ascii_lowercase()
     };
 
     let hits: Vec<&Json> = list
@@ -1804,16 +1842,9 @@ fn insert_function(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confir
         for (i, f) in hits.iter().enumerate() {
             let canonical = f["name"].as_str().unwrap_or("");
             let localized = locale.function_name(canonical);
-            let label = if localized != canonical {
-                format!("{localized} ({canonical})")
-            } else {
-                canonical.to_string()
-            };
+            let label = if localized != canonical { format!("{localized} ({canonical})") } else { canonical.to_string() };
             let category = f["category"].as_str().unwrap_or("");
-            let r = ui.add(
-                egui::Button::selectable(i == d.list_index, format!("{label:<26} {category}"))
-                    .min_size(vec2(480.0, 20.0)),
-            );
+            let r = ui.add(egui::Button::selectable(i == d.list_index, format!("{label:<26} {category}")).min_size(vec2(480.0, 20.0)));
             if r.clicked() {
                 d.list_index = i;
             }
@@ -1867,17 +1898,37 @@ fn find(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
     let mut case = d.values.get("matchCase").and_then(Json::as_bool).unwrap_or(false);
     let mut whole = d.values.get("wholeCell").and_then(Json::as_bool).unwrap_or(false);
     let mut wb = d.values.get("within").and_then(Json::as_str) == Some("workbook");
+    let mut look_values = d.values.get("lookIn").and_then(Json::as_str) == Some("values");
+    let mut by_cols = d.values.get("byColumns").and_then(Json::as_bool).unwrap_or(false);
     ui.horizontal(|ui| {
         ui.checkbox(&mut case, "Match case");
         ui.checkbox(&mut whole, "Match entire cell contents");
         ui.checkbox(&mut wb, "Within workbook");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Look in:");
+        ui.radio_value(&mut look_values, false, "Formulas");
+        ui.radio_value(&mut look_values, true, "Values");
+        ui.separator();
+        ui.label("Search:");
+        ui.radio_value(&mut by_cols, false, "By Rows");
+        ui.radio_value(&mut by_cols, true, "By Columns");
     });
     d.values.insert("what".into(), json!(what));
     d.values.insert("with".into(), json!(with));
     d.values.insert("matchCase".into(), json!(case));
     d.values.insert("wholeCell".into(), json!(whole));
     d.values.insert("within".into(), json!(if wb { "workbook" } else { "sheet" }));
-    let base = json!({"what": what, "matchCase": case, "wholeCell": whole, "within": if wb { "workbook" } else { "sheet" }});
+    d.values.insert("lookIn".into(), json!(if look_values { "values" } else { "formulas" }));
+    d.values.insert("byColumns".into(), json!(by_cols));
+    let base = json!({
+        "what": what,
+        "matchCase": case,
+        "wholeCell": whole,
+        "within": if wb { "workbook" } else { "sheet" },
+        "lookIn": if look_values { "values" } else { "formulas" },
+        "byColumns": by_cols,
+    });
     ui.horizontal(|ui| {
         if d.tab == "Replace" {
             if ui.button("Replace All").clicked() {
@@ -1916,11 +1967,15 @@ fn find(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
         ui.label(format!("{} cell(s) found", list.len()));
         egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
             for item in list {
+                // Sheet, cell, the matched text, and the formula when the cell has one (the
+                // reference dialog's Value/Formula columns).
+                let formula = item["formula"].as_str().map(|f| format!("  {f}")).unwrap_or_default();
                 let label = format!(
-                    "{}  {}  {}",
+                    "{}  {}  {}{}",
                     item["sheet"].as_str().unwrap_or(""),
                     item["cell"].as_str().unwrap_or(""),
-                    item["value"].as_str().unwrap_or("")
+                    item["value"].as_str().unwrap_or(""),
+                    formula
                 );
                 if ui.selectable_label(false, label).clicked() {
                     if let Some(s) = item["sheet"].as_str() {
@@ -2342,6 +2397,8 @@ fn goal_seek(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &mu
     ok_cancel(ui, confirm, &mut open);
     if *confirm {
         match app.run("data.goalSeek", json!({"set": set, "to": to.parse::<f64>().unwrap_or(0.0), "changing": changing})) {
+            // A background Goal Seek answers "pending": its job reports the solution.
+            Ok(r) if r.get("pending").and_then(Json::as_bool) == Some(true) => {}
             Ok(r) => app.toast = Some((format!("Goal Seeking found a solution: {}", r["value"]), crate::now_ms())),
             Err(e) => app.message = Some(("Goal Seek".into(), crate::clean_error(&e))),
         }

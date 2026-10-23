@@ -323,7 +323,21 @@ fn goal_seek(s: &mut Session, p: &Json) -> Result<Json> {
     let x0 = d.wb.sheet(csi).map(|sh| sh.value(chg)).and_then(|v| v.as_f64()).unwrap_or(0.0);
     let (max_iter, tol) = (d.wb.calc.max_iterations, d.wb.calc.max_change);
     let mut trial = Trial::new(d);
+    // A background job's cancellation/progress (docs/plano-responsividade.md, Fase 3): a
+    // cancelled run yields no value, which ends the search right away.
+    let hooks = s.analysis_hooks.clone();
+    let total = max_iter.max(1) as usize;
+    let mut done = 0usize;
     let mut f = |x: f64| -> f64 {
+        if let Some(h) = &hooks
+            && h.cancelled()
+        {
+            return f64::NAN;
+        }
+        done += 1;
+        if let Some(h) = &hooks {
+            h.report(done, total);
+        }
         trial.run(&[(csi, chg, Value::number(x))], &[(ssi, set)]).first().and_then(Value::as_f64).map(|v| v - target).unwrap_or(f64::NAN)
     };
     let r = seek(x0, &mut f, max_iter, tol);

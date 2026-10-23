@@ -306,12 +306,20 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// Rounds a number to the 15 significant decimal digits Excel keeps.
+pub fn round15(x: f64) -> f64 {
+    if !x.is_finite() || x == 0.0 { x } else { format!("{x:.14e}").parse().unwrap_or(x) }
+}
+
+/// The exact-match key of a number: values equal at Excel's 15 significant digits share it (the
+/// same rounding [`compare_numbers`] applies), so a lookup index agrees with a linear scan.
+pub fn exact_number_key(n: f64) -> u64 {
+    round15(if n == 0.0 { 0.0 } else { n }).to_bits()
+}
+
 /// Compares numbers the way Excel does: both are rounded to 15 significant digits first, so binary
 /// noise such as `0.1+0.2` versus `0.3` counts as equal.
 pub fn compare_numbers(a: f64, b: f64) -> Ordering {
-    fn round15(x: f64) -> f64 {
-        if !x.is_finite() || x == 0.0 { x } else { format!("{x:.14e}").parse().unwrap_or(x) }
-    }
     if a == b {
         return Ordering::Equal;
     }

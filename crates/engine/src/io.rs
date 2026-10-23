@@ -203,11 +203,19 @@ pub fn save_bytes(wb: &Workbook, path: &str) -> Result<Vec<u8>> {
 
 /// Encodes a workbook as `kind`, whatever `path`'s extension says.
 pub fn save_bytes_as(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8>> {
+    save_bytes_as_level(wb, path, kind, 6)
+}
+
+/// Encodes with an explicit deflate level for the package formats: 6 for a manual save, 1 for
+/// the fast AutoSave (docs/plano-responsividade.md, Fase 2). Other formats ignore it.
+pub fn save_bytes_as_level(wb: &Workbook, path: &str, kind: FileKind, level: i64) -> Result<Vec<u8>> {
     let sheet = wb.active_sheet;
     match kind {
         // The extension picks the package kind; only the macro-enabled kinds (.xlsm, .xltm) carry
         // the VBA project, so any other name saves without it, as Excel does.
-        FileKind::Xlsx => gridcraft_xlsx::write_xlsx_as(wb, gridcraft_xlsx::XlsxKind::from_path(path)).map_err(|e| EngineError::Other(e.to_string())),
+        FileKind::Xlsx => {
+            gridcraft_xlsx::write_xlsx_with(wb, gridcraft_xlsx::XlsxKind::from_path(path), level).map_err(|e| EngineError::Other(e.to_string()))
+        }
         FileKind::Xls => {
             Err(EngineError::Other("Excel 97-2003 (.xls) is supported for import only. Save as .xlsx or another supported export format.".into()))
         }

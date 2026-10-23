@@ -158,9 +158,9 @@ fn clicking_the_ribbon_paste_button_or_its_menu_does_not_freeze() {
         assert_eq!(cell(&h, "D4"), Some(Value::from("Name")));
         assert_eq!(cell(&h, "E5"), Some(Value::number(42.0)));
 
-        // The secondary click opens the paste options menu; its items paste too.
+        // The Paste split button's own arrow opens the options menu; its items paste too.
         h.state_mut().run("selection.set", json!({"cell": "G1"})).unwrap();
-        h.get_by_role_and_label(Role::Button, "Paste").click_secondary();
+        h.get_by_role_and_label(Role::Button, "Paste Options").click();
         h.run_steps(3);
         h.get_by_label("Paste Values").click();
         h.run_steps(3);
@@ -242,9 +242,9 @@ fn paste_menu_items_paste_the_system_clipboard() {
     let ribbon = h.get_by_role_and_label(Role::Button, "Paste").rect();
     let click_menu_paste = |h: &Harness| h.get_all_by_role_and_label(Role::Button, "Paste").find(|n| n.rect() != ribbon).unwrap().click();
 
-    // Home › Paste options menu › Paste.
+    // Home › Paste options menu › Paste (the split button's arrow opens the menu).
     h.state_mut().run("selection.set", json!({"cell": "D4"})).unwrap();
-    h.get_by_role_and_label(Role::Button, "Paste").click_secondary();
+    h.get_by_role_and_label(Role::Button, "Paste Options").click();
     h.run_steps(2);
     click_menu_paste(&h);
     h.run_steps(2);
@@ -504,4 +504,3 @@ fn escape_cancels_copy_mode_and_disables_paste() {
     assert_eq!(value_at(&h, "D4"), Some(Value::Empty), "cell D4 remains empty");
     assert!(h.state().toast.is_some() || h.state().message.is_some(), "Paste reports there is nothing to paste");
 }
-

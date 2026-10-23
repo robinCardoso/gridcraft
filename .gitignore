@@ -8,3 +8,16 @@ plan/
 /.claude/
 /target-*/
 /craft-fonts/
+
+# Scratch, logs and debug dumps
+scratch*
+scratch_*
+out.txt
+err.txt
+row*.txt
+*.log
+
+# Editor / OS files
+.idea/
+.vscode/
+Thumbs.db

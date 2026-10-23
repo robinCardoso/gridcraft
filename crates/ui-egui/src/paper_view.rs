@@ -131,6 +131,7 @@ pub(crate) fn paint_pages(
     sel: &gridcraft_engine::Selection,
     outline: Rect,
     cf: &mut CfCache,
+    tc: &mut grid::TextCache,
     t: &Tokens,
 ) -> Vec<((u32, u32), (u32, u32), Rect)> {
     let mut quads = Vec::new();
@@ -161,7 +162,7 @@ pub(crate) fn paint_pages(
         }
         painted += 1;
         let pc = p.with_clip_rect(clip);
-        grid::paint_quadrant(&pc, geo, wb, si, sh, rows, cols, cf, t);
+        grid::paint_quadrant(&pc, geo, wb, si, sh, rows, cols, cf, tc, t);
         if !pg.is_data_page(i, j) {
             // "Click to add data" pages: faded until something is typed there.
             pc.rect_filled(clip, 0.0, t.grid_bg.gamma_multiply(0.75));

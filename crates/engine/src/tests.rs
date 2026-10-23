@@ -270,6 +270,286 @@ fn undo_redo() {
     assert!(s.doc().unwrap().is_dirty());
 }
 
+/// Fase 5: a single-cell edit records a compact cell patch, not a full workbook snapshot.
+#[test]
+fn cell_edits_record_undo_as_a_cell_patch() {
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
+    match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Diff { reverse, forward } => {
+            assert_eq!(reverse.cell_count(), 1);
+            assert_eq!(forward.cell_count(), 1);
+            assert!(reverse.meta.is_empty());
+        }
+        crate::HistoryState::Snapshot(_) => panic!("expected a cell patch for a single-cell edit"),
+    }
+    s.execute("cell.set", json!({"cell": "A1", "input": "2"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(1.0));
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(2.0));
+}
+
+/// Fase 5: inserting a sheet changes topology — history keeps a COW snapshot.
+#[test]
+fn structural_edits_keep_a_snapshot_undo() {
+    let mut s = s();
+    s.execute("home.insertSheet", json!({})).unwrap();
+    match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Snapshot(_) => {}
+        crate::HistoryState::Diff { .. } => panic!("structural edits must not use a cell/meta patch"),
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.sheets.len(), 1);
+}
+
+/// Fase 5: sheet meta edits (merge / row height / comment) use a meta patch, not a full snapshot.
+#[test]
+fn sheet_meta_edits_record_undo_as_a_meta_patch() {
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
+    s.execute("home.mergeCells", json!({"range": "A1:B2"})).unwrap();
+    match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Diff { reverse, .. } => {
+            assert!(reverse.cells.is_empty(), "merge must not snapshot cells");
+            assert_eq!(reverse.meta.sheets.len(), 1);
+        }
+        crate::HistoryState::Snapshot(_) => panic!("expected a meta patch for merge"),
+    }
+    assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().merges.len(), 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.doc().unwrap().wb.sheet(0).unwrap().merges.is_empty());
+    assert_eq!(v(&s, "A1"), Value::Number(1.0));
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().merges.len(), 1);
+
+    s.execute("home.rowHeight", json!({"rows": "1:1", "height": 40})).unwrap();
+    match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Diff { reverse, .. } => {
+            assert!(reverse.cells.is_empty());
+            assert_eq!(reverse.meta.sheets.len(), 1);
+        }
+        crate::HistoryState::Snapshot(_) => panic!("expected a meta patch for row height"),
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_ne!(s.doc().unwrap().wb.sheet(0).unwrap().row_height(0), 40.0);
+
+    s.execute("review.newNote", json!({"cell": "A1", "text": "hello", "author": "t"})).unwrap();
+    match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Diff { reverse, .. } => {
+            assert!(reverse.cells.is_empty());
+            assert_eq!(reverse.meta.sheets.len(), 1);
+        }
+        crate::HistoryState::Snapshot(_) => panic!("expected a meta patch for a note"),
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.doc().unwrap().wb.sheet(0).unwrap().comments.is_empty());
+}
+
+/// Residual Fase 5: undo/redo of a cell Diff keeps the graph current via `cells_changed` /
+/// `update_nodes` (no full O(formulas) rebuild). Snapshot undo still pays `ensure_graph`.
+#[test]
+fn undo_cell_diff_keeps_graph_current_like_a_live_edit() {
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=A1*2"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C1", "input": "=B1+1"})).unwrap();
+    assert!(s.doc().unwrap().calc.graph_is_current());
+    let graph_len = s.doc().unwrap().calc.graph.len();
+
+    // Replace a formula with a constant: node removed; undo must put it back.
+    s.execute("cell.set", json!({"cell": "B1", "input": "10"})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::Number(11.0));
+    assert!(matches!(&s.doc().unwrap().undo.last().unwrap().state, crate::HistoryState::Diff { .. }));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.doc().unwrap().calc.graph_is_current(), "cell Diff undo must not leave the graph invalid");
+    assert_eq!(s.doc().unwrap().calc.graph.len(), graph_len, "B1 formula node restored");
+    assert_eq!(v(&s, "B1"), Value::Number(2.0));
+    assert_eq!(v(&s, "C1"), Value::Number(3.0));
+
+    // Equivalence: same graph size as a from-scratch rebuild after redo+undo of a value edit.
+    s.execute("cell.set", json!({"cell": "A1", "input": "5"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(1.0));
+    assert_eq!(v(&s, "C1"), Value::Number(3.0));
+    let len_after_undo = s.doc().unwrap().calc.graph.len();
+    {
+        let d = s.doc_mut().unwrap();
+        d.calc.rebuild(&d.wb);
+    }
+    assert_eq!(s.doc().unwrap().calc.graph.len(), len_after_undo, "incremental undo matches full rebuild");
+
+    // Snapshot (topology) still rebuilds via ensure_graph.
+    s.execute("home.insertSheet", json!({})).unwrap();
+    assert!(matches!(&s.doc().unwrap().undo.last().unwrap().state, crate::HistoryState::Snapshot(_)));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.doc().unwrap().calc.graph_is_current());
+    assert_eq!(s.doc().unwrap().wb.sheets.len(), 1);
+    assert_eq!(s.doc().unwrap().calc.graph.len(), graph_len);
+}
+
+/// Fase 5: editing an input that feeds many formulas must not store every dependent's cached value.
+#[test]
+fn undo_patch_ignores_recalculated_formula_values() {
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
+    for r in 2..=500 {
+        s.execute("cell.set", json!({ "cell": format!("A{r}"), "input": "=A1" })).unwrap();
+    }
+    s.execute("cell.set", json!({"cell": "A1", "input": "2"})).unwrap();
+    match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Diff { reverse, .. } => {
+            assert_eq!(reverse.cell_count(), 1, "cascade value updates must not inflate the undo patch");
+        }
+        crate::HistoryState::Snapshot(_) => panic!("expected a one-cell patch"),
+    }
+    assert_eq!(v(&s, "A2"), Value::Number(2.0));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(1.0));
+    assert_eq!(v(&s, "A2"), Value::Number(1.0));
+}
+
+/// Release timing / size: `cargo test -p gridcraft-engine measure_undo_diff --release -- --ignored --nocapture`
+///
+/// Manual calc isolates clone+patch cost from the cascade (Fase 5 aceite: edit < 20 ms sem cascata).
+#[test]
+#[ignore = "timing; run with --ignored in release"]
+#[allow(clippy::disallowed_methods)]
+fn measure_undo_diff() {
+    let n = 50_000u32;
+    let mut s = s();
+    // Seed without filling the undo stack (direct model write + rebuild).
+    {
+        let d = s.doc_mut().unwrap();
+        let wb = std::sync::Arc::make_mut(&mut d.wb);
+        wb.calc.mode = gridcraft_model::CalcMode::Manual;
+        let sh = wb.sheet_mut(0).unwrap();
+        sh.cells.set(CellRef::new(0, 0), gridcraft_model::Cell::value(1.0.into()));
+        for r in 1..n {
+            sh.cells.set(CellRef::new(r, 0), gridcraft_model::Cell::formula(gridcraft_model::Formula::new("=A1")));
+        }
+        d.calc.rebuild(&d.wb);
+    }
+    let t0 = std::time::Instant::now();
+    s.execute("cell.set", json!({"cell": "A1", "input": "2"})).unwrap();
+    let edit_ms = t0.elapsed();
+    let patch_cells = match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Diff { reverse, .. } => reverse.cell_count(),
+        crate::HistoryState::Snapshot(_) => usize::MAX,
+    };
+    let t1 = std::time::Instant::now();
+    s.execute("edit.undo", json!({})).unwrap();
+    let undo_ms = t1.elapsed();
+    let graph_current = s.doc().unwrap().calc.graph_is_current();
+    eprintln!(
+        "measure_undo_diff ({n} formulas, manual calc): edit={edit_ms:?} undo={undo_ms:?} patch_cells={patch_cells} graph_current={graph_current}"
+    );
+    assert_eq!(patch_cells, 1);
+    assert!(graph_current, "undo of a cell Diff must keep the graph current (no full rebuild)");
+    assert_eq!(v(&s, "A1"), Value::Number(1.0));
+
+    // Meta-only edit that does not set `structural` (rowHeight would pay recalc_all — Fase 3).
+    // Clone must not copy the band map (Arc inside CellStore).
+    let t2 = std::time::Instant::now();
+    s.execute("review.newNote", json!({"cell": "A1", "text": "n", "author": "t"})).unwrap();
+    let meta_edit = t2.elapsed();
+    let is_meta = matches!(
+        &s.doc().unwrap().undo.last().unwrap().state,
+        crate::HistoryState::Diff { reverse, .. } if reverse.cells.is_empty() && !reverse.meta.is_empty()
+    );
+    eprintln!("measure_undo_diff meta newNote: edit={meta_edit:?} meta_patch={is_meta}");
+    assert!(is_meta);
+    assert!(meta_edit.as_millis() < 20, "meta edit on {n} cells should stay under 20 ms, got {meta_edit:?}");
+}
+
+/// Aceite Fase 5 no arquivo real (~350k): `GRIDCRAFT_LISTA_XLSX=… cargo test -p gridcraft-engine
+/// measure_fase5_real_xlsx --release -- --ignored --nocapture`
+///
+/// Default: `../LISTA TESTE V3.xlsx` relativo ao crate (raiz do monorepo). Skip se o arquivo não existir.
+#[test]
+#[ignore = "timing; needs LISTA TESTE V3.xlsx; run with --ignored in release"]
+#[allow(clippy::disallowed_methods)]
+fn measure_fase5_real_xlsx() {
+    let path = std::env::var("GRIDCRAFT_LISTA_XLSX").unwrap_or_else(|_| {
+        // crates/engine → crates → gridcraft → monorepo root
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p.pop();
+        p.pop();
+        p.push("LISTA TESTE V3.xlsx");
+        p.display().to_string()
+    });
+    let path = std::path::Path::new(&path);
+    if !path.is_file() {
+        eprintln!("skip measure_fase5_real_xlsx: missing {}", path.display());
+        return;
+    }
+    let bytes = std::fs::read(path).expect("read xlsx");
+    let t_open = std::time::Instant::now();
+    let (wb, _) = crate::io::open_bytes("lista.xlsx", &bytes).expect("open xlsx");
+    let open_ms = t_open.elapsed();
+    let mut formulas = 0usize;
+    let mut biggest = (0usize, 0usize);
+    for (i, sh) in wb.sheets.iter().enumerate() {
+        let n = sh.cells.iter().filter(|(_, c)| c.formula.is_some()).count();
+        if n > biggest.1 {
+            biggest = (i, n);
+        }
+        formulas += n;
+    }
+    eprintln!("measure_fase5_real_xlsx: open={open_ms:?} sheets={} formulas={formulas} biggest_sheet={} ({})", wb.sheets.len(), biggest.0, biggest.1);
+
+    // Pick a blank cell outside every table (A1 is often a header — sync_headers would rewrite
+    // structured-ref formulas across the whole sheet and blow the Diff budget).
+    let sh_i = biggest.0;
+    let edit_cell = {
+        let sh = wb.sheet(sh_i).unwrap();
+        let mut at = CellRef::new(0, 25); // Z1
+        for _ in 0..200 {
+            let in_table = sh.tables.iter().any(|t| t.range.contains(at));
+            let busy = sh.cells.get(at).is_some_and(|c| c.formula.is_some() || !c.value.is_empty());
+            if !in_table && !busy {
+                break;
+            }
+            at = CellRef::new(at.row, at.col + 1);
+        }
+        at
+    };
+    let edit_a1 = edit_cell.a1();
+
+    let mut s = s();
+    {
+        let d = s.doc_mut().unwrap();
+        let mut wb = wb;
+        wb.calc.mode = gridcraft_model::CalcMode::Manual;
+        wb.active_sheet = sh_i;
+        wb.sheet_mut(sh_i).unwrap().cells.set(edit_cell, gridcraft_model::Cell::value(1.0.into()));
+        d.wb = std::sync::Arc::new(wb);
+        // Skip full graph rebuild: Fase 5 aceite is clone+patch, not O(fórmulas) graph build.
+        d.calc.invalidate_graph();
+    }
+
+    let t0 = std::time::Instant::now();
+    s.execute("cell.set", json!({"cell": edit_a1, "input": "42"})).unwrap();
+    let edit = t0.elapsed();
+    let patch_cells = match &s.doc().unwrap().undo.last().unwrap().state {
+        crate::HistoryState::Diff { reverse, .. } => reverse.cell_count(),
+        crate::HistoryState::Snapshot(_) => usize::MAX,
+    };
+    let t1 = std::time::Instant::now();
+    s.execute("review.newNote", json!({"cell": edit_a1, "text": "fase5", "author": "t"})).unwrap();
+    let meta_edit = t1.elapsed();
+    let meta_ok = matches!(
+        &s.doc().unwrap().undo.last().unwrap().state,
+        crate::HistoryState::Diff { reverse, .. } if reverse.cells.is_empty() && !reverse.meta.is_empty()
+    );
+    eprintln!("measure_fase5_real_xlsx: cell={edit_a1} cell.set={edit:?} patch_cells={patch_cells} newNote={meta_edit:?} meta_patch={meta_ok}");
+    assert_eq!(patch_cells, 1, "expected a one-cell Diff (avoid table headers)");
+    assert!(meta_ok);
+    assert!(edit.as_millis() < 20, "Fase 5 aceite: edit < 20 ms sem cascata no arquivo real, got {edit:?}");
+    assert!(meta_edit.as_millis() < 20, "meta edit < 20 ms no arquivo real, got {meta_edit:?}");
+}
+
 #[test]
 fn redo_selects_the_redone_cell() {
     // #1855: type into A1..A3, click A1, undo, redo: the selection follows the edit to A3.
@@ -1719,8 +1999,8 @@ fn ods_import_keeps_cached_values_and_reports_limits() {
     }
 }
 
-#[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn ods_import_never_reuses_source_as_save_target() {
     #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -1750,8 +2030,8 @@ fn ods_import_never_reuses_source_as_save_target() {
 }
 
 /// Open a `;` CSV by path (a double-click), edit, Save: the file keeps its `;` separator.
-#[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn saving_an_opened_semicolon_csv_keeps_semicolons() {
     #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -1825,8 +2105,8 @@ fn link_target(path: &std::path::Path) -> String {
 
 /// Save As into another folder keeps the link on the same file, as Excel does: the relative path
 /// is rewritten from the new folder (#801).
-#[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn save_as_into_another_folder_keeps_linked_workbooks_on_the_same_file() {
     #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -1854,8 +2134,8 @@ fn save_as_into_another_folder_keeps_linked_workbooks_on_the_same_file() {
 
 /// A typo like `report.cvs` must not quietly write an XLSX under that name and adopt it as the
 /// document's file.
-#[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn saving_to_an_unknown_extension_is_refused() {
     #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -1879,8 +2159,8 @@ fn saving_to_an_unknown_extension_is_refused() {
 
 /// An XLSX opened by its content under an unknown extension (`budget.dat`) saves back to its own
 /// file as XLSX; a Save As to another unknown extension is still refused.
-#[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn an_xlsx_opened_under_an_unknown_extension_saves_back_as_xlsx() {
     #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -2462,8 +2742,8 @@ fn xlsb_import_keeps_cached_values_and_reports_limits() {
     }
 }
 
-#[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn xlsb_import_never_reuses_source_as_save_target() {
     #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -3252,8 +3532,8 @@ fn encrypted_workbooks_open_with_their_password() {
     assert!(!journal.contains(PW), "the password never reaches the journal");
 }
 
-#[test]
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn a_decrypted_workbook_never_overwrites_its_encrypted_original() {
     const PW: &str = "synthetic-pw-5522";
     #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
@@ -3360,4 +3640,343 @@ fn csv_as_text_keeps_identifier_columns_as_written() {
     }
     let saved = s.execute("file.saveBytes", json!({"format": "csv"})).unwrap();
     assert_eq!(crate::io::base64_decode(saved["base64"].as_str().unwrap()).unwrap(), csv.replace('\n', "\r\n").as_bytes());
+}
+
+/// Fase 0 of docs/plano-responsividade.md: measure every command over a heavy corpus and report
+/// the slowest ones, so the budget work picks targets from numbers instead of guesses. The corpus
+/// is generated in code (no fixtures in the repo): two sheets holding values and formulas.
+///
+/// Reporting only at first, as the plan asks ("orçamento inicialmente frouxo: só reportando"): the
+/// test fails when a command errors *internally* (the never-crash invariant) or, once someone sets
+/// `GRIDCRAFT_BUDGET_MS`, when a command takes longer than that budget.
+#[allow(clippy::disallowed_methods)] // the crate forbids clocks (wasm traps); a measurement must read one
+#[test]
+fn every_command_stays_within_budget() {
+    use std::time::Instant;
+    // `cargo xtask perf --rows N` scales the corpus up; the plain test run stays small on
+    // purpose (fast CI), the measurement runs heavier on demand.
+    let rows: usize = std::env::var("GRIDCRAFT_BUDGET_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    const COLS: usize = 5;
+    const REPORT_TOP: usize = 25;
+    let mut s = s();
+
+    // Two sheets, values in A:E and a SUM column in F (the shape the plan's corpus describes).
+    for sheet in 0..2 {
+        if sheet > 0 {
+            s.execute("home.insertSheet", json!({})).unwrap();
+        }
+        let block: Vec<Vec<serde_json::Value>> =
+            (0..rows).map(|r| (0..COLS).map(|c| if c == COLS - 1 { json!(format!("item-{r}")) } else { json!(r * COLS + c) }).collect()).collect();
+        s.execute("range.setValues", json!({"range": "A1", "values": block})).unwrap();
+        let col = sheet; // sheets are addressed 0-based
+        for r in 1..=rows {
+            s.execute("cell.set", json!({"sheet": col, "cell": format!("F{r}"), "input": format!("=SUM(A{r}:C{r})")})).unwrap();
+        }
+    }
+
+    // The corpus is what makes the timings mean anything: report its size with the numbers.
+    let (cells, formulas) = {
+        let d = s.doc().unwrap();
+        let cells: usize = d.wb.sheets.iter().map(|sh| sh.cells.len()).sum();
+        (cells, d.calc.graph.len())
+    };
+
+    let mut times: Vec<(&'static str, f64)> = Vec::new();
+    for spec in crate::command_specs() {
+        // Files and pictures leave the process (paths, dialogs); `file.new` would discard the corpus.
+        if matches!(
+            spec.id,
+            "file.close" | "file.open" | "file.new" | "file.save" | "file.saveAs" | "file.exportCsv" | "file.exportHtml" | "insert.picture"
+        ) {
+            continue;
+        }
+        let t0 = Instant::now();
+        let r = s.execute(spec.id, json!({}));
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(!matches!(r, Err(crate::EngineError::Internal(..))), "{} returned an internal error: {r:?}", spec.id);
+        times.push((spec.id, ms));
+    }
+
+    times.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let total: f64 = times.iter().map(|(_, ms)| ms).sum();
+    eprintln!("command budget on {cells} cells / {formulas} formulas: {} commands, {total:.0} ms total", times.len());
+    for (id, ms) in times.iter().take(REPORT_TOP) {
+        eprintln!("  {ms:9.1} ms  {id}");
+    }
+
+    // Opt-in hard budget: the plan starts loose and tightens as the numbers come in.
+    if let Ok(budget) = std::env::var("GRIDCRAFT_BUDGET_MS").map_err(|_| ()).and_then(|b| b.parse::<f64>().map_err(|_| ())) {
+        let over: Vec<String> = times.iter().filter(|(_, ms)| *ms > budget).map(|(id, ms)| format!("{id} {ms:.0} ms")).collect();
+        assert!(over.is_empty(), "commands over the {budget} ms budget:\n{}", over.join("\n"));
+    }
+}
+
+/// Fase 3 (docs/plano-responsividade.md): with the interface's deferral on, structural commands
+/// skip the synchronous recalculation — the values stay stale until something recomputes, and a
+/// full inline recalculation pays the debt. The CLI and the tests never turn this on.
+#[test]
+fn structural_commands_defer_the_recalculation_only_when_the_interface_asks() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["H"], [1], [2], [3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=SUM(A2:A4)"})).unwrap();
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(6.0));
+    // Without the deferral (the CLI's and tests' world), a structural edit recalculates inline.
+    s.execute("home.deleteRows", json!({"rows": "4:4"})).unwrap();
+    assert!(!s.doc().unwrap().recalc_pending);
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(3.0));
+    // Undo for the next half of the test.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(6.0));
+    // With the deferral on, the same edit leaves the values stale and marks the debt.
+    s.doc_mut().unwrap().defer_structural = true;
+    s.execute("home.deleteRows", json!({"rows": "4:4"})).unwrap();
+    assert!(s.doc().unwrap().recalc_pending, "the recalculation is owed");
+    assert!(!s.doc().unwrap().calc.graph_is_current(), "structural deferral invalidates the graph");
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(6.0), "stale until something recomputes");
+    // A full inline recalculation pays it.
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert!(!s.doc().unwrap().recalc_pending);
+    assert!(s.doc().unwrap().calc.graph_is_current(), "F9 rebuilds and marks the graph current");
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(3.0), "fresh after the recalculation");
+    // And while the debt is open, plain edits defer too (the job recomputes everything anyway).
+    s.doc_mut().unwrap().defer_structural = true;
+    s.doc_mut().unwrap().recalc_pending = true;
+    s.execute("cell.set", json!({"cell": "A2", "input": "10"})).unwrap();
+    assert!(s.doc().unwrap().calc.graph_is_current(), "non-structural deferral keeps nodes via update_nodes");
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(3.0), "still stale: the job will recompute");
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(12.0));
+}
+
+/// Automatic edit must cascade to other sheets even when the dirty set exceeds 1_000 (the old
+/// active-sheet truncate). With `defer_structural`, a cascade past `CASCADE_JOB_CELLS` marks
+/// `recalc_pending` instead of leaving silent stale values. Manual stays non-cascading.
+#[test]
+fn automatic_edit_cascades_cross_sheet_or_marks_pending() {
+    let n = 1_100u32;
+    let mut s = s();
+    s.execute("home.insertSheet", json!({"name": "Data"})).unwrap();
+    // Seed on sheet 0 + many dependents on Data without going through commit per cell.
+    // Direct model writes leave `graph_valid`; invalidate so recalc_all rebuilds nodes.
+    {
+        let d = s.doc_mut().unwrap();
+        let wb = std::sync::Arc::make_mut(&mut d.wb);
+        wb.active_sheet = 0;
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 0), gridcraft_model::Cell::value(Value::Number(1.0)));
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 1), gridcraft_model::Cell::formula(gridcraft_model::Formula::new("=Data!A1")));
+        {
+            let data = wb.sheet_mut(1).unwrap();
+            for r in 0..n {
+                data.cells.set(CellRef::new(r, 0), gridcraft_model::Cell::formula(gridcraft_model::Formula::new("=Sheet1!A1")));
+            }
+        }
+        d.calc.invalidate_graph();
+        d.calc.recalc_all(wb);
+    }
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(0, 0)), Value::Number(1.0));
+    assert_eq!(v(&s, "B1"), Value::Number(1.0));
+
+    s.execute("cell.set", json!({"cell": "A1", "input": "7"})).unwrap();
+    assert!(!s.doc().unwrap().recalc_pending, "sync Automatic pays the cascade inline");
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(0, 0)), Value::Number(7.0));
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(n - 1, 0)), Value::Number(7.0));
+    assert_eq!(v(&s, "B1"), Value::Number(7.0), "cross-sheet read on the active sheet updates");
+
+    // Manual: dependents stay until calculateNow.
+    s.execute("formulas.calculationOptions", json!({"mode": "manual"})).unwrap();
+    s.execute("cell.set", json!({"cell": "A1", "input": "3"})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(0, 0)), Value::Number(7.0), "Manual does not cascade");
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(0, 0)), Value::Number(3.0));
+
+    // Large cascade with interface deferral: debt is observable, not silent truncate.
+    s.execute("formulas.calculationOptions", json!({"mode": "automatic"})).unwrap();
+    let big = (crate::CASCADE_JOB_CELLS + 100) as u32;
+    {
+        let d = s.doc_mut().unwrap();
+        d.defer_structural = true;
+        let wb = std::sync::Arc::make_mut(&mut d.wb);
+        wb.active_sheet = 0;
+        {
+            let data = wb.sheet_mut(1).unwrap();
+            for r in n..big {
+                data.cells.set(CellRef::new(r, 0), gridcraft_model::Cell::formula(gridcraft_model::Formula::new("=Sheet1!A1")));
+            }
+        }
+        d.calc.invalidate_graph();
+        d.calc.recalc_all(wb);
+        d.recalc_pending = false;
+    }
+    s.execute("cell.set", json!({"cell": "A1", "input": "11"})).unwrap();
+    assert!(s.doc().unwrap().recalc_pending, "cascade past CASCADE_JOB_CELLS owes a job");
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(0, 0)), Value::Number(3.0), "stale until the job / F9");
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert!(!s.doc().unwrap().recalc_pending);
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(0, 0)), Value::Number(11.0));
+    assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(big - 1, 0)), Value::Number(11.0));
+}
+
+/// Fase 3: `recalc_document` reuses a current graph (skip rebuild) and matches a fresh Calc.
+#[test]
+fn recalc_document_reuses_current_graph() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=SUM(A1:A3)"})).unwrap();
+    s.execute("cell.set", json!({"cell": "B2", "input": "=B1*2"})).unwrap();
+    let d = s.doc().unwrap();
+    assert!(d.calc.graph_is_current());
+    let seeds = d.calc.seeds();
+    let (wb_inc, calc_inc, _) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds);
+    let (wb_full, calc_full, _) = crate::recalc_document(&d.wb, crate::calc::Calc::new(), None, None, seeds);
+    assert!(calc_inc.graph_is_current());
+    assert!(calc_full.graph_is_current());
+    assert_eq!(wb_inc, wb_full);
+    assert_eq!(calc_inc.graph.len(), calc_full.graph.len());
+    assert_eq!(wb_inc.sheet(0).unwrap().value(gridcraft_core::CellRef::parse("B2").unwrap()), gridcraft_core::Value::Number(12.0));
+}
+
+/// Fase 3 (docs/plano-responsividade.md): an analysis (Goal Seek, Solver) runs on a *snapshot*
+/// through a private Session — same result as the inline command, never mutating the live
+/// document — and honours the job hooks, so a cancelled job stops the search.
+#[test]
+fn analysis_runs_on_a_snapshot_and_honours_cancel() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=A1*2+1"})).unwrap();
+    let d = s.doc().unwrap();
+    let (wb, calc) = (d.wb.clone(), d.calc.clone());
+    let params = json!({"set": "B1", "to": 9, "changing": "A1"});
+    let (out_wb, _calc, r) = crate::run_analysis(&wb, &calc, "data.goalSeek", &params, None).unwrap();
+    assert_eq!(r["converged"], json!(true), "{r}");
+    assert!((r["value"].as_f64().unwrap() - 4.0).abs() < 1e-6, "{r}");
+    assert_eq!(out_wb.active().unwrap().value(CellRef::parse("A1").unwrap()), Value::Number(4.0));
+    assert_eq!(wb.active().unwrap().value(CellRef::parse("A1").unwrap()), Value::Number(1.0), "the snapshot is untouched");
+    // Cancelled before it starts: the search stops without converging.
+    let hooks = std::sync::Arc::new(gridcraft_calc::CalcHooks::new());
+    hooks.cancel();
+    let (_wb, _calc, r) = crate::run_analysis(&wb, &calc, "data.goalSeek", &params, Some(hooks)).unwrap();
+    assert_eq!(r["converged"], json!(false), "{r}");
+
+    // The Solver's evaluation loop stops on the same hook (status: evaluation limit).
+    s.execute("range.setValues", json!({"range": "D1", "values": [[0, 0], [0, 0], [0, 0]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "E1", "input": "=3*D1+5*D2"})).unwrap();
+    s.execute("cell.set", json!({"cell": "E2", "input": "=2*D2"})).unwrap();
+    s.execute("cell.set", json!({"cell": "E3", "input": "=3*D1+2*D2"})).unwrap();
+    let d = s.doc().unwrap();
+    let (wb, calc) = (d.wb.clone(), d.calc.clone());
+    let lp = json!({"objective": "E1", "goal": "max", "variables": "D1:D2", "constraints": ["D1 <= 4", "E2 <= 12", "E3 <= 18"], "method": "simplex"});
+    let hooks = std::sync::Arc::new(gridcraft_calc::CalcHooks::new());
+    hooks.cancel();
+    let (_wb, _calc, r) = crate::run_analysis(&wb, &calc, "data.solver", &lp, Some(hooks)).unwrap();
+    assert_eq!(r["status"], json!("iterationLimit"), "{r}");
+    assert_eq!(r["changed"], json!(false), "{r}");
+}
+
+/// Fase 3 (docs/plano-responsividade.md): exact MATCH/VLOOKUP answer through the host's per-pass
+/// index, with Excel's semantics — 15-significant-digit number equality, case-insensitive text,
+/// wildcards, first duplicate, whole-column references (trimmed like the array path), the same
+/// errors as the functions, and the fallback shape still correct.
+#[test]
+fn exact_lookup_index_matches_excel_semantics() {
+    let mut s = s();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["code", "price"], ["alpha", 10], ["BETA", 20], ["alpha", 99], ["gamma", 0.1], ["delta", 0.2]
+        ]}),
+    )
+    .unwrap();
+    s.execute("cell.set", json!({"cell": "D1", "input": "=0.1+0.2"})).unwrap();
+    s.execute("cell.set", json!({"cell": "D2", "input": "=0.3"})).unwrap();
+    let set = |s: &mut Session, cell: &str, input: &str| {
+        s.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+    };
+    set(&mut s, "F1", "=MATCH(\"ALPHA\",A2:A6,0)");
+    set(&mut s, "F2", "=MATCH(\"beta\",A2:A6,0)");
+    set(&mut s, "F3", "=MATCH(\"*a\",A2:A6,0)");
+    set(&mut s, "F4", "=VLOOKUP(\"beta\",A2:B6,2,FALSE)");
+    set(&mut s, "F5", "=VLOOKUP(\"nope\",A2:B6,2,FALSE)");
+    set(&mut s, "F6", "=VLOOKUP(\"alpha\",A2:B6,3,FALSE)");
+    set(&mut s, "F7", "=MATCH(\"gamma\",A:A,0)");
+    set(&mut s, "F8", "=MATCH(D1,D2:D2,0)");
+    set(&mut s, "F9", "=MATCH(0.31,D2:D2,0)");
+    // Not a literal 0: the function path, still the same answer.
+    set(&mut s, "F10", "=MATCH(\"alpha\",A2:A6,0+0)");
+    let d = s.doc().unwrap();
+    let v = |a1: &str| d.wb.active().unwrap().value(CellRef::parse(a1).unwrap());
+    assert_eq!(v("F1"), Value::Number(1.0), "first duplicate, case-insensitive");
+    assert_eq!(v("F2"), Value::Number(2.0));
+    assert_eq!(v("F3"), Value::Number(1.0), "wildcard, first match");
+    assert_eq!(v("F4"), Value::Number(20.0));
+    assert_eq!(v("F5"), Value::Error(gridcraft_core::CellError::NA));
+    assert_eq!(v("F6"), Value::Error(gridcraft_core::CellError::Ref), "column index past the table");
+    assert_eq!(v("F7"), Value::Number(5.0), "whole-column reference");
+    assert_eq!(v("F8"), Value::Number(1.0), "0.1+0.2 equals 0.3 at 15 digits");
+    assert_eq!(v("F9"), Value::Error(gridcraft_core::CellError::NA));
+    assert_eq!(v("F10"), Value::Number(1.0), "the fallback path still answers");
+}
+
+/// Fase 3 (docs/plano-responsividade.md): COUNTIFS/SUMIFS with pure equality criteria answer
+/// through the per-pass equality index, with the same results as the function path — text is
+/// case-insensitive, numbers compare at 15 significant digits, several criteria intersect, text
+/// cells in the sum range are ignored, errors propagate, and non-equality criteria (wildcards,
+/// comparisons) and mismatched shapes still behave exactly as before.
+#[test]
+fn equality_indexed_ifs_matches_the_function_path() {
+    let mut s = s();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["group", "qty", "tag", "mixed"],
+            ["a", 1, "x", "text"],
+            ["A", 2, "y", 10],
+            ["b", 3, "x", 20],
+            ["a", 4, "x", 30],
+            ["b", 5.000000000000001, "y", 40]
+        ]}),
+    )
+    .unwrap();
+    s.execute("cell.set", json!({"cell": "G1", "input": "=0.1+0.2"})).unwrap();
+    s.execute("cell.set", json!({"cell": "G2", "input": "=0.3"})).unwrap();
+    let f = |s: &mut Session, cell: &str, input: &str| {
+        s.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+    };
+    // Indexed shapes (plain references + literal or value criteria).
+    f(&mut s, "H1", "=COUNTIFS(A2:A6,\"a\")");
+    f(&mut s, "H2", "=COUNTIFS(A2:A6,\"a\",C2:C6,\"x\")");
+    f(&mut s, "H3", "=SUMIFS(B2:B6,A2:A6,\"a\")");
+    f(&mut s, "H4", "=SUMIFS(B2:B6,A2:A6,\"a\",C2:C6,\"x\")");
+    f(&mut s, "H5", "=COUNTIFS(A2:A6,\"zzz\")");
+    f(&mut s, "H6", "=COUNTIFS(A2:A6,A2)");
+    // Non-equality criteria fall back and keep their answers.
+    f(&mut s, "H7", "=COUNTIFS(A2:A6,\"a*\")");
+    f(&mut s, "H8", "=COUNTIFS(B2:B6,\">2\")");
+    f(&mut s, "H9", "=SUMIFS(C2:C6,A2:A6,\"a\")");
+    f(&mut s, "H10", "=SUMIFS(B2:B6,A2:A5,\"a\")");
+    // The same searches through the functions (an array expression defeats the reference shape).
+    f(&mut s, "I1", "=COUNTIFS(A2:A6&\"\",\"a\")");
+    f(&mut s, "I2", "=COUNTIFS(A2:A6&\"\",\"a\",C2:C6&\"\",\"x\")");
+    f(&mut s, "I3", "=SUMIFS(B2:B6,A2:A6&\"\",\"a\")");
+    f(&mut s, "I4", "=SUMIFS(B2:B6,A2:A6&\"\",\"a\",C2:C6&\"\",\"x\")");
+    // 15-significant-digit equality: the index keys the rounded number, like `compare_numbers`.
+    f(&mut s, "I5", "=COUNTIFS(G2:G2,G1)");
+    f(&mut s, "I6", "=COUNTIFS(B2:B6,5.000000000000001)");
+    let d = s.doc().unwrap();
+    let v = |a1: &str| d.wb.active().unwrap().value(CellRef::parse(a1).unwrap());
+    assert_eq!(v("H1"), Value::Number(3.0), "case-insensitive");
+    assert_eq!(v("H2"), Value::Number(2.0), "two criteria intersect");
+    assert_eq!(v("H3"), Value::Number(7.0));
+    assert_eq!(v("H4"), Value::Number(5.0));
+    assert_eq!(v("H5"), Value::Number(0.0), "no matches");
+    assert_eq!(v("H6"), Value::Number(3.0), "a cell as the criterion");
+    assert_eq!(v("H7"), Value::Number(3.0), "wildcard (function path)");
+    assert_eq!(v("H8"), Value::Number(3.0), "comparison (function path)");
+    assert_eq!(v("H9"), Value::Number(0.0), "text cells in the sum range are ignored");
+    assert_eq!(v("H10"), Value::Error(gridcraft_core::CellError::Value), "mismatched shapes");
+    assert_eq!(v("I1"), v("H1"), "the function path agrees");
+    assert_eq!(v("I2"), v("H2"));
+    assert_eq!(v("I3"), v("H3"));
+    assert_eq!(v("I4"), v("H4"));
+    assert_eq!(v("I5"), Value::Number(1.0), "0.1+0.2 equals 0.3 at 15 digits");
+    assert_eq!(v("I6"), Value::Number(1.0));
 }

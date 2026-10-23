@@ -551,6 +551,8 @@ fn evaluate(s: &mut Session, p: &Json) -> Result<Json> {
 fn calc_now(s: &mut Session, _: &Json) -> Result<Json> {
     let d = s.doc_mut()?;
     let mut wb = (*d.wb).clone();
+    // A full inline recalculation pays the whole deferral debt (Fase 3).
+    d.recalc_pending = false;
     d.calc.recalc_all(&mut wb);
     d.wb = std::sync::Arc::new(wb);
     Ok(json!({"cells": d.calc.last_recalc_cells}))

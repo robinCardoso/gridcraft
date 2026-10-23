@@ -92,7 +92,8 @@ fn windows_and_mac_variants() {
     let mac_cmd = Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE };
     let ctrl = Modifiers::CTRL;
     let run = |id: &'static str| Some(Shortcut::Run(id, json!({})));
-    assert_eq!(lookup(Key::L, Some(Key::L), cmd, false), run("insert.table"));
+    // Excel pt-BR opens Find with Ctrl+L (Ctrl+T is Insert Table).
+    assert_eq!(lookup(Key::L, Some(Key::L), cmd, false), Some(Shortcut::Dialog("find", json!({}))));
     assert_eq!(lookup(Key::L, Some(Key::L), mac_cmd, true), run("home.alignLeft"));
     assert_eq!(lookup(Key::E, Some(Key::E), mac_cmd, true), run("home.alignCenter"));
     assert_eq!(lookup(Key::E, Some(Key::E), ctrl, true), run("edit.flashFill"));

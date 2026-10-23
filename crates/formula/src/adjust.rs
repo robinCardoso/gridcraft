@@ -116,6 +116,78 @@ pub fn adjust(e: Expr, host: &str, target: &str, edit: &Edit) -> Expr {
     })
 }
 
+/// Like [`adjust`] for several edits applied one after the other (oldest first), in a single walk
+/// of the expression and without reparsing: equivalent to folding `adjust` over `edits`.
+pub fn adjust_edits(e: Expr, host: &str, target: &str, edits: &[Edit]) -> Expr {
+    let rows_only = edits.iter().all(|x| matches!(x, Edit::Insert { axis: Axis::Rows, .. }));
+    e.map(&mut |x| match x {
+        Expr::Ref(r) => {
+            let on_target = match &r.sheet {
+                SheetSel::Current => host.eq_ignore_ascii_case(target),
+                SheetSel::Named(n) => n.eq_ignore_ascii_case(target),
+                SheetSel::Span(..) => false,
+            };
+            if !on_target {
+                return Expr::Ref(r);
+            }
+            let mut cur = r;
+            if rows_only {
+                // Same arithmetic as `adjust_ref`, in place: no clone of the reference per edit.
+                let ins = |f: &mut dyn FnMut(u32, u32) -> Option<()>| {
+                    for edit in edits {
+                        if let Edit::Insert { at, count, .. } = edit {
+                            f(*at, *count)?;
+                        }
+                    }
+                    Some(())
+                };
+                let ok = match &mut cur.kind {
+                    RefKind::Cell(a) => {
+                        let mut row = a.row;
+                        let ok = ins(&mut |at, count| {
+                            row = map_index(row, at, count, true, MAX_ROWS)?;
+                            Some(())
+                        });
+                        a.row = row;
+                        ok
+                    }
+                    RefKind::Range(a, b) => {
+                        let (mut lo, mut hi) = (a.row.min(b.row), a.row.max(b.row));
+                        let ok = ins(&mut |at, count| {
+                            (lo, hi) = map_span(lo, hi, at, count, true, MAX_ROWS)?;
+                            Some(())
+                        });
+                        a.row = lo;
+                        b.row = hi;
+                        ok
+                    }
+                    RefKind::Rows(r0, _, r1, _) => {
+                        let (mut lo, mut hi) = (*r0.min(r1), *r0.max(r1));
+                        let ok = ins(&mut |at, count| {
+                            (lo, hi) = map_span(lo, hi, at, count, true, MAX_ROWS)?;
+                            Some(())
+                        });
+                        *r0 = lo;
+                        *r1 = hi;
+                        ok
+                    }
+                    RefKind::Cols(..) => Some(()),
+                };
+                return if ok.is_some() { Expr::Ref(cur) } else { Expr::Error(CellError::Ref) };
+            }
+            for edit in edits {
+                // A reference that moved to another sheet (MoveToSheet) is no longer on the target.
+                match adjust_ref(&cur, edit) {
+                    Some(n) => cur = n,
+                    None => return Expr::Error(CellError::Ref),
+                }
+            }
+            Expr::Ref(cur)
+        }
+        other => other,
+    })
+}
+
 /// New position of an index after an insert (`None` never) or delete (`None` = deleted).
 fn map_index(v: u32, at: u32, count: u32, insert: bool, max: u32) -> Option<u32> {
     if insert {

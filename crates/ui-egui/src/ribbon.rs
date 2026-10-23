@@ -8,7 +8,7 @@ use crate::SheetApp;
 use crate::icons::{self, Icon};
 use crate::keytips::keytip_table;
 use crate::theme::{self, Tokens};
-use crate::widgets::{big_button, big_button_enabled, color_palette, icon_button, small_button, split_button, toggle_button};
+use crate::widgets::{big_button, color_palette, icon_button, small_button, split_big_button, split_button, toggle_button};
 
 pub const TABS: &[&str] = &["Home", "Insert", "Draw", "Page Layout", "Formulas", "Data", "Review", "View", "Automate"];
 
@@ -510,38 +510,20 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
     let st = active_style(app);
     // Clipboard
     let can_paste = app.can_paste();
-    let paste = big_button_enabled(ui, Icon::Paste, "Paste", "Paste (⌘V)", true, can_paste);
+    // Main part (icon + label) pastes; the independent arrow below the label opens the options menu.
+    let (paste, paste_arrow) = split_big_button(ui, Icon::Paste, "Paste", "Paste (⌘V)", "Paste Options", can_paste);
     paste.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, can_paste, "Paste"));
     for sequence in
         keytip_table::group_extension(app.keytips.prefix().unwrap_or_default(), &["edit.paste", "edit.pasteSpecial", "dialog:pasteSpecial"])
     {
-        keytip(app, ui, sequence, paste.rect.center_bottom());
+        keytip(app, ui, sequence, paste_arrow.rect.center_bottom());
     }
     if paste.clicked() {
         app.paste_from_clipboard();
     }
     let paste_keys = can_paste && matches!(app.keytips.prefix(), Some("HV" | "E"));
-    // Keep a keyboard-opened menu anchored to the button when a pointer click
-    // cancels keytips, so its items remain in place and can still be clicked.
-    let anchor_id = paste.id.with("keytip_anchor");
-    // Query response state before taking the egui context write lock.
-    // Calling secondary_clicked() inside data_mut can deadlock.
-    let paste_secondary_clicked = paste.secondary_clicked();
-    let anchored = ui.ctx().data_mut(|data| {
-        let anchored = if paste_keys {
-            true
-        } else if paste_secondary_clicked {
-            false
-        } else {
-            data.get_temp::<bool>(anchor_id).unwrap_or(false)
-        };
-        data.insert_temp(anchor_id, anchored);
-        anchored
-    });
-    let mut paste_popup = egui::Popup::context_menu(&paste);
-    if anchored {
-        paste_popup = paste_popup.anchor(&paste);
-    }
+    // Left click on the arrow toggles the menu; keytips open it anchored to the arrow.
+    let mut paste_popup = egui::Popup::menu(&paste_arrow);
     if paste_keys {
         paste_popup = paste_popup.open_memory(egui::SetOpenCommand::Bool(true));
     }

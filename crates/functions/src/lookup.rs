@@ -210,14 +210,15 @@ fn match_fn(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     if let Value::Error(e) = av {
         return Err(*e);
     }
-    let hay = vector(&as_array(av)).ok_or(CellError::NA)?;
+    let arr = as_array(av);
+    let hay: &[Value] = if arr.rows == 1 || arr.cols == 1 { &arr.data } else { return Err(CellError::NA) };
     let mt = opt_num(args, 2, 1.0)?;
     let pos = if mt == 0.0 {
-        find_exact(&x, &hay, true, false)
+        find_exact(&x, hay, true, false)
     } else if mt > 0.0 {
-        bsearch_last(&x, &hay, false)
+        bsearch_last(&x, hay, false)
     } else {
-        bsearch_last(&x, &hay, true)
+        bsearch_last(&x, hay, true)
     };
     pos.map(|p| Value::Number((p + 1) as f64)).ok_or(CellError::NA)
 }

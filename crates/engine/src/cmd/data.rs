@@ -1256,6 +1256,11 @@ fn show_levels(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
+/// Data › Subtotal in ONE commit (docs/plano-responsividade.md, Fase 0). The old version ran four
+/// commands per group (`home.insertRows`, `cell.set`s, `home.bold`, `data.group`), and every one
+/// of them recalculated the whole cascade — quadratic in the number of groups (55 s at 1 500
+/// groups). Everything now mutates the `Ctx` workbook directly and the framework commits once, so
+/// the recalculation runs a single time; undo also reverts the whole subtotal in one step.
 fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
     let r = data_range(s, p)?;
     let group_col = col_param(p.get("groupBy"), r.start.col).unwrap_or(r.start.col);
@@ -1282,7 +1287,7 @@ fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
         _ => "Total",
     };
     let sheet = s.doc()?.wb.active_sheet;
-    // Group boundaries (header in the first row).
+    // Group boundaries (header in the first row) — read before any edit.
     let d = s.doc()?;
     let sh = d.wb.sheet(sheet).ok_or(EngineError::NoDocument)?;
     let mut groups: Vec<(u32, u32, String)> = Vec::new();
@@ -1295,30 +1300,124 @@ fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
             start = row;
         }
     }
-    // Insert a total row after each group, bottom-up so indices stay valid.
-    let mut inserted = 0;
-    for (g0, g1, name) in groups.iter().rev() {
-        s.execute("home.insertRows", json!({"rows": format!("{}:{}", g1 + 2, g1 + 2)}))?;
-        let row = g1 + 1;
-        let lbl = CellRef::new(row, group_col).a1();
-        s.execute("cell.set", json!({"cell": lbl, "input": format!("{name} {label}")}))?;
-        for c in &cols {
-            let range = RangeRef::new(CellRef::new(*g0, *c), CellRef::new(*g1, *c)).a1();
-            s.execute("cell.set", json!({"cell": CellRef::new(row, *c).a1(), "input": format!("=SUBTOTAL({code},{range})")}))?;
+    // Row inserts are what `home.insertRows` would check; every group inserts on the same sheet,
+    // so one check for the first position covers them all.
+    if let Some((_, g1, _)) = groups.first() {
+        super::sheet::check_lines_protection(s, p, gridcraft_formula::adjust::Axis::Rows, g1 + 1, 1, true)?;
+    }
+    let name = sh.name.clone();
+    edit(s, |cx| {
+        // The protection of the inserts was checked above (as `home.insertRows` does).
+        cx.protection_checked = true;
+        let mut cache: std::collections::HashMap<gridcraft_model::StyleId, gridcraft_model::StyleId> = std::collections::HashMap::new();
+        use gridcraft_formula::adjust::{Axis, Edit};
+        // (a) Shift the rows of every total line, bottom-up so the indices above stay valid, and
+        // (b) rewrite the references ONCE for all of those inserts (oldest first) — doing it per
+        // insert re-parsed every formula k times.
+        let n = groups.len() as u32;
+        let last = r.end.row + n + 1;
+        // Refuse to push data off the sheet, as `home.insertRows` does.
+        if let Some(u) = cx.wb.sheet(sheet).and_then(|sh| sh.used_range())
+            && u.end.row as u64 + n as u64 + 1 >= gridcraft_core::MAX_ROWS as u64
+        {
+            return Err(EngineError::Other("To prevent possible loss of data, Excel cannot shift nonblank cells off of the worksheet.".into()));
         }
-        s.execute("home.bold", json!({"range": RangeRef::new(CellRef::new(row, r.start.col), CellRef::new(row, r.end.col)).a1(), "on": true}))?;
-        s.execute("data.group", json!({"rows": format!("{}:{}", g0 + 1, g1 + 1)}))?;
-        inserted += 1;
+        let ats: Vec<u32> = groups.iter().map(|(_, g1, _)| g1 + 1).collect();
+        // Every cell moves once: down by the inserts at or above its row, plus the grand-total
+        // insert (at `last`, in the already-shifted coordinates).
+        cx.sheet_mut(sheet)?.cells.remap_rows(|v| {
+            let v1 = v + ats.partition_point(|a| *a <= v) as u32;
+            Some(if v1 >= last { v1 + 1 } else { v1 })
+        });
+        let mut edits: Vec<Edit> = Vec::with_capacity(groups.len() + 1);
+        for (_, g1, _) in groups.iter().rev() {
+            insert_row_on(cx, sheet, g1 + 1)?;
+            edits.push(Edit::Insert { axis: Axis::Rows, at: g1 + 1, count: 1 });
+        }
+        insert_row_on(cx, sheet, last)?;
+        edits.push(Edit::Insert { axis: Axis::Rows, at: last, count: 1 });
+        super::sheet::rewrite_edits(&mut cx.wb, &name, &edits);
+        cx.structural = true;
+        // (c) Labels, formulas and formats go in at their final coordinates (group `i` sits `i`
+        // rows lower than where it was read), after the rewrite so they are not adjusted again.
+        for (i, (g0, g1, gname)) in groups.iter().enumerate() {
+            let i = i as u32;
+            let (d0, d1, at) = (g0 + i, g1 + i, g1 + 1 + i);
+            set_text(cx, sheet, CellRef::new(at, group_col), format!("{gname} {label}"))?;
+            for c in &cols {
+                let range = RangeRef::new(CellRef::new(d0, *c), CellRef::new(d1, *c)).a1();
+                set_formula(cx, sheet, CellRef::new(at, *c), format!("=SUBTOTAL({code},{range})"))?;
+            }
+            bold_range(cx, sheet, &RangeRef::new(CellRef::new(at, r.start.col), CellRef::new(at, r.end.col)), &mut cache);
+            group_rows_on(cx, sheet, d0, d1)?;
+        }
+        // Grand total row, spanning every data row plus the group totals (SUBTOTAL ignores
+        // nested SUBTOTALs, which is what makes that work).
+        set_text(cx, sheet, CellRef::new(last, group_col), format!("Grand {label}"))?;
+        for c in &cols {
+            let range = RangeRef::new(CellRef::new(r.start.row + 1, *c), CellRef::new(last - 1, *c)).a1();
+            set_formula(cx, sheet, CellRef::new(last, *c), format!("=SUBTOTAL({code},{range})"))?;
+        }
+        bold_range(cx, sheet, &RangeRef::new(CellRef::new(last, r.start.col), CellRef::new(last, r.end.col)), &mut cache);
+        Ok(json!({"groups": groups.len()}))
+    })
+}
+
+/// One empty row inserted on the `Ctx` workbook — what `home.insertRows` does per commit, minus the
+/// reference rewrite (the caller does it once for all the inserts): the cells and every positioned
+/// feature shift down, and the new row inherits the format of the row above (Excel's "Format
+/// Same As Above").
+fn insert_row_on(cx: &mut Ctx, sheet: usize, at: u32) -> Result<()> {
+    // The cells were already moved by the caller in one pass (`CellStore::remap_rows`).
+    let sh = cx.sheet_mut(sheet)?;
+    super::sheet::shift_sheet_features(sh, gridcraft_formula::adjust::Axis::Rows, at, 1, true);
+    if at > 0
+        && let Some(info) = sh.rows.get(&(at - 1)).copied()
+    {
+        sh.rows.insert(at, gridcraft_model::LineInfo { hidden: false, outline: 0, collapsed: false, ..info });
     }
-    let last = r.end.row + inserted + 1;
-    let lbl = CellRef::new(last, group_col).a1();
-    s.execute("home.insertRows", json!({"rows": format!("{}:{}", last + 1, last + 1)}))?;
-    s.execute("cell.set", json!({"cell": lbl, "input": format!("Grand {label}")}))?;
-    for c in &cols {
-        let range = RangeRef::new(CellRef::new(r.start.row + 1, *c), CellRef::new(last - 1, *c)).a1();
-        s.execute("cell.set", json!({"cell": CellRef::new(last, *c).a1(), "input": format!("=SUBTOTAL({code},{range})")}))?;
+    Ok(())
+}
+
+/// One text cell written on the `Ctx` workbook (what `cell.set` does per commit).
+fn set_text(cx: &mut Ctx, sheet: usize, c: CellRef, text: String) -> Result<()> {
+    cx.sheet_mut(sheet)?.cells.set(c, gridcraft_model::Cell::value(Value::text(text)));
+    cx.touch(sheet, c);
+    Ok(())
+}
+
+/// One formula cell written on the `Ctx` workbook (what `cell.set` does per commit).
+fn set_formula(cx: &mut Ctx, sheet: usize, c: CellRef, text: String) -> Result<()> {
+    cx.sheet_mut(sheet)?.cells.set(c, gridcraft_model::Cell::formula(gridcraft_model::Formula::new(&text)));
+    cx.touch(sheet, c);
+    Ok(())
+}
+
+/// Bolds every cell of the range (what `home.bold {"on": true}` does per commit).
+fn bold_range(cx: &mut Ctx, sheet: usize, r: &RangeRef, cache: &mut std::collections::HashMap<gridcraft_model::StyleId, gridcraft_model::StyleId>) {
+    let Some(sh) = cx.wb.sheet(sheet) else { return };
+    let cells: Vec<(CellRef, gridcraft_model::StyleId)> = sh.cells.iter_range(*r).map(|(c, x)| (c, x.style)).collect();
+    for (c, st) in &cells {
+        let new = *cache.entry(*st).or_insert_with(|| cx.wb.styles.derive(*st, |s: &mut gridcraft_model::Style| s.font.bold = true));
+        if new != *st
+            && let Ok(sh) = cx.sheet_mut(sheet)
+        {
+            sh.set_style(*c, new);
+        }
     }
-    Ok(json!({"groups": inserted}))
+    // Formatting touched these rows: re-fit them (Excel auto-fits), as `apply_style` does.
+    cx.fit_rows.extend(cells.iter().map(|(c, _)| (sheet, c.row)));
+}
+
+/// Raises the outline level of the group's rows (what `data.group` does per commit).
+fn group_rows_on(cx: &mut Ctx, sheet: usize, a: u32, b: u32) -> Result<()> {
+    let sh = cx.sheet_mut(sheet)?;
+    let b = b.min(a.saturating_add(1_048_575));
+    for i in a..=b {
+        let e = sh.rows.entry(i).or_default();
+        e.outline = (e.outline + 1).min(crate::outline::MAX_LEVEL);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1535,5 +1634,41 @@ mod tests {
         assert_eq!(split_delimited("a,b,,c", &[','], false, '"'), ["a", "b", "", "c"]);
         assert_eq!(split_delimited("a,b,,c", &[','], true, '"'), ["a", "b", "c"]);
         assert_eq!(split_delimited("\"x,y\",z", &[','], false, '"'), ["x,y", "z"]);
+    }
+
+    #[test]
+    fn subtotal_inserts_group_totals_and_a_grand_total_in_one_commit() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Item", "Qty"], ["a", 1], ["a", 2], ["b", 3], ["b", 4]]})).unwrap();
+        let out = s.execute("data.subtotal", json!({"groupBy": "Item", "function": "sum"})).unwrap();
+        assert_eq!(out["groups"], json!(2));
+        // Rows: header, a, a, "a Total", b, b, "b Total", "Grand Total" (1-based below).
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        let v = |a1: &str| sh.value(CellRef::parse(a1).unwrap());
+        let formula = |a1: &str| sh.cell(CellRef::parse(a1).unwrap()).and_then(|c| c.formula.as_ref().map(|f| f.text.clone()));
+        assert_eq!(v("A4"), Value::from("a Total"));
+        assert_eq!(v("B4"), Value::number(3.0), "the group SUBTOTAL is computed in the same commit");
+        assert!(formula("B4").is_some_and(|f| f.contains("SUBTOTAL(9,B2:B3)")), "the group SUBTOTAL formula: {:?}", formula("B4"));
+        assert_eq!(v("A7"), Value::from("b Total"));
+        assert_eq!(v("B7"), Value::number(7.0));
+        assert_eq!(v("A8"), Value::from("Grand Total"));
+        assert_eq!(v("B8"), Value::number(10.0), "SUBTOTAL ignores the nested group totals");
+        assert!(formula("B8").is_some_and(|f| f.contains("SUBTOTAL(9,B2:B7)")), "the grand total formula: {:?}", formula("B8"));
+        // The total rows are bold and the group's rows carry one outline level.
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        let bold = |a1: &str| {
+            let c = CellRef::parse(a1).unwrap();
+            d.wb.styles.get(sh.style_id(c)).font.bold
+        };
+        assert!(bold("A4"), "the total row's label is bold");
+        assert!((1..=2).all(|r| sh.rows.get(&r).is_some_and(|l| l.outline == 1)), "the group rows are grouped");
+        // One undo reverts the whole subtotal (the rewrite commits everything at once).
+        s.execute("edit.undo", json!({})).unwrap();
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        assert_eq!(sh.value(CellRef::parse("A4").unwrap()), Value::from("b"), "the original layout is back");
+        assert_eq!(sh.value(CellRef::parse("B4").unwrap()), Value::number(3.0));
+        assert_eq!(sh.value(CellRef::parse("A8").unwrap()), Value::Empty, "the grand total row is gone");
     }
 }

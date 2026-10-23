@@ -98,10 +98,7 @@ fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workboo
     let has_columns: bool = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = '_gc_columns'", [], |r| r.get::<_, i64>(0))? > 0;
 
     for (name, table_name) in sheet_list {
-        let max_r: Option<i64> = conn
-            .query_row("SELECT MAX(row) FROM _gc_cells WHERE sheet = ?1", [&name], |r| r.get(0))
-            .ok()
-            .flatten();
+        let max_r: Option<i64> = conn.query_row("SELECT MAX(row) FROM _gc_cells WHERE sheet = ?1", [&name], |r| r.get(0)).ok().flatten();
 
         let Some(max_row) = max_r else {
             continue;
@@ -113,17 +110,14 @@ fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workboo
 
         let mut sh = Sheet::new(sheet_name(&wb, &name));
 
-        let formula_count: i64 = conn
-            .query_row("SELECT COUNT(formula) FROM _gc_cells WHERE sheet = ?1", [&name], |r| r.get(0))
-            .unwrap_or(0);
+        let formula_count: i64 = conn.query_row("SELECT COUNT(formula) FROM _gc_cells WHERE sheet = ?1", [&name], |r| r.get(0)).unwrap_or(0);
         // Sheets with massive formula counts (e.g. catalog tables with > 50,000 repeated formulas)
         // load cached values to keep memory responsive and avoid locking the UI thread.
         // The formulas remain permanently preserved in the SQLite database.
         let load_formulas = formula_count < 50_000;
 
-        let mut cell_stmt = conn.prepare(
-            "SELECT row, col, val_type, val_num, val_text, formula FROM _gc_cells WHERE sheet = ?1 AND row <= ?2 ORDER BY row, col",
-        )?;
+        let mut cell_stmt =
+            conn.prepare("SELECT row, col, val_type, val_num, val_text, formula FROM _gc_cells WHERE sheet = ?1 AND row <= ?2 ORDER BY row, col")?;
         let mut rows = cell_stmt.query(rusqlite::params![name, max_rows])?;
         while let Some(r) = rows.next()? {
             let row: u32 = r.get(0)?;
@@ -140,11 +134,8 @@ fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workboo
                 Some("e") => val_text.as_deref().and_then(gridcraft_core::CellError::parse).map(Value::Error).unwrap_or(Value::Empty),
                 _ => Value::Empty,
             };
-            let formula = if load_formulas {
-                formula_text.as_deref().filter(|s| !s.is_empty()).map(|s| std::sync::Arc::new(Formula::new(s)))
-            } else {
-                None
-            };
+            let formula =
+                if load_formulas { formula_text.as_deref().filter(|s| !s.is_empty()).map(|s| std::sync::Arc::new(Formula::new(s))) } else { None };
             let at = CellRef::new(row, col);
             if at.is_valid() {
                 sh.set_cell(at, Cell { value, formula, style: StyleId::DEFAULT });
@@ -161,8 +152,7 @@ fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workboo
                 if let Some(range) = RangeRef::parse(&range_str) {
                     let mut cols = vec![];
                     if has_columns {
-                        let mut col_stmt =
-                            conn.prepare("SELECT position, name, formula FROM _gc_columns WHERE table_name = ?1 ORDER BY position")?;
+                        let mut col_stmt = conn.prepare("SELECT position, name, formula FROM _gc_columns WHERE table_name = ?1 ORDER BY position")?;
                         let mut c_rows = col_stmt.query([&t_name])?;
                         while let Some(cr) = c_rows.next()? {
                             let c_name: String = cr.get(1)?;
@@ -239,7 +229,12 @@ pub fn read_workbook(path: &Path, max_rows: u32) -> Result<(Workbook, Vec<String
             n = n.saturating_add(1);
             let excel_row = if has_row {
                 // `_row` is the 1-based Excel row; the header is row 1.
-                row.get_ref(0).ok().and_then(|v| v.as_i64().ok()).and_then(|r| u32::try_from(r.saturating_sub(1)).ok()).filter(|r| *r >= 1).unwrap_or(n)
+                row.get_ref(0)
+                    .ok()
+                    .and_then(|v| v.as_i64().ok())
+                    .and_then(|r| u32::try_from(r.saturating_sub(1)).ok())
+                    .filter(|r| *r >= 1)
+                    .unwrap_or(n)
             } else {
                 n
             };
@@ -348,15 +343,7 @@ fn write_into(wb: &Workbook, path: &Path) -> Result<()> {
                     _ => (None, None, None),
                 };
                 let f_text = cell.formula.as_ref().map(|f| f.text.as_str());
-                insert_cell.execute(rusqlite::params![
-                    sh.name,
-                    at.row as i64,
-                    at.col as i64,
-                    v_type,
-                    v_num,
-                    v_text,
-                    f_text,
-                ])?;
+                insert_cell.execute(rusqlite::params![sh.name, at.row as i64, at.col as i64, v_type, v_num, v_text, f_text,])?;
             }
         }
 
@@ -430,7 +417,10 @@ fn write_into(wb: &Workbook, path: &Path) -> Result<()> {
             }
         }
         for (i, n) in names.iter().enumerate() {
-            conn.execute("INSERT OR REPLACE INTO _gc_columns (table_name, position, name, formula) VALUES (?1, ?2, ?3, NULL)", rusqlite::params![sh.name, i as i64, n])?;
+            conn.execute(
+                "INSERT OR REPLACE INTO _gc_columns (table_name, position, name, formula) VALUES (?1, ?2, ?3, NULL)",
+                rusqlite::params![sh.name, i as i64, n],
+            )?;
         }
         for (at, text) in &formulas {
             conn.execute(

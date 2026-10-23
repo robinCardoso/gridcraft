@@ -566,6 +566,8 @@ struct Evaluator {
     budget: u64,
     /// The Limits report: the objective is this variable itself.
     target: Option<usize>,
+    /// A background job's progress/cancel hooks (docs/plano-responsividade.md, Fase 3).
+    hooks: Option<std::sync::Arc<gridcraft_calc::CalcHooks>>,
 }
 
 fn as_num(v: &Value) -> f64 {
@@ -582,12 +584,23 @@ impl Evaluator {
         self.evals >= self.budget
     }
 
-    /// Evaluates the model at `x`; `None` once the budget is spent.
+    /// Evaluates the model at `x`; `None` once the budget is spent (or a background job cancelled).
     fn eval(&mut self, x: &[f64]) -> Option<Point> {
+        if let Some(h) = &self.hooks
+            && h.cancelled()
+        {
+            // A cancelled background solve stops like a spent budget: its result is discarded.
+            return None;
+        }
         if self.exhausted() {
             return None;
         }
         self.evals += 1;
+        if let Some(h) = &self.hooks
+            && self.evals.is_multiple_of(64)
+        {
+            h.report(self.evals as usize, self.budget as usize);
+        }
         let sets: Vec<(usize, CellRef, Value)> = self.vars.iter().zip(x).map(|(c, v)| (self.sheet, *c, Value::number(*v))).collect();
         let mut reads = Vec::with_capacity(1 + 2 * self.rows.len());
         reads.push((self.sheet, self.objective));
@@ -1818,6 +1831,8 @@ fn limits_report(d: &DocState, sh: &Sheet, inp: &ReportInput) -> Result<Lines> {
         evals: 0,
         budget: 0,
         target: None,
+        // Reports are bounded (one pass per variable) and run after the solve: no job hooks.
+        hooks: None,
     };
     let objective_at = |ev: &mut Evaluator, x: &[f64]| {
         ev.target = None;
@@ -2022,6 +2037,7 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
         evals: 0,
         budget,
         target: None,
+        hooks: s.analysis_hooks.clone(),
     };
     if model.method == Method::Evolutionary && model.evo.require_bounds && prob.lo.iter().chain(&prob.hi).any(|b| !b.is_finite()) {
         return Err(EngineError::Other(

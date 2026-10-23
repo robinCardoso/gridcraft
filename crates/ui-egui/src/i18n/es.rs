@@ -300,6 +300,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "Un archivo CSV, una página web o un PDF son una copia: el libro conserva su propio archivo."
         }
         "Save the workbook under another name or in another folder." => "Guarda el libro con otro nombre o en otra carpeta.",
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "Guardando…",
+        "Calculating…" => "Calculando…",
+        "Solving…" => "Resolviendo…",
         "Print Active Sheets" => "Imprimir hojas activas",
         "Print Entire Workbook" => "Imprimir todo el libro",
         "Fit Sheet on One Page" => "Ajustar hoja en una página",

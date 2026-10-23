@@ -30,7 +30,10 @@ fn sample_xlsx(path: &PathBuf) {
         "xl/_rels/workbook.xml.rels",
         r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="/xl/worksheets/sheet2.xml"/></Relationships>"#,
     );
-    put("xl/sharedStrings.xml", r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Parafuso &amp; porca</t></si></sst>"#);
+    put(
+        "xl/sharedStrings.xml",
+        r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Parafuso &amp; porca</t></si></sst>"#,
+    );
     put(
         "xl/worksheets/sheet1.xml",
         r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
@@ -65,8 +68,9 @@ fn imports_xlsx_streaming_into_tables() {
     assert!(report.warnings.iter().any(|w| w.contains("VAZIA")));
 
     let conn = rusqlite::Connection::open(&db).expect("open");
-    let (desc, price, active): (String, f64, i64) =
-        conn.query_row("SELECT Descricao, Preco, Ativo FROM PRECO WHERE Referencia = 'AB-1'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).expect("row");
+    let (desc, price, active): (String, f64, i64) = conn
+        .query_row("SELECT Descricao, Preco, Ativo FROM PRECO WHERE Referencia = 'AB-1'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("row");
     assert_eq!((desc.as_str(), price, active), ("Parafuso & porca", 10.5, 1));
     let row: i64 = conn.query_row("SELECT _row FROM PRECO WHERE Referencia = 'ZZ-9'", [], |r| r.get(0)).expect("row number");
     assert_eq!(row, 4, "blank rows keep their Excel row number");
@@ -112,7 +116,10 @@ fn workbook_round_trips_through_a_db() {
     }
     sh.set_value(CellRef::new(1, 0), Value::text("caneta"));
     sh.set_value(CellRef::new(1, 1), Value::Number(4.0));
-    sh.set_cell(CellRef::new(1, 2), Cell { value: Value::Number(8.0), formula: Some(std::sync::Arc::new(Formula::new("=B2*2"))), style: Default::default() });
+    sh.set_cell(
+        CellRef::new(1, 2),
+        Cell { value: Value::Number(8.0), formula: Some(std::sync::Arc::new(Formula::new("=B2*2"))), style: Default::default() },
+    );
     write_workbook(&wb, &db).expect("write");
 
     let (back, _) = read_workbook(&db, DEFAULT_MAX_ROWS).expect("read");

@@ -301,6 +301,10 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Save the workbook under another name or in another folder." => {
             "Speichert die Arbeitsmappe unter einem anderen Namen oder in einem anderen Ordner."
         }
+        // Background jobs (docs/plano-responsividade.md): the status bar indicators.
+        "Saving…" => "Speichern…",
+        "Calculating…" => "Berechnen…",
+        "Solving…" => "Lösen…",
         "Print Active Sheets" => "Aktive Blätter drucken",
         "Print Entire Workbook" => "Gesamte Arbeitsmappe drucken",
         "Fit Sheet on One Page" => "Blatt auf einer Seite darstellen",

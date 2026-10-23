@@ -27,12 +27,12 @@ use std::sync::Arc;
 
 use gridcraft_calc::Calc;
 use gridcraft_core::{CellRef, RangeRef};
-use gridcraft_model::Workbook;
+use gridcraft_model::{Workbook, WorkbookDiff};
 use serde::Serialize;
 use serde_json::Value as Json;
 
-pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command, register_test_command};
 pub use cmd::file::load_document;
+pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command, register_test_command};
 pub use gridcraft_calc as calc;
 pub use gridcraft_core as core;
 pub use gridcraft_formula as formula;
@@ -58,11 +58,80 @@ pub enum EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// How an undo/redo step remembers the workbook (Fase 5 — docs/plano-responsividade.md).
+///
+/// Edits that only touch cell content and/or sheet metadata (comments, merges, dims, …) keep a
+/// compact reverse/forward [`WorkbookDiff`]; workbook-level or structural changes keep a full COW
+/// snapshot.
+#[derive(Clone, Debug)]
+pub enum HistoryState {
+    Snapshot(Arc<Workbook>),
+    /// `reverse` restores the pre-edit workbook from the post-edit one; `forward` does the opposite.
+    Diff {
+        reverse: WorkbookDiff,
+        forward: WorkbookDiff,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct HistoryEntry {
     pub label: String,
-    pub wb: Arc<Workbook>,
+    pub state: HistoryState,
     pub selection: Selection,
+}
+
+/// Above this many content-changed cells, a full snapshot is cheaper / simpler than a huge patch
+/// (large paste, fill, etc.). Band COW already shares unchanged cell data across snapshots.
+const UNDO_DIFF_MAX_CELLS: usize = 10_000;
+
+fn history_state(before: Arc<Workbook>, after: &Workbook) -> HistoryState {
+    match before.history_patches(after) {
+        Some((reverse, forward)) if !reverse.is_empty() && reverse.cell_count() <= UNDO_DIFF_MAX_CELLS => HistoryState::Diff { reverse, forward },
+        _ => HistoryState::Snapshot(before),
+    }
+}
+
+fn push_undo(d: &mut DocState, label: String, before: Arc<Workbook>, selection: Selection) {
+    let state = history_state(before, &d.wb);
+    d.undo.push(HistoryEntry { label, state, selection });
+    if d.undo.len() > UNDO_LIMIT {
+        d.undo.remove(0);
+    }
+    d.redo.clear();
+    d.revision += 1;
+}
+
+/// Applies the step's `reverse` patch (or swaps in a snapshot). Redo entries are stored with
+/// reverse/forward swapped so this same helper walks either stack.
+///
+/// Cell patches only restore edited cells (formula caches of dependents stay stale until
+/// [`Calc::cells_changed`] runs here); that path also keeps the dependency graph current via
+/// [`Calc::update_nodes`] / `apply_node_updates` (same as a live edit). Full snapshots already
+/// hold the right cached values but replace the workbook wholesale — the graph is marked
+/// invalid so undo/redo's [`Calc::ensure_graph`] rebuilds once. Meta-only diffs skip the calc
+/// hook (topology of formulas unchanged).
+pub(crate) fn apply_history_state(d: &mut DocState, state: &HistoryState) {
+    match state {
+        HistoryState::Snapshot(wb) => {
+            d.wb = wb.clone();
+            d.calc.invalidate_graph();
+        }
+        HistoryState::Diff { reverse, .. } => {
+            let keys: Vec<(usize, CellRef)> = reverse.cells.sheets.iter().flat_map(|sh| sh.cells.iter().map(|&(c, _)| (sh.sheet, c))).collect();
+            let wb = Arc::make_mut(&mut d.wb);
+            wb.apply_workbook_diff(reverse);
+            if !keys.is_empty() {
+                d.calc.cells_changed(wb, &keys);
+            }
+        }
+    }
+}
+
+pub(crate) fn invert_history_state(state: HistoryState, current_wb: &Arc<Workbook>) -> HistoryState {
+    match state {
+        HistoryState::Snapshot(_) => HistoryState::Snapshot(current_wb.clone()),
+        HistoryState::Diff { reverse, forward } => HistoryState::Diff { reverse: forward, forward: reverse },
+    }
 }
 
 /// The clipboard: a block of cells (with formulas and styles) or marching-ants reference.
@@ -114,10 +183,33 @@ pub struct DocState {
     /// The format `path`'s content was recognised as when its extension doesn't name one (an
     /// XLSX called `budget.dat`): Save writes it back in that format.
     pub content_kind: Option<io::FileKind>,
+    /// The interface asked for structural commands to skip the synchronous full recalculation
+    /// (docs/plano-responsividade.md, Fase 3): a background job recalculates and applies the
+    /// result. Never set by the CLI or the tests, which keep the synchronous contract.
+    pub defer_structural: bool,
+    /// A recalculation is owed (`defer_structural` skipped one): every commit defers until a
+    /// background job applies the fresh values.
+    pub recalc_pending: bool,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 const UNDO_LIMIT: usize = 100;
+
+/// The undo label of an analysis command (the same text its inline command would push).
+fn command_label(command: &str) -> String {
+    match command {
+        "data.solver" => "Solver",
+        "data.goalSeek" => "Goal Seek",
+        _ => command,
+    }
+    .to_string()
+}
+
+/// Fase 3 (docs/plano-responsividade.md): when the interface turned `defer_structural` on and an
+/// edit's recalculation cascade would evaluate more formulas than this, the commit skips the
+/// synchronous recalculation and a background job recomputes everything. Below it, edits stay
+/// inline so typing keeps feeling instant.
+pub const CASCADE_JOB_CELLS: usize = 5_000;
 
 impl DocState {
     pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
@@ -139,6 +231,8 @@ impl DocState {
             sheet_selections: vec![],
             unlocked_ranges: vec![],
             content_kind: None,
+            defer_structural: false,
+            recalc_pending: false,
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -296,6 +390,10 @@ pub struct Session {
     /// Review › Notes › Show All Notes: every note is displayed. An application display setting
     /// (like Excel's comment indicator option), so it's not saved in the file.
     pub show_all_notes: bool,
+    /// Cooperation hooks for a background analysis command (`data.solver`, `data.goalSeek`): the
+    /// interface sets them on the private session a job runs on, so the iteration reports
+    /// progress and stops on cancel (docs/plano-responsividade.md, Fase 3). `None` in the CLI.
+    pub analysis_hooks: Option<std::sync::Arc<gridcraft_calc::CalcHooks>>,
 }
 
 impl Session {
@@ -325,6 +423,32 @@ impl Session {
     pub fn doc_mut(&mut self) -> Result<&mut DocState> {
         self.active_mut().ok_or(EngineError::NoDocument)
     }
+    /// A document by uid. Background jobs apply their outcomes to the document their snapshot
+    /// came from, even after the user switched windows meanwhile.
+    pub fn doc_by_uid_mut(&mut self, uid: u64) -> Option<&mut DocState> {
+        self.docs.iter_mut().find(|d| d.uid == uid)
+    }
+    /// Applies a background analysis outcome (Solver, Goal Seek) to a document as ONE undoable
+    /// step: the private session's workbook — values, saved model and report sheets — and its
+    /// calculation state replace the document's. Nothing is recalculated here (the snapshot was
+    /// fully computed on the worker); the entry mirrors what the inline command would have pushed.
+    pub fn apply_analysis(&mut self, uid: u64, wb: Workbook, calc: Calc, command: &str, params: &Json) -> Result<()> {
+        let Some(i) = self.docs.iter().position(|d| d.uid == uid) else { return Ok(()) };
+        let d = &mut self.docs[i];
+        let before = d.wb.clone();
+        let sel = d.selection.clone();
+        d.wb = Arc::new(wb);
+        d.calc = calc;
+        d.recalc_pending = false;
+        self.journal.push((command.to_string(), cmd::journal_params(params)));
+        if self.journal.len() > 10_000 {
+            self.journal.drain(..5_000);
+        }
+        if !Arc::ptr_eq(&d.wb, &before) {
+            push_undo(d, command_label(command), before, sel);
+        }
+        Ok(())
+    }
     pub fn add_document(&mut self, d: DocState) -> usize {
         self.docs.push(d);
         self.active = self.docs.len() - 1;
@@ -353,7 +477,9 @@ impl Session {
     pub fn install_document(&mut self, doc: DocState, warnings: Vec<String>) -> Result<Json> {
         // Replace an untouched blank Book1 like Excel does.
         if self.documents().len() == 1
-            && self.active().is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
+            && self
+                .active()
+                .is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
         {
             self.close_document(0);
         }
@@ -416,12 +542,7 @@ impl Session {
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
-            d.undo.push(HistoryEntry { label: spec.label.trim_end_matches('…').to_string(), wb, selection: sel });
-            if d.undo.len() > UNDO_LIMIT {
-                d.undo.remove(0);
-            }
-            d.redo.clear();
-            d.revision += 1;
+            push_undo(d, spec.label.trim_end_matches('…').to_string(), wb, sel);
         }
         result
     }
@@ -452,6 +573,62 @@ impl Session {
         }
         r
     }
+}
+
+/// Runs a what-if analysis command (`data.solver`, `data.goalSeek`) on a snapshot, as a pure
+/// function any thread can run in a background job (docs/plano-responsividade.md, Fase 3). A
+/// private [`Session`] owns the clone, so the iteration never touches the live document; the
+/// result carries the workbook (values, saved model, report sheets), its calculation state and
+/// the command's own JSON result (the Solver Results dialog reads it).
+pub fn run_analysis(
+    wb: &Workbook,
+    calc: &Calc,
+    command: &str,
+    params: &Json,
+    hooks: Option<Arc<gridcraft_calc::CalcHooks>>,
+) -> Result<(Workbook, Calc, Json)> {
+    let mut doc = DocState::new((*wb).clone(), None, "Analysis".into());
+    // The snapshot's graph is already settled; the clone above only paid for `recalc_on_load`.
+    doc.calc = calc.clone();
+    let mut s = Session::new();
+    s.install_document(doc, Vec::new())?;
+    s.analysis_hooks = hooks;
+    let result = s.execute(command, params.clone())?;
+    let d = s.doc()?;
+    Ok(((*d.wb).clone(), d.calc.clone(), result))
+}
+
+/// Recalculates a snapshot of a workbook — what F9 does — as a pure function any thread can run
+/// in a background job (docs/plano-responsividade.md, Fase 3). `calc` is typically a clone of the
+/// live calculation: when its graph is current, [`Calc::ensure_graph`] skips the O(formulas)
+/// rebuild; when structurally invalidated (or empty), it rebuilds. Returns the recalculated
+/// workbook, the [`Calc`] to install beside it (hooks detached), and the number of formulas
+/// evaluated. With `sheet`, only that sheet's uncomputed formulas run (Shift+F9); the graph is
+/// still ensured for the whole workbook. `seeds` carries the volatile calculation state
+/// (`rand()` stream, fixed "now") so the result matches the inline calculation.
+#[must_use]
+pub fn recalc_document(
+    wb: &Workbook,
+    mut calc: Calc,
+    sheet: Option<usize>,
+    hooks: Option<Arc<gridcraft_calc::CalcHooks>>,
+    seeds: gridcraft_calc::CalcSeeds,
+) -> (Workbook, Calc, usize) {
+    let mut wb = (*wb).clone();
+    calc.set_seeds(seeds);
+    if let Some(hooks) = hooks {
+        calc.set_hooks(hooks);
+    }
+    match sheet {
+        Some(i) => {
+            calc.ensure_graph(&wb);
+            calc.recalc_sheet(&mut wb, i);
+        }
+        None => calc.recalc_all(&mut wb),
+    }
+    calc.hooks = None;
+    let cells = calc.last_recalc_cells;
+    (wb, calc, cells)
 }
 
 /// Convenience: the active workbook's active sheet.

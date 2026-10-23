@@ -1,7 +1,9 @@
+use std::sync::{Arc, Mutex};
+
 use gridcraft_core::{CellError, CellRef, Value};
 use gridcraft_model::{Cell, Formula, Workbook};
 
-use crate::Calc;
+use crate::{Calc, CalcHooks};
 
 fn c(s: &str) -> CellRef {
     CellRef::parse(s).unwrap()
@@ -1332,4 +1334,233 @@ fn median_large_values_recalculate_dependents() {
     for cell in ["C1", "C2"] {
         assert!((t.num(cell) + 1.3).abs() < 1e-14);
     }
+}
+
+/// A workbook with `n` independent formulas in column B (an F9-shaped recalculation load).
+fn chain(n: u32) -> Workbook {
+    let mut wb = Workbook::new();
+    let sh = wb.sheet_mut(0).unwrap();
+    sh.cells.set(CellRef::new(0, 0), Cell::value(Value::Number(7.0)));
+    for r in 0..n {
+        sh.cells.set(CellRef::new(r, 1), Cell::formula(Formula::new("=A1+1")));
+    }
+    wb
+}
+
+#[test]
+fn hooks_report_progress_through_a_recalculation() {
+    let mut wb = chain(6000);
+    let hooks = Arc::new(CalcHooks::new());
+    let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+    let collect = seen.clone();
+    hooks.set_progress(Box::new(move |done, total| {
+        if let Ok(mut v) = collect.lock() {
+            v.push((done, total));
+        }
+    }));
+    let mut calc = Calc::new();
+    calc.set_hooks(hooks);
+    calc.recalc_all(&mut wb);
+    let reports = seen.lock().unwrap();
+    let last = *reports.last().unwrap_or(&(0, 0));
+    assert_eq!(last, (6000, 6000), "the final report covers every formula: {:?}", reports.last());
+    let first = *reports.first().unwrap_or(&(0, 0));
+    assert!(first.0 > 0 && first.0 < first.1, "in-flight reports grow towards the total: {first:?}");
+    // The result is identical to the same recalculation without hooks (never crash: the hooks
+    // are observers only).
+    let mut plain = chain(6000);
+    let mut calc2 = Calc::new();
+    calc2.recalc_all(&mut plain);
+    assert_eq!(wb, plain);
+}
+
+#[test]
+fn hooks_cancel_stop_a_recalculation() {
+    let mut wb = chain(500);
+    let hooks = Arc::new(CalcHooks::new());
+    hooks.cancel();
+    let mut calc = Calc::new();
+    calc.set_hooks(hooks.clone());
+    calc.recalc_all(&mut wb);
+    assert!(hooks.cancelled());
+    assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Empty, "a cancelled pass writes nothing back");
+    assert_eq!(wb.sheet(0).unwrap().value(c("B500")), Value::Empty);
+    // Detaching the hooks (a new plain run) still finishes the job.
+    let mut calc2 = Calc::new();
+    calc2.recalc_all(&mut wb);
+    assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Number(8.0));
+}
+
+/// Fase 3 (docs/plano-responsividade.md): the per-pass range cache keeps ranges apart — the same
+/// coordinates on two sheets are different ranges — and reads the same values as a direct read.
+#[test]
+fn range_cache_keeps_ranges_apart() {
+    let mut wb = Workbook::new();
+    wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new("Other")));
+    {
+        let a = wb.sheet_mut(0).unwrap();
+        a.cells.set(CellRef::new(0, 0), Cell::value(Value::Number(1.0)));
+        a.cells.set(CellRef::new(1, 0), Cell::value(Value::Number(2.0)));
+        let b = wb.sheet_mut(1).unwrap();
+        b.cells.set(CellRef::new(0, 0), Cell::value(Value::Number(10.0)));
+        b.cells.set(CellRef::new(1, 0), Cell::value(Value::Number(20.0)));
+    }
+    let s0 = wb.sheet_mut(0).unwrap();
+    s0.cells.set(CellRef::new(0, 1), Cell::formula(Formula::new("=SUM(A1:A2)")));
+    s0.cells.set(CellRef::new(1, 1), Cell::formula(Formula::new("=SUM(A1:A2)")));
+    s0.cells.set(CellRef::new(2, 1), Cell::formula(Formula::new("=SUM(Other!A1:A2)")));
+    let mut calc = Calc::new();
+    calc.recalc_all(&mut wb);
+    let sh = wb.sheet(0).unwrap();
+    assert_eq!(sh.value(CellRef::new(0, 1)), Value::Number(3.0));
+    assert_eq!(sh.value(CellRef::new(1, 1)), Value::Number(3.0), "a cache hit returns the same values");
+    assert_eq!(sh.value(CellRef::new(2, 1)), Value::Number(30.0), "the same coordinates on another sheet stay distinct");
+}
+
+/// Regression: Automatic `cells_changed` must not drop other-sheet dirty cells when the
+/// cascade exceeds 1_000 (commit c7a3c16 truncated to the active sheet and left cross-sheet
+/// dependents stale — formulas on the active sheet that read them looked static).
+#[test]
+fn automatic_cascade_keeps_cross_sheet_dependents_past_thousand() {
+    let n = 1_100u32;
+    let mut t = T::new();
+    t.wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new("Data")));
+    t.wb.active_sheet = 0;
+    t.wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(1.0)));
+    // Active-sheet formula that reads a cross-sheet dependent (the "static" symptom).
+    t.wb.sheet_mut(0).unwrap().cells.set(c("B1"), Cell::formula(Formula::new("=Data!A1")));
+    {
+        let data = t.wb.sheet_mut(1).unwrap();
+        for r in 0..n {
+            data.cells.set(CellRef::new(r, 0), Cell::formula(Formula::new("=Sheet1!A1")));
+        }
+    }
+    t.calc.recalc_all(&mut t.wb);
+    assert_eq!(t.wb.sheet(1).unwrap().value(c("A1")), Value::Number(1.0));
+    assert_eq!(t.num("B1"), 1.0);
+
+    t.wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(7.0)));
+    t.calc.cells_changed(&mut t.wb, &[(0, c("A1"))]);
+
+    assert_eq!(t.wb.sheet(1).unwrap().value(c("A1")), Value::Number(7.0), "other-sheet dependents update");
+    assert_eq!(t.wb.sheet(1).unwrap().value(CellRef::new(n - 1, 0)), Value::Number(7.0));
+    assert_eq!(t.num("B1"), 7.0, "active formula reading cross-sheet is not static");
+}
+
+/// Manual mode only evaluates the edited formulas themselves — dependents stay until F9.
+#[test]
+fn manual_cells_changed_does_not_cascade_cross_sheet_dependents() {
+    let mut t = T::new();
+    t.wb.calc.mode = gridcraft_model::CalcMode::Manual;
+    t.wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new("Data")));
+    t.wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(1.0)));
+    t.wb.sheet_mut(1).unwrap().cells.set(c("A1"), Cell::formula(Formula::new("=Sheet1!A1")));
+    t.calc.recalc_all(&mut t.wb);
+    assert_eq!(t.wb.sheet(1).unwrap().value(c("A1")), Value::Number(1.0));
+
+    t.wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(9.0)));
+    t.calc.cells_changed(&mut t.wb, &[(0, c("A1"))]);
+    assert_eq!(t.wb.sheet(1).unwrap().value(c("A1")), Value::Number(1.0), "Manual leaves dependents stale");
+
+    t.calc.recalc_all(&mut t.wb);
+    assert_eq!(t.wb.sheet(1).unwrap().value(c("A1")), Value::Number(9.0), "F9 pays the debt");
+}
+
+/// Fase 3: F9's `ensure_graph` skips a full rebuild when nodes were kept current by
+/// `cells_changed` / `update_nodes`; results match a from-scratch rebuild.
+#[test]
+fn ensure_graph_skips_rebuild_when_current_and_matches_full() {
+    let mut wb = chain(200);
+    let mut calc = Calc::new();
+    calc.recalc_all(&mut wb);
+    assert!(calc.graph_is_current());
+    let n = calc.graph.len();
+    assert_eq!(n, 200);
+
+    // Touch an input: graph stays current (node for A1 removed / absent).
+    wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(3.0)));
+    calc.update_nodes(&mut wb, &[(0, c("A1"))]);
+    assert!(calc.graph_is_current());
+    assert_eq!(calc.graph.len(), n, "a value cell is not a formula node");
+
+    // F9 with a current graph must equal a fresh full rebuild + recalc.
+    let mut incremental = wb.clone();
+    let mut calc_inc = calc.clone();
+    calc_inc.recalc_all(&mut incremental);
+    assert!(calc_inc.graph_is_current());
+
+    let mut fresh = wb.clone();
+    let mut calc_full = Calc::new();
+    calc_full.recalc_all(&mut fresh);
+    assert_eq!(incremental, fresh);
+    assert_eq!(calc_inc.graph.len(), calc_full.graph.len());
+}
+
+#[test]
+fn invalidate_graph_forces_rebuild_on_ensure() {
+    let mut wb = chain(50);
+    let mut calc = Calc::new();
+    calc.recalc_all(&mut wb);
+    assert!(calc.graph_is_current());
+    calc.invalidate_graph();
+    assert!(!calc.graph_is_current());
+    // Structural-style rewrite: every formula text changes, old nodes would be wrong.
+    for r in 0..50 {
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(r, 1), Cell::formula(Formula::new("=A1+2")));
+    }
+    calc.ensure_graph(&wb);
+    assert!(calc.graph_is_current());
+    calc.recalc_all(&mut wb);
+    assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Number(9.0));
+}
+
+#[test]
+fn update_nodes_while_invalid_is_a_noop() {
+    let mut wb = chain(10);
+    let mut calc = Calc::new();
+    calc.recalc_all(&mut wb);
+    let before = calc.graph.len();
+    calc.invalidate_graph();
+    wb.sheet_mut(0).unwrap().cells.set(c("B1"), Cell::formula(Formula::new("=A1+99")));
+    calc.update_nodes(&mut wb, &[(0, c("B1"))]);
+    assert!(!calc.graph_is_current());
+    assert_eq!(calc.graph.len(), before, "stale nodes untouched until rebuild");
+    calc.ensure_graph(&wb);
+    assert_eq!(calc.graph.len(), 10);
+}
+
+/// Release timing: `cargo test -p gridcraft-calc measure_f9_incremental_graph --release -- --ignored --nocapture`
+#[test]
+#[ignore = "timing; run with --ignored in release"]
+#[allow(clippy::disallowed_methods)]
+fn measure_f9_incremental_graph() {
+    use std::time::Instant;
+    let n = 50_000u32;
+    let wb = chain(n);
+    let mut calc = Calc::new();
+    let t_build = Instant::now();
+    calc.rebuild(&wb);
+    let rebuild = t_build.elapsed();
+
+    let t_ensure = Instant::now();
+    calc.ensure_graph(&wb);
+    let ensure = t_ensure.elapsed();
+
+    let mut wb_inc = wb.clone();
+    let mut calc_inc = calc.clone();
+    let t_f9_inc = Instant::now();
+    calc_inc.recalc_all(&mut wb_inc);
+    let f9_inc = t_f9_inc.elapsed();
+
+    let mut wb_full = wb.clone();
+    let mut calc_full = Calc::new();
+    let t_f9_full = Instant::now();
+    calc_full.recalc_all(&mut wb_full);
+    let f9_full = t_f9_full.elapsed();
+
+    assert_eq!(wb_inc, wb_full);
+    eprintln!(
+        "F9 graph ({n} formulas): rebuild={rebuild:?}, ensure_when_current={ensure:?}, \
+         F9_with_current_graph={f9_inc:?}, F9_fresh_calc_full_rebuild={f9_full:?}"
+    );
 }

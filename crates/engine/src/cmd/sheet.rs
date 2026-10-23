@@ -112,7 +112,7 @@ fn shift_anchor(sh: &Sheet, a: Anchor, corner: (u32, u32, f32, f32), axis: Axis,
 }
 
 /// Shifts everything that has a position on the sheet for an insert/delete.
-fn shift_sheet_features(sh: &mut Sheet, axis: Axis, at: u32, count: u32, insert: bool) {
+pub(crate) fn shift_sheet_features(sh: &mut Sheet, axis: Axis, at: u32, count: u32, insert: bool) {
     let map_line = |v: u32| -> Option<u32> {
         if insert {
             if v >= at { v.checked_add(count) } else { Some(v) }
@@ -214,14 +214,19 @@ fn shift_sheet_features(sh: &mut Sheet, axis: Axis, at: u32, count: u32, insert:
 }
 
 /// Rewrites every formula reference (and chart series) for a structural edit on `target`.
-fn rewrite(wb: &mut gridcraft_model::Workbook, target: &str, e: &Edit) {
-    super::edit::rewrite_all_formulas(wb, target, e);
+pub(crate) fn rewrite(wb: &mut gridcraft_model::Workbook, target: &str, e: &Edit) {
+    rewrite_edits(wb, target, std::slice::from_ref(e));
+}
+
+/// [`rewrite`] for several edits (oldest first) in a single pass over the workbook.
+pub(crate) fn rewrite_edits(wb: &mut gridcraft_model::Workbook, target: &str, edits: &[Edit]) {
+    super::edit::rewrite_all_formulas_edits(wb, target, edits);
     for si in 0..wb.sheets.len() {
         let host = wb.sheets.get(si).map(|s| s.name.clone()).unwrap_or_default();
         let Some(sh) = wb.sheet_mut(si) else { continue };
         let fix = |text: &str| -> String {
             match gridcraft_formula::parse(text) {
-                Ok(expr) => gridcraft_formula::print(&gridcraft_formula::adjust::adjust(expr, &host, target, e)),
+                Ok(expr) => gridcraft_formula::print(&gridcraft_formula::adjust::adjust_edits(expr, &host, target, edits)),
                 Err(_) => text.to_string(),
             }
         };
@@ -680,7 +685,7 @@ fn edit_doc<R>(d: &mut crate::DocState, f: impl FnOnce(&mut Ctx) -> Result<R>) -
 
 /// Sheet protection for inserting or deleting rows/columns: the protection must allow it, and
 /// deleted lines must not hold locked cells.
-fn check_lines_protection(s: &Session, p: &Json, axis: Axis, at: u32, count: u32, insert: bool) -> Result<()> {
+pub(crate) fn check_lines_protection(s: &Session, p: &Json, axis: Axis, at: u32, count: u32, insert: bool) -> Result<()> {
     let sheet = target_sheet(s, p)?;
     let wb = &s.doc()?.wb;
     let Some(sh) = wb.sheet(sheet) else { return Ok(()) };

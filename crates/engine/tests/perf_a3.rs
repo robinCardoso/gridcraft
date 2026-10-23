@@ -1,3 +1,7 @@
+// Local machine-only benchmark (times a real workbook on this desktop); the wasm clock lint
+// doesn't apply: this test target never builds in the web app.
+#![allow(clippy::disallowed_methods)]
+
 use gridcraft_engine::Session;
 use serde_json::json;
 
