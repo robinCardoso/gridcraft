@@ -631,6 +631,34 @@ fn let_lambda() {
     assert_eq!(t.num("A4"), 14.0);
 }
 
+/// Nested LET must not cache a binding that only names an outer LET variable: the AST looks
+/// invariant (no relative ref / ThisRow), but the outer binding can differ per cell. Without
+/// seeding `variant_names` from `env`, PassHost's `val_cache` reused the first row's array
+/// (COTACAO `Linha` / INDEX all resolving as MB001).
+#[test]
+fn nested_let_does_not_reuse_outer_binding_across_rows() {
+    let mut t = T::new();
+    // Lookup column: row 1 → 10, row 2 → 20, row 3 → 30
+    t.set("A1", "MB001");
+    t.set("A2", "MB002");
+    t.set("A3", "MB003");
+    t.set("B1", "10");
+    t.set("B2", "20");
+    t.set("B3", "30");
+    // Same shape as COTACAO Linha: outer LET binds codigo from this row; inner LET builds
+    // `achou` from a whole-column compare against codigo, then MATCH.
+    let f = concat!(
+        "=LET(codigo,A1,",
+        "LET(achou,A$1:A$3=codigo,IF(SUM(--achou)=0,0,MATCH(TRUE,achou,0))))",
+    );
+    t.set("C1", f);
+    t.set("C2", &f.replace("A1", "A2"));
+    t.set("C3", &f.replace("A1", "A3"));
+    assert_eq!(t.num("C1"), 1.0);
+    assert_eq!(t.num("C2"), 2.0, "inner LET must recompute achou for this row's codigo");
+    assert_eq!(t.num("C3"), 3.0);
+}
+
 #[test]
 fn functions_given_by_name() {
     let mut t = T::new();
@@ -1364,8 +1392,10 @@ fn hooks_report_progress_through_a_recalculation() {
     let reports = seen.lock().unwrap();
     let last = *reports.last().unwrap_or(&(0, 0));
     assert_eq!(last, (6000, 6000), "the final report covers every formula: {:?}", reports.last());
-    let first = *reports.first().unwrap_or(&(0, 0));
-    assert!(first.0 > 0 && first.0 < first.1, "in-flight reports grow towards the total: {first:?}");
+    // Leading (0, _) nudges are expected (ensure_graph / start of run_scoped); a mid-flight
+    // report must still show real work before the final total.
+    let mid = reports.iter().copied().find(|(done, total)| *done > 0 && *done < *total);
+    assert!(mid.is_some(), "in-flight reports grow towards the total: {reports:?}");
     // The result is identical to the same recalculation without hooks (never crash: the hooks
     // are observers only).
     let mut plain = chain(6000);
@@ -1381,14 +1411,63 @@ fn hooks_cancel_stop_a_recalculation() {
     hooks.cancel();
     let mut calc = Calc::new();
     calc.set_hooks(hooks.clone());
-    calc.recalc_all(&mut wb);
+    assert!(!calc.recalc_all(&mut wb), "a pre-cancelled recalc reports incomplete");
     assert!(hooks.cancelled());
     assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Empty, "a cancelled pass writes nothing back");
     assert_eq!(wb.sheet(0).unwrap().value(c("B500")), Value::Empty);
     // Detaching the hooks (a new plain run) still finishes the job.
     let mut calc2 = Calc::new();
-    calc2.recalc_all(&mut wb);
+    assert!(calc2.recalc_all(&mut wb));
     assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Number(8.0));
+}
+
+/// Cancel mid-rebuild must leave the graph invalid and stop without evaluating formulas.
+#[test]
+fn hooks_cancel_during_rebuild_leaves_graph_invalid() {
+    let wb = chain(8_000);
+    let hooks = Arc::new(CalcHooks::new());
+    let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+    let collect = seen.clone();
+    let cancel_at = hooks.clone();
+    hooks.set_progress(Box::new(move |done, total| {
+        if let Ok(mut v) = collect.lock() {
+            v.push((done, total));
+        }
+        // Cancel once rebuild has reported real work (done > 0), before it finishes.
+        if done > 0 && done < total {
+            cancel_at.cancel();
+        }
+    }));
+    let mut calc = Calc::new();
+    calc.set_hooks(hooks.clone());
+    assert!(!calc.rebuild(&wb), "cancel during rebuild returns false");
+    assert!(!calc.graph_is_current(), "a partial rebuild must not be trusted");
+    assert!(hooks.cancelled());
+    let reports = seen.lock().unwrap();
+    assert!(reports.iter().any(|(d, t)| *d > 0 && *d < *t), "rebuild reported progress before cancel: {reports:?}");
+}
+
+/// A live recalc must leave the hard "0 done" nudge: at least one report with done > 0 while
+/// hooks are attached (regression for status "1% — 0 / N" stuck forever).
+#[test]
+fn hooks_progress_advances_past_zero_done() {
+    let mut wb = chain(5_000);
+    let hooks = Arc::new(CalcHooks::new());
+    let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+    let collect = seen.clone();
+    hooks.set_progress(Box::new(move |done, total| {
+        if let Ok(mut v) = collect.lock() {
+            v.push((done, total));
+        }
+    }));
+    let mut calc = Calc::new();
+    calc.set_hooks(hooks);
+    assert!(calc.recalc_all(&mut wb));
+    let reports = seen.lock().unwrap();
+    assert!(
+        reports.iter().any(|(done, _)| *done > 0),
+        "progress must leave 0 done while the job is alive: {reports:?}"
+    );
 }
 
 /// Fase 3 (docs/plano-responsividade.md): the per-pass range cache keeps ranges apart — the same

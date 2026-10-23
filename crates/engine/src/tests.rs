@@ -3826,13 +3826,34 @@ fn recalc_document_reuses_current_graph() {
     let d = s.doc().unwrap();
     assert!(d.calc.graph_is_current());
     let seeds = d.calc.seeds();
-    let (wb_inc, calc_inc, _) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds);
-    let (wb_full, calc_full, _) = crate::recalc_document(&d.wb, crate::calc::Calc::new(), None, None, seeds);
+    let (wb_inc, calc_inc, _) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, None);
+    let (wb_full, calc_full, _) = crate::recalc_document(&d.wb, crate::calc::Calc::new(), None, None, seeds, None);
     assert!(calc_inc.graph_is_current());
     assert!(calc_full.graph_is_current());
     assert_eq!(wb_inc, wb_full);
     assert_eq!(calc_inc.graph.len(), calc_full.graph.len());
     assert_eq!(wb_inc.sheet(0).unwrap().value(gridcraft_core::CellRef::parse("B2").unwrap()), gridcraft_core::Value::Number(12.0));
+}
+
+/// Deferred Automatic edits record cascade seeds; `recalc_document` with those seeds matches
+/// a full recalc of the same edit without forcing every unrelated formula.
+#[test]
+fn deferred_cascade_seeds_drive_recalc_document() {
+    let mut s = s();
+    s.doc_mut().unwrap().defer_structural = true;
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3]]})).unwrap();
+    // Past CASCADE_JOB_CELLS formulas in one paste → deferred cascade with seeds.
+    let n = (crate::CASCADE_JOB_CELLS + 50) as u32;
+    let lines: String = (0..n).map(|_| "=A1+1".to_string()).collect::<Vec<_>>().join("\n");
+    s.execute("edit.paste", json!({"at": "B1", "text": lines})).unwrap();
+    let d = s.doc().unwrap();
+    assert!(d.recalc_pending);
+    let cascade = d.recalc_cascade.clone().expect("paste records cascade seeds");
+    assert!(cascade.len() as u32 >= n, "seeds cover the pasted formulas");
+    let seeds = d.calc.seeds();
+    let (wb_cas, _, cells) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, Some(cascade));
+    assert!(cells > 0);
+    assert_eq!(wb_cas.sheet(0).unwrap().value(gridcraft_core::CellRef::new(0, 1)), gridcraft_core::Value::Number(2.0));
 }
 
 /// Fase 3 (docs/plano-responsividade.md): an analysis (Goal Seek, Solver) runs on a *snapshot*

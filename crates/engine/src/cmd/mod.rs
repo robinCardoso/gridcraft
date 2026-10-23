@@ -354,26 +354,34 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
         // the graph, recalculates and applies the result. Row/col/sheet shape changes make the
         // existing nodes unusable; mark them dirty so F9's ensure_graph does a full rebuild.
         d.recalc_pending = true;
+        d.recalc_cascade = None;
         d.calc.invalidate_graph();
     } else if structural {
         // A full inline recalculation pays the whole debt.
         d.recalc_pending = false;
-        d.calc.recalc_all(&mut wb);
+        d.recalc_cascade = None;
+        let _ = d.calc.recalc_all(&mut wb);
     } else if !changed.is_empty() {
         if d.recalc_pending {
-            // A full recalculation is already owed; keep nodes in sync when the graph is still
+            // A recalculation is already owed; keep nodes in sync when the graph is still
             // current (cascade deferral) so the job can skip the O(formulas) rebuild. After a
-            // structural invalidate, only the full rebuild is safe.
+            // structural invalidate, only the full rebuild is safe. Merge new seeds into a
+            // deferred cascade so the job evaluates dependents of every unpaid edit.
             d.calc.update_nodes(&mut wb, &changed);
+            if let Some(seeds) = d.recalc_cascade.as_mut() {
+                seeds.extend_from_slice(&changed);
+            }
         } else if d.defer_structural && (changed.len() > crate::CASCADE_JOB_CELLS || d.calc.cascade_exceeds(&changed, crate::CASCADE_JOB_CELLS)) {
             // A huge cascade (an input cell feeding a big dependency graph) or a huge edit itself
             // (a wide paste: brand-new formulas aren't in the graph yet, so their count is the
             // signal) goes to the background job — same flow as the structural deferral above.
-            // Update nodes now (no evaluate) so F9 reuses the graph.
+            // Update nodes now (no evaluate) so the job reuses the graph and runs a dirty cascade
+            // from these seeds instead of a full-workbook F9.
             d.recalc_pending = true;
+            d.recalc_cascade = Some(changed.clone());
             d.calc.update_nodes(&mut wb, &changed);
         } else {
-            d.calc.cells_changed(&mut wb, &changed);
+            let _ = d.calc.cells_changed(&mut wb, &changed);
         }
     }
     if let Some(t0) = t0 {

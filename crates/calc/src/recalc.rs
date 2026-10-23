@@ -563,6 +563,15 @@ struct PassHost<'a> {
     /// A cached range would go stale if a spill fills cells during the pass (or the workbook
     /// already has spills): the cache is off for such workbooks, correctness first.
     spills_possible: bool,
+    /// Background cooperation: checked inside on-demand `compute` so a deep dependency tree can
+    /// stop without waiting for the top-level dirty cell to finish (status bar Cancel).
+    hooks: Option<Arc<CalcHooks>>,
+    /// Progress denominator for mid-compute reports (`run_scoped`'s total).
+    progress_total: usize,
+    /// Steps through `compute` (including recursive deps); used to throttle cancel/progress checks.
+    compute_steps: usize,
+    /// Set when hooks request cancel mid-tree; `run_scoped` aborts the pass without write-back.
+    aborted: bool,
 }
 
 /// Most cells kept materialized per pass: a bigger range is read normally, so one huge array
@@ -592,7 +601,14 @@ fn to_lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
 }
 
 impl<'a> PassHost<'a> {
-    fn new(wb: &'a Workbook, exprs: &'a HashMap<Key, std::sync::Arc<Expr>>, rng: &'a mut u64, now: f64) -> Self {
+    fn new(
+        wb: &'a Workbook,
+        exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
+        rng: &'a mut u64,
+        now: f64,
+        hooks: Option<Arc<CalcHooks>>,
+        progress_total: usize,
+    ) -> Self {
         PassHost {
             wb,
             exprs,
@@ -619,6 +635,10 @@ impl<'a> PassHost<'a> {
             range_cells: 0,
             criteria: HashMap::default(),
             spills_possible: wb.sheets.iter().any(|s| !s.spill.is_empty() || !s.spill_ranges.is_empty()),
+            hooks,
+            progress_total: progress_total.max(1),
+            compute_steps: 0,
+            aborted: false,
         }
     }
 }
@@ -646,6 +666,24 @@ fn spill_blocked(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool {
 
 impl PassHost<'_> {
     fn compute(&mut self, k: Key) -> Value {
+        if self.aborted {
+            return Value::Empty;
+        }
+        // On-demand evaluation can recurse through a huge DAG before the top-level dirty loop
+        // checks cancel; sample here so Cancel stops a stuck "0 / N" pass.
+        self.compute_steps = self.compute_steps.wrapping_add(1);
+        if self.compute_steps.is_multiple_of(256)
+            && let Some(hooks) = self.hooks.as_ref()
+        {
+            if hooks.cancelled() {
+                self.aborted = true;
+                return Value::Empty;
+            }
+            let done = self.results.len().min(self.progress_total);
+            if done > 0 {
+                hooks.report(done, self.progress_total);
+            }
+        }
         if let Some(v) = self.results.get(&k) {
             let v = v.clone();
             if self.iterate && self.tainted.contains(&k) {
@@ -1109,8 +1147,29 @@ impl Calc {
     }
 
     /// Rebuilds the graph from scratch and marks it current.
-    pub fn rebuild(&mut self, wb: &Workbook) {
+    /// Returns `false` if a background caller cancelled mid-rebuild (`Calc::hooks`): the graph is
+    /// left invalid so a later F9 rebuilds again instead of trusting a partial index.
+    pub fn rebuild(&mut self, wb: &Workbook) -> bool {
         self.graph = Graph::default();
+        self.graph_valid = false;
+        // Count formulas first so progress has a real denominator (and cancel can stop before the
+        // heavy precedents walk on a huge workbook).
+        let mut total = 0usize;
+        for sheet in &wb.sheets {
+            for (_, cell) in sheet.cells.iter() {
+                if cell.formula.as_ref().is_some_and(|f| f.expr().is_some()) {
+                    total += 1;
+                }
+            }
+        }
+        let total = total.max(1);
+        if let Some(hooks) = self.hooks.as_ref() {
+            if hooks.cancelled() {
+                return false;
+            }
+            hooks.report(0, total);
+        }
+        let mut built = 0usize;
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, cell) in sheet.cells.iter() {
                 if let Some(f) = &cell.formula
@@ -1118,21 +1177,52 @@ impl Calc {
                 {
                     let (areas, dynamic) = precedents(wb, si, &e);
                     self.graph.insert((si, c), Node { areas, dynamic });
+                    built += 1;
+                    if built == 1 || built.is_multiple_of(2048) {
+                        if let Some(hooks) = self.hooks.as_ref() {
+                            if hooks.cancelled() {
+                                self.graph = Graph::default();
+                                self.graph_valid = false;
+                                return false;
+                            }
+                            hooks.report(built.min(total), total);
+                        }
+                    }
                 }
             }
         }
+        if let Some(hooks) = self.hooks.as_ref()
+            && hooks.cancelled()
+        {
+            self.graph = Graph::default();
+            self.graph_valid = false;
+            return false;
+        }
         self.graph.settle();
         self.graph_valid = true;
+        if let Some(hooks) = self.hooks.as_ref() {
+            hooks.report(built.min(total), total);
+        }
+        true
     }
 
     /// Ensures the graph matches `wb`: no-op when [`Self::graph_is_current`], otherwise a full
     /// [`Self::rebuild`]. Used by F9 so a workbook whose graph was kept up to date by
     /// [`Self::cells_changed`] / [`Self::update_nodes`] skips the O(formulas) rebuild.
-    pub fn ensure_graph(&mut self, wb: &Workbook) {
+    /// Returns `false` only when a background rebuild was cancelled.
+    pub fn ensure_graph(&mut self, wb: &Workbook) -> bool {
         if self.graph_valid {
-            return;
+            return true;
         }
-        self.rebuild(wb);
+        // A full rebuild can take seconds on big workbooks; nudge progress so a background job
+        // is not stuck at 0 % with no reports until `run_scoped` starts.
+        if let Some(hooks) = self.hooks.as_ref() {
+            if hooks.cancelled() {
+                return false;
+            }
+            hooks.report(0, 1);
+        }
+        self.rebuild(wb)
     }
 
     /// Updates graph nodes for `changed` cells only (insert/remove precedents), without evaluating.
@@ -1182,8 +1272,11 @@ impl Calc {
     }
 
     /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
-    pub fn recalc_all(&mut self, wb: &mut Workbook) {
-        self.ensure_graph(wb);
+    /// Returns `false` only when a background caller cancelled (`Calc::hooks`).
+    pub fn recalc_all(&mut self, wb: &mut Workbook) -> bool {
+        if !self.ensure_graph(wb) {
+            return false;
+        }
         // Spills are laid out again from the formulas where they are now (a structural edit moves
         // or deletes the formulas, not the values they spilled).
         for i in 0..wb.sheets.len() {
@@ -1195,14 +1288,14 @@ impl Calc {
             }
         }
         let all: Vec<Key> = self.graph.nodes.keys().copied().collect();
-        self.run(wb, all, true);
+        self.run(wb, all, true)
     }
 
     /// Recalculates after loading: builds the dependency graph and only evaluates formulas
     /// that do not already have a computed value or require dynamic-array spilling.
     /// Formulas whose values were pre-calculated and saved by Excel are preserved instantly.
     pub fn recalc_on_load(&mut self, wb: &mut Workbook) {
-        self.rebuild(wb);
+        let _ = self.rebuild(wb);
         for i in 0..wb.sheets.len() {
             if wb.sheet(i).is_some_and(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty())
                 && let Some(sh) = wb.sheet_mut(i)
@@ -1263,18 +1356,18 @@ impl Calc {
     }
 
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
-    pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
+    /// Returns `false` only when a background caller cancelled (`Calc::hooks`).
+    pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) -> bool {
         // A structurally invalidated graph must be rebuilt before patching nodes; otherwise
         // keys/areas from before the edit would mix with the new ones.
-        if !self.graph_valid && !self.graph.is_empty() {
-            self.rebuild(wb);
+        if !self.graph_valid && !self.graph.is_empty() && !self.rebuild(wb) {
+            return false;
         }
         let cleared = self.apply_node_updates(wb, changed);
         if wb.calc.mode == CalcMode::Manual {
             // Only the edited formulas themselves are evaluated.
             let own: Vec<Key> = changed.iter().copied().filter(|k| self.graph.nodes.contains_key(k)).collect();
-            self.run(wb, own, false);
-            return;
+            return self.run(wb, own, false);
         }
         let mut seeds: Vec<Key> = changed.to_vec();
         let mut emptied: Vec<Key> = Vec::new();
@@ -1317,6 +1410,11 @@ impl Calc {
         for (si, r) in &cleared {
             seeds.extend(r.iter().map(|c| (*si, c)));
         }
+        if let Some(hooks) = self.hooks.as_ref()
+            && hooks.cancelled()
+        {
+            return false;
+        }
         let t0 = prof_now();
         let dirty = self.dirty_closure(wb, &seeds);
         let t1 = prof_now();
@@ -1326,10 +1424,11 @@ impl Calc {
         // active sheet that read those sheets look "static" until a tab switch's scoped refill.
         // Large cascades are deferred by the engine (`defer_structural` + `CASCADE_JOB_CELLS` →
         // `recalc_pending` / F9 job), not discarded here. Load may still scope (`recalc_on_load`).
-        self.run(wb, dirty, false);
+        let ok = self.run(wb, dirty, false);
         if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
             eprintln!("recalc: {} seeds, closure {} cells {:.1} ms, run {:.1} ms", seeds.len(), n, t1 - t0, prof_now() - t1);
         }
+        ok
     }
 
     /// Whether the recalculation cascade from `seeds` would evaluate more than `limit` formulas.
@@ -1399,8 +1498,8 @@ impl Calc {
     }
 
     /// Evaluates the dirty set and writes results (and spills) back.
-    fn run(&mut self, wb: &mut Workbook, dirty: Vec<Key>, full: bool) {
-        self.run_scoped(wb, dirty, full, None);
+    fn run(&mut self, wb: &mut Workbook, dirty: Vec<Key>, full: bool) -> bool {
+        self.run_scoped(wb, dirty, full, None)
     }
 
     /// Evaluates the dirty set, optionally scoped to a single sheet to avoid cascading recalculation across massive workbooks on load.
@@ -1416,12 +1515,33 @@ impl Calc {
             if dirty.is_empty() {
                 break;
             }
+            if let Some(hooks) = self.hooks.as_ref() {
+                if hooks.cancelled() {
+                    return false;
+                }
+                // Report before prep (sort / expr map / PassHost) so Cancel is meaningful while a
+                // 640k dirty set is still being prepared — and the bar shows the real N early.
+                if done == 0 {
+                    hooks.report(0, total);
+                }
+            }
             // Row-major order is a good topological guess; on-demand evaluation fixes the rest.
             // Active/scoped sheet cells are evaluated first so visible cells update earlier.
             let target_sheet = scope_sheet.or(Some(wb.active_sheet));
             dirty.sort_by_key(|(s, c)| (target_sheet.is_some_and(|ts| *s != ts), *s, c.row, c.col));
+            if let Some(hooks) = self.hooks.as_ref()
+                && hooks.cancelled()
+            {
+                return false;
+            }
             let mut exprs: HashMap<Key, std::sync::Arc<Expr>> = HashMap::with_capacity_and_hasher(dirty.len(), Default::default());
-            for k in &dirty {
+            for (i, k) in dirty.iter().enumerate() {
+                if i.is_multiple_of(8192)
+                    && let Some(hooks) = self.hooks.as_ref()
+                    && hooks.cancelled()
+                {
+                    return false;
+                }
                 if let Some(e) = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.expr_arc()) {
                     exprs.insert(*k, e);
                 }
@@ -1430,16 +1550,21 @@ impl Calc {
             let mut rng = self.rng;
             let tp = prof_now();
             let (results, spills, cycles) = {
-                let mut host = PassHost::new(wb, &exprs, &mut rng, now);
+                let mut host = PassHost::new(wb, &exprs, &mut rng, now, self.hooks.clone(), total);
                 host.iterate = wb.calc.iterative;
                 for (i, k) in dirty.iter().enumerate() {
                     host.compute(*k);
+                    if host.aborted {
+                        return false;
+                    }
                     let Some(hooks) = self.hooks.as_ref() else { continue };
                     if hooks.cancelled() {
                         return false;
                     }
                     // Fine-grained progress between rounds, so a long pass reports steadily.
-                    if (i + 1).is_multiple_of(4096) {
+                    // First formula + every 4096 thereafter (was only 4096 — huge workbooks
+                    // looked stuck at 0 % through the opening batch).
+                    if i == 0 || (i + 1).is_multiple_of(4096) {
                         hooks.report((done + i + 1).min(total), total);
                     }
                 }
@@ -1579,7 +1704,7 @@ pub fn evaluate(wb: &Workbook, sheet: usize, at: CellRef, formula: &str) -> Valu
 pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> Value {
     let exprs = HashMap::default();
     let mut rng = 0x1234_5678_9ABC_DEF0u64;
-    let mut host = PassHost::new(wb, &exprs, &mut rng, now_serial());
+    let mut host = PassHost::new(wb, &exprs, &mut rng, now_serial(), None, 1);
     let mut ev = Evaluator::new(&mut host, sheet, at);
     ev.value(expr)
 }
@@ -1819,7 +1944,7 @@ pub(crate) mod tests {
         // of a real pass partway through; `visit_range` has to cope with the formulas it reads
         // being calculated under it.
         let mut rng = 1u64;
-        let mut host = PassHost::new(wb, &exprs, &mut rng, 0.0);
+        let mut host = PassHost::new(wb, &exprs, &mut rng, 0.0, None, 1);
 
         let mut seen = Vec::new();
         host.visit_range(0, range, &mut |v| {

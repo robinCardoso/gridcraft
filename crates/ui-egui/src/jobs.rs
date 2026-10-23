@@ -106,6 +106,9 @@ pub struct Job {
     /// Cooperative hooks of a calculation/analysis job: cancelling the job also stops the work
     /// in progress (not just discards the result).
     hooks: Option<Arc<CalcHooks>>,
+    /// Workbook `Arc` a Calc job was spawned from (stale detection in `after_engine`). Kept off
+    /// [`JobKind`] so the kind stays `Eq` without requiring `Workbook: Eq`.
+    calc_snapshot: Option<Arc<Workbook>>,
     rx: Receiver<JobMessage>,
 }
 
@@ -176,6 +179,15 @@ impl JobManager {
             }
         }
     }
+    /// The workbook `Arc` a running calculation of `doc_uid` was spawned from, if any. Used to
+    /// skip cancelling a still-current job when `recalc_pending` is merely owed (autosave /
+    /// unrelated `after_engine`) rather than a newer edit.
+    pub fn calculating_snapshot(&self, doc_uid: u64) -> Option<&Arc<Workbook>> {
+        self.jobs.iter().find_map(|j| match &j.kind {
+            JobKind::Calc { doc_uid: u, .. } if *u == doc_uid => j.calc_snapshot.as_ref(),
+            _ => None,
+        })
+    }
     pub fn cancel_analysis(&mut self, doc_uid: u64) {
         for j in &self.jobs {
             if matches!(j.kind, JobKind::Analysis { doc_uid: u } if u == doc_uid) {
@@ -197,10 +209,18 @@ impl JobManager {
         self.jobs.iter().any(|j| matches!(j.kind, JobKind::Analysis { doc_uid: u } if u == doc_uid))
     }
 
-    fn register(&mut self, kind: JobKind, title: String, cancel: Arc<AtomicBool>, hooks: Option<Arc<CalcHooks>>, rx: Receiver<JobMessage>) -> JobId {
+    fn register(
+        &mut self,
+        kind: JobKind,
+        title: String,
+        cancel: Arc<AtomicBool>,
+        hooks: Option<Arc<CalcHooks>>,
+        calc_snapshot: Option<Arc<Workbook>>,
+        rx: Receiver<JobMessage>,
+    ) -> JobId {
         let id = self.next;
         self.next += 1;
-        self.jobs.push(Job { id, kind, title, progress: 0.0, status: String::new(), cancel, hooks, rx });
+        self.jobs.push(Job { id, kind, title, progress: 0.0, status: String::new(), cancel, hooks, calc_snapshot, rx });
         id
     }
 
@@ -244,13 +264,14 @@ impl JobManager {
             // Dropping the last sender makes poll report a failed job next frame.
             drop(tx);
         }
-        self.register(kind, title, cancel, None, rx)
+        self.register(kind, title, cancel, None, None, rx)
     }
 
     /// Recalculates a snapshot of `wb` (F9) on a background thread, reporting progress from the
     /// calculation itself. The caller keeps `wb` (the `Arc`) to guard the outcome's application,
     /// passes a clone of the live `calc` so a current dependency graph skips the full rebuild, and
-    /// passes `seeds` so the background result matches the inline one.
+    /// passes `seeds` so the background result matches the inline one. `cascade` (when `Some`)
+    /// evaluates only the Automatic dirty set from those seeds instead of every formula.
     pub fn spawn_calc(
         &mut self,
         doc_uid: u64,
@@ -259,34 +280,48 @@ impl JobManager {
         full: bool,
         sheet: usize,
         seeds: gridcraft_engine::calc::CalcSeeds,
+        cascade: Option<Vec<gridcraft_engine::calc::Key>>,
         title: String,
     ) -> JobId {
         let (tx, rx) = mpsc::channel::<JobMessage>();
         let cancel = Arc::new(AtomicBool::new(false));
         let kind = JobKind::Calc { doc_uid, full };
+        let snapshot = wb.clone();
         let hooks = Arc::new(CalcHooks::new());
         {
             let tx = tx.clone();
             hooks.set_progress(Box::new(move |done, total| {
                 let done = done.min(total.max(1));
-                let frac = if total <= 1 { 0.0 } else { ((done as f64 / total as f64) * 0.9).min(0.9) };
+                // A zero-done report still nudges the bar off a hard 0 % so "Calculando…" is not
+                // stuck looking idle through graph ensure / first formulas.
+                let frac = if total <= 1 {
+                    0.0
+                } else if done == 0 {
+                    0.01
+                } else {
+                    ((done as f64 / total as f64) * 0.9).min(0.9)
+                };
                 let _ = tx.send(JobMessage::Progress(frac, format!("{done} / {total}")));
             }));
         }
+        // Immediate status so the UI leaves 0 % before the first cooperative report (clone /
+        // ensure_graph can take a while on big workbooks).
+        let _ = tx.send(JobMessage::Progress(0.01, "0 / …".into()));
         let work = {
             let tx = tx.clone();
             let cancel = cancel.clone();
             let hooks = hooks.clone();
             move || {
-                let outcome = if cancel.load(Ordering::Relaxed) {
+                let outcome = if cancel.load(Ordering::Relaxed) || hooks.cancelled() {
                     Err(CANCELLED.to_string())
                 } else {
                     let sheet = (!full).then_some(sheet);
-                    let hooks = Some(hooks);
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gridcraft_engine::recalc_document(&wb, calc, sheet, hooks, seeds)))
-                    {
+                    let hooks_run = Some(hooks.clone());
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        gridcraft_engine::recalc_document(&wb, calc, sheet, hooks_run, seeds, cascade)
+                    })) {
                         // A cancelled run stops halfway: its snapshot is never applied.
-                        Ok(_) if cancel.load(Ordering::Relaxed) => Err(CANCELLED.to_string()),
+                        Ok(_) if cancel.load(Ordering::Relaxed) || hooks.cancelled() => Err(CANCELLED.to_string()),
                         Ok((wb, calc, cells)) => Ok(CalcOutcome { wb, calc, cells }),
                         Err(p) => Err(compact_panic(p)),
                     }
@@ -298,7 +333,7 @@ impl JobManager {
         if !spawned {
             drop(tx);
         }
-        self.register(kind, title, cancel, Some(hooks), rx)
+        self.register(kind, title, cancel, Some(hooks), Some(snapshot), rx)
     }
 
     /// Runs Solver / Goal Seek on a snapshot (Fase 3): the analysis works on a private session on
@@ -351,7 +386,7 @@ impl JobManager {
         if !spawned {
             drop(tx);
         }
-        self.register(kind, title, cancel, Some(hooks), rx)
+        self.register(kind, title, cancel, Some(hooks), None, rx)
     }
 
     /// Drains progress from every job each frame and hands back the finished ones, in the order
@@ -387,7 +422,7 @@ impl JobManager {
                             },
                             JobKind::Calc { doc_uid, full } => JobResult::Calc {
                                 doc_uid,
-                                wb: Arc::new(Workbook::new()),
+                                wb: job.calc_snapshot.clone().unwrap_or_else(|| Arc::new(Workbook::new())),
                                 full,
                                 outcome: Box::new(Err("the calculation job stopped unexpectedly".into())),
                             },

@@ -190,6 +190,10 @@ pub struct DocState {
     /// A recalculation is owed (`defer_structural` skipped one): every commit defers until a
     /// background job applies the fresh values.
     pub recalc_pending: bool,
+    /// Seeds for a deferred Automatic cascade (`cells_changed` dirty set). `None` while a full
+    /// workbook recalc is owed (structural invalidate / explicit F9). Preferring cascade over
+    /// `recalc_all` keeps a big paste from re-evaluating every unrelated formula in the book.
+    pub recalc_cascade: Option<Vec<calc::Key>>,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -233,6 +237,7 @@ impl DocState {
             content_kind: None,
             defer_structural: false,
             recalc_pending: false,
+            recalc_cascade: None,
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -440,6 +445,7 @@ impl Session {
         d.wb = Arc::new(wb);
         d.calc = calc;
         d.recalc_pending = false;
+        d.recalc_cascade = None;
         self.journal.push((command.to_string(), cmd::journal_params(params)));
         if self.journal.len() > 10_000 {
             self.journal.drain(..5_000);
@@ -606,6 +612,8 @@ pub fn run_analysis(
 /// evaluated. With `sheet`, only that sheet's uncomputed formulas run (Shift+F9); the graph is
 /// still ensured for the whole workbook. `seeds` carries the volatile calculation state
 /// (`rand()` stream, fixed "now") so the result matches the inline calculation.
+/// `cascade` prefers an Automatic dirty-set recalc (`cells_changed`) over a full workbook pass
+/// when a deferred paste/edit recorded its changed keys — avoiding a needless 640k F9.
 #[must_use]
 pub fn recalc_document(
     wb: &Workbook,
@@ -613,6 +621,7 @@ pub fn recalc_document(
     sheet: Option<usize>,
     hooks: Option<Arc<gridcraft_calc::CalcHooks>>,
     seeds: gridcraft_calc::CalcSeeds,
+    cascade: Option<Vec<calc::Key>>,
 ) -> (Workbook, Calc, usize) {
     let mut wb = (*wb).clone();
     calc.set_seeds(seeds);
@@ -621,10 +630,17 @@ pub fn recalc_document(
     }
     match sheet {
         Some(i) => {
-            calc.ensure_graph(&wb);
+            let _ = calc.ensure_graph(&wb);
             calc.recalc_sheet(&mut wb, i);
         }
-        None => calc.recalc_all(&mut wb),
+        None => match cascade {
+            Some(keys) if !keys.is_empty() => {
+                let _ = calc.cells_changed(&mut wb, &keys);
+            }
+            _ => {
+                let _ = calc.recalc_all(&mut wb);
+            }
+        },
     }
     calc.hooks = None;
     let cells = calc.last_recalc_cells;

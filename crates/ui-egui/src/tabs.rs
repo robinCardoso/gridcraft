@@ -335,7 +335,7 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                     // Background jobs (docs/plano-responsividade.md, Fase 1): saving or
                     // calculating with live progress and a cancel — the window keeps answering
                     // while a big workbook works on its own thread.
-                    let mut cancel_job = None;
+                    let mut cancel_job: Option<(u64, bool)> = None;
                     if let Some(d) = app.session.active()
                         && let Some(job) = app.jobs.status_for(d.uid)
                     {
@@ -358,11 +358,20 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                         resp.on_hover_text(title);
                         ui.label(egui::RichText::new(msg).font(theme::ui_font(12.0)).color(t.text_dim));
                         if crate::widgets::icon_button(ui, Icon::Close, t.text_dim, "Cancel", vec2(18.0, 18.0)).clicked() {
-                            cancel_job = Some(job.id);
+                            // User Cancel on a calc job must drop the owed recalc — otherwise
+                            // after_engine would immediately re-spawn "Calculando…".
+                            let drop_pending = matches!(job.kind, crate::jobs::JobKind::Calc { .. });
+                            cancel_job = Some((job.id, drop_pending));
                         }
                     }
-                    if let Some(id) = cancel_job {
+                    if let Some((id, drop_pending)) = cancel_job {
                         app.jobs.cancel(id);
+                        if drop_pending
+                            && let Some(d) = app.session.active_mut()
+                        {
+                            d.recalc_pending = false;
+                            d.recalc_cascade = None;
+                        }
                     }
                     // Calculation indicator and progress bar (Excel style)
                     if let Some((progress, count, at)) = app.calc_status {

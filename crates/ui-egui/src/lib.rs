@@ -639,8 +639,11 @@ impl SheetApp {
         let calc = d.calc.clone();
         let active_sheet = d.wb.active_sheet;
         let wb = d.wb.clone();
+        // Deferred Automatic jobs carry the changed-cell seeds so the worker runs a dirty
+        // cascade instead of re-evaluating the whole workbook. Explicit F9 stays full.
+        let cascade = if force { d.recalc_cascade.clone() } else { None };
         let title = format!("Calculating {}", d.display_title());
-        self.jobs.spawn_calc(uid, wb, calc, full, active_sheet, seeds, title);
+        self.jobs.spawn_calc(uid, wb, calc, full, active_sheet, seeds, cascade, title);
         Some(Ok(json!({"pending": true})))
     }
 
@@ -718,6 +721,7 @@ impl SheetApp {
                         d.calc = o.calc;
                         // The snapshot is fully recomputed: any owed recalculation is paid.
                         d.recalc_pending = false;
+                        d.recalc_cascade = None;
                         self.calc_status = Some((1.0, o.cells, now_ms()));
                     } else {
                         log::info!("job: calculation result discarded (the workbook changed during it)");
@@ -728,6 +732,7 @@ impl SheetApp {
                     // Clear the debt so a failing calculation never requeues forever.
                     if let Some(d) = self.session.doc_by_uid_mut(doc_uid) {
                         d.recalc_pending = false;
+                        d.recalc_cascade = None;
                     }
                     self.message = Some(("GridCraft".into(), clean_error(&e)));
                 }
@@ -1175,12 +1180,18 @@ impl SheetApp {
             {
                 d.defer_structural = true;
             }
+            // Owe a full recalculation: spawn when idle. Cancel+requeue only when the running
+            // job's snapshot is already stale (an edit landed during it). A still-current job
+            // must keep running — otherwise every `after_engine` (finished autosave, unrelated
+            // command, cancelled-job apply) restarts the worker at 0 % forever.
             if self.session.active().is_some_and(|d| d.recalc_pending) {
                 let uid = uid.unwrap_or_default();
-                if self.jobs.is_calculating(uid) {
+                let stale = self.jobs.calculating_snapshot(uid).is_some_and(|snap| {
+                    self.session.active().is_some_and(|d| d.uid == uid && !std::sync::Arc::ptr_eq(&d.wb, snap))
+                });
+                if stale {
                     self.jobs.cancel_calculating(uid);
-                }
-                if !self.jobs.is_calculating(uid) {
+                } else if !self.jobs.is_calculating(uid) {
                     self.calc_job_attempt(true, true);
                 }
             }

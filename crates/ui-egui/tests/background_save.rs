@@ -168,6 +168,114 @@ fn a_huge_cascade_recalculates_in_the_background() {
     );
 }
 
+/// Regression: `after_engine` while a calc job is owed must NOT cancel a still-current snapshot
+/// (autosave / finished-job apply used to restart every worker at 0 %). An edit that replaces the
+/// workbook Arc still cancels and requeues.
+#[test]
+fn after_engine_keeps_current_calc_job_while_pending() {
+    let mut app = app();
+    let data: Vec<Vec<serde_json::Value>> = (0..60).map(|r| (0..100).map(|c| json!(r * 100 + c)).collect()).collect();
+    app.run("range.setValues", json!({"range": "A1", "values": data})).expect("the grid is filled");
+    let lines: String = (0..6000).map(|_| "=SUM(A1:CV20)*2".to_string()).collect::<Vec<_>>().join("\n");
+    app.run("edit.paste", json!({"at": "A21", "text": lines})).expect("the paste answers");
+    let uid = app.session.active().expect("open").uid;
+    assert!(app.jobs.is_calculating(uid), "the deferred paste spawned a calc job");
+    let snap = app.jobs.calculating_snapshot(uid).expect("snapshot").clone();
+
+    // Simulate what a finished autosave (or any non-edit `after_engine`) used to do: cancel the
+    // running job just because `recalc_pending` is still true.
+    for _ in 0..5 {
+        app.after_engine();
+    }
+    assert!(app.jobs.is_calculating(uid), "a current-snapshot job survives after_engine");
+    assert!(
+        app.jobs.calculating_snapshot(uid).is_some_and(|s| std::sync::Arc::ptr_eq(s, &snap)),
+        "the same job keeps running (no cancel/restart loop at 0 %)"
+    );
+
+    let ctx = egui::Context::default();
+    // Progress must leave 0 % (spawn nudges immediately; cooperative reports follow).
+    let mut saw_progress = false;
+    for _ in 0..5000 {
+        let _ = app.jobs.poll(&ctx);
+        if app.jobs.status_for(uid).is_some_and(|j| j.progress > 0.0) {
+            saw_progress = true;
+            break;
+        }
+        if !app.jobs.is_calculating(uid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(saw_progress, "calc progress advances above 0 %");
+
+    for _ in 0..5000 {
+        wait_for_job(&mut app, &ctx);
+        if !app.session.active().is_some_and(|d| d.recalc_pending) {
+            break;
+        }
+    }
+    assert!(!app.session.active().is_some_and(|d| d.recalc_pending), "the undisturbed job converges");
+}
+
+/// User Cancel on a calc job must stop the worker (hooks flag) and clear the owed recalc so
+/// `after_engine` does not immediately re-spawn "Calculando…".
+#[test]
+fn user_cancel_clears_calculating_and_does_not_respawn() {
+    let mut app = app();
+    let data: Vec<Vec<serde_json::Value>> = (0..60).map(|r| (0..100).map(|c| json!(r * 100 + c)).collect()).collect();
+    app.run("range.setValues", json!({"range": "A1", "values": data})).expect("the grid is filled");
+    let lines: String = (0..6000).map(|_| "=SUM(A1:CV20)*2".to_string()).collect::<Vec<_>>().join("\n");
+    app.run("edit.paste", json!({"at": "A21", "text": lines})).expect("the paste answers");
+    let uid = app.session.active().expect("open").uid;
+    assert!(app.jobs.is_calculating(uid), "the deferred paste spawned a calc job");
+    let job_id = app.jobs.status_for(uid).expect("status").id;
+
+    // Same effect as the status-bar X: cancel the job and drop the owed recalc.
+    app.jobs.cancel(job_id);
+    if let Some(d) = app.session.active_mut() {
+        d.recalc_pending = false;
+        d.recalc_cascade = None;
+    }
+
+    let ctx = egui::Context::default();
+    for _ in 0..5000 {
+        for r in app.jobs.poll(&ctx) {
+            app.apply_job(r);
+        }
+        if !app.jobs.is_calculating(uid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(!app.jobs.is_calculating(uid), "the cancelled job finishes");
+    for _ in 0..10 {
+        app.after_engine();
+    }
+    assert!(!app.jobs.is_calculating(uid), "Cancel must not re-spawn Calculando…");
+    assert!(!app.session.active().is_some_and(|d| d.recalc_pending), "the owed recalc was cleared");
+}
+
+/// Deferred paste records cascade seeds so the job evaluates the dirty set, not a blind full F9.
+#[test]
+fn deferred_paste_records_cascade_seeds() {
+    let mut app = app();
+    let data: Vec<Vec<serde_json::Value>> = (0..60).map(|r| (0..100).map(|c| json!(r * 100 + c)).collect()).collect();
+    app.run("range.setValues", json!({"range": "A1", "values": data})).expect("the grid is filled");
+    let lines: String = (0..6000).map(|_| "=SUM(A1:CV20)*2".to_string()).collect::<Vec<_>>().join("\n");
+    app.run("edit.paste", json!({"at": "A21", "text": lines})).expect("the paste answers");
+    let seeds = app.session.active().and_then(|d| d.recalc_cascade.clone());
+    assert!(seeds.as_ref().is_some_and(|s| s.len() >= 6000), "paste seeds the deferred cascade: {seeds:?}");
+    // Let the job finish so the harness does not leak a running worker into other tests.
+    let ctx = egui::Context::default();
+    for _ in 0..5000 {
+        wait_for_job(&mut app, &ctx);
+        if !app.session.active().is_some_and(|d| d.recalc_pending) {
+            break;
+        }
+    }
+}
+
 /// Steps the harness until the running jobs finish (applying their outcomes), returning how many
 /// concluded.
 fn run_jobs_to_end(app: &mut SheetApp, ctx: &egui::Context) -> usize {

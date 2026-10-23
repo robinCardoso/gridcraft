@@ -174,29 +174,33 @@
 
 ## Handoff — próximos passos (para quem continuar o plano)
 
-> ### ⏸️ ONDE PARAMOS — 2026-10-23 (Rodada fix recalc: cascata Automatic cross-sheet)
+> ### ⏸️ ONDE PARAMOS — 2026-10-23 (Rodada LET aninhado / COTACAO lookup repetido)
 >
-> **Regressão fechada.** Em Automatic, `Calc::cells_changed` deixou de truncar a dirty set à
-> aba ativa quando `n > 1_000` (introduzido em `c7a3c16` para responsividade). Esse truncate
-> deixava outras abas stale e fórmulas da aba ativa que leem cross-sheet “estáticas”; a troca
-> de aba (`wb_switch_sheet` → `recalc_sheet_scoped` só em `value` vazio) mascarava o bug.
+> **Bug fechado (engine, não arquivo).** Em `LISTA REDUZIDA.xlsx` aba COTACAO, Referencia
+> mudava (MB001, MB002…) mas Descricao/Fornecedor/Preço/Linha repetiam MB001 após
+> `recalc_on_load`. O xlsx está correto: fórmulas usam `ORCAMENTO[[#This Row],…]` /
+> `[@Referencia]`; cache Excel tinha L16=2, L17=3, L18=4 e descrições distintas.
 >
-> **Correto agora:** cascata completa no caminho Automatic de edição. Cascata grande continua
-> pelo deferral já existente (`defer_structural` + `CASCADE_JOB_CELLS` → `recalc_pending` / job
-> F9), sem stale silencioso. Manual intacto. `recalc_on_load` pode seguir scoped (dívida de
-> abertura / pending) — residual consciente.
+> **Causa:** cache de bindings do `LET` (`PassHost::val_cache`) via `is_expr_invariant`.
+> O LET externo marca `codigo` (ThisRow) como variante; o LET **interno** reiniciava
+> `variant_names` vazio, então `achou = LISTA_PRECO[…] = codigo` parecia invariante
+> (AST só cita o nome) e reutilizava o array da 1ª linha em todas as demais.
+> Não é regressão do truncate Automatic / `recalc_cascade` / job — é o cache do LET
+> (Fase 3) + LET aninhado típico da coluna `Linha`.
 >
-> - Código: `crates/calc/src/recalc.rs` (`cells_changed`).
-> - Testes: `automatic_cascade_keeps_cross_sheet_dependents_past_thousand`,
->   `manual_cells_changed_does_not_cascade_cross_sheet_dependents` (calc);
->   `automatic_edit_cascades_cross_sheet_or_marks_pending` (engine).
+> **Fix:** em `eval::let_`, semear `variant_names` com os nomes já em `self.env`
+> (LET/LAMBDA externos) antes de decidir cache.
+> - Código: `calc/src/eval.rs` (`let_`).
+> - Teste: `nested_let_does_not_reuse_outer_binding_across_rows` (`calc/src/tests.rs`).
 >
-> **Herdado (Rodada 15 — ainda válida):** undo Diff sem rebuild O(n); Fase 5 COW; Fase 3 motor
-> verde. Wasm/clang: não tentar.
+> **Herdado:** Rodada calc job 1% / 0/N + Cancel (cooperativo + `recalc_cascade`).
+> Truncate >1000 removido; Wasm/clang: não tentar. Não commitir sem pedido do dono.
 >
 > **PRÓXIMO PASSO RECOMENDADO (opcional):**
 > 1. Índice `COUNTIF`/`SUMIF`/`AVERAGEIFS`/`MAXIFS`/`MINIFS` (extensão do índice *IFS da Fase 3).
-> 2. Não commitir sem pedido do dono.
+>
+> **Reteste manual:** abrir `LISTA REDUZIDA.xlsx`, aba COTACAO — E16/E17/E18 (e F/J)
+> devem diferir por referência; coluna Linha ≈ 2, 3, 4… como no Excel.
 
 
 **Mapa do que já existe (símbolos):**

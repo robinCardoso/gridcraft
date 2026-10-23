@@ -1292,7 +1292,12 @@ impl<'h> Evaluator<'h> {
             return err(CellError::Value);
         }
         let base = self.env.len();
-        let mut variant_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Outer LET/LAMBDA bindings are cell/context-dependent. A nested LET that only looks at
+        // its own prior names would treat `achou = … = codigo` as invariant (AST mentions the
+        // name, not ThisRow) and reuse the first row's array from `val_cache` for every row —
+        // the COTACAO `Linha` symptom (all INDEX rows = MB001).
+        let outer_names: Vec<String> = self.env.iter().map(|(n, _)| n.clone()).collect();
+        let mut variant_names: std::collections::HashSet<&str> = outer_names.iter().map(|s| s.as_str()).collect();
         for pair in args[..args.len() - 1].chunks(2) {
             let [Expr::Name(n), v] = pair else {
                 self.env.truncate(base);
