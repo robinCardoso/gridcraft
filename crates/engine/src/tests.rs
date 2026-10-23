@@ -3741,8 +3741,13 @@ fn structural_commands_defer_the_recalculation_only_when_the_interface_asks() {
     // And while the debt is open, plain edits defer too (the job recomputes everything anyway).
     s.doc_mut().unwrap().defer_structural = true;
     s.doc_mut().unwrap().recalc_pending = true;
+    s.doc_mut().unwrap().recalc_cascade = None;
     s.execute("cell.set", json!({"cell": "A2", "input": "10"})).unwrap();
     assert!(s.doc().unwrap().calc.graph_is_current(), "non-structural deferral keeps nodes via update_nodes");
+    assert!(
+        s.doc().unwrap().recalc_cascade.as_ref().is_some_and(|c| !c.is_empty()),
+        "edits while recalc_pending must record cascade seeds even when the list was None"
+    );
     assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(3.0), "still stale: the job will recompute");
     s.execute("formulas.calculateNow", json!({})).unwrap();
     assert_eq!(s.execute("cell.get", json!({"cell": "B1"})).unwrap()["value"], json!(12.0));

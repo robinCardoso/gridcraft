@@ -354,7 +354,9 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
         // the graph, recalculates and applies the result. Row/col/sheet shape changes make the
         // existing nodes unusable; mark them dirty so F9's ensure_graph does a full rebuild.
         d.recalc_pending = true;
-        d.recalc_cascade = None;
+        // Keep the edit seeds so the job can run a dirty cascade (table expand + pasted codes)
+        // instead of relying on a full-workbook pass that may still be running or get cancelled.
+        d.recalc_cascade = if changed.is_empty() { None } else { Some(changed.clone()) };
         d.calc.invalidate_graph();
     } else if structural {
         // A full inline recalculation pays the whole debt. Invalidate first: `recalc_all` →
@@ -373,8 +375,11 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
             // structural invalidate, only the full rebuild is safe. Merge new seeds into a
             // deferred cascade so the job evaluates dependents of every unpaid edit.
             d.calc.update_nodes(&mut wb, &changed);
-            if let Some(seeds) = d.recalc_cascade.as_mut() {
-                seeds.extend_from_slice(&changed);
+            if !changed.is_empty() {
+                match &mut d.recalc_cascade {
+                    Some(seeds) => seeds.extend_from_slice(&changed),
+                    None => d.recalc_cascade = Some(changed.clone()),
+                }
             }
         } else if d.defer_structural && (changed.len() > crate::CASCADE_JOB_CELLS || d.calc.cascade_exceeds(&changed, crate::CASCADE_JOB_CELLS)) {
             // A huge cascade (an input cell feeding a big dependency graph) or a huge edit itself

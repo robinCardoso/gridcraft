@@ -258,6 +258,42 @@ inteira continuavam no range antigo.
    - Custo uniforme + cache miss alto → **M3 + Q3**.
    - Uniforme, cache quente, 1 core → spike **E1**.
 
+### 7.3 Pedido / PROCV + Tabela3 (2026-10-23)
+
+**Sintoma:** `10 LISTA SC para Outros.xlsm`, aba **Pedido** — colar códigos em **A6–A14**
+não preenchia **B–L**; a partir da **linha 15** sim.
+
+**Causa raiz (confirmada no corpus):**
+- Grade de pedido = **Tabela3 `A5:L14`** (não é ORCAMENTO structured).
+- Fórmulas **PROCV/SEERRO** em **C6:C14** vêm do xlsx com resultado cacheado
+  `Text("")` → `Value::is_empty()` é **falso** → `recalc_on_load` / `wb_switch_sheet`
+  não reavaliam até haver cascata.
+- Colar **abaixo da linha 14** dispara **`auto_expand_tables`** (`structural`) e autofilla
+  linhas novas com `Value::Empty` (calculam na hora após recalc).
+- Com **`defer_structural`** (≈59k fórmulas no livro), expand estrutural **invalidava o grafo**
+  mas **`recalc_cascade = None`** → job só podia contar com F9 full; edições enquanto
+  `recalc_pending` **não acumulavam seeds** se `recalc_cascade` estava vazio.
+- Fix anterior **db8b630**: `invalidate_graph` no path estrutural **síncrono** (grafo stale
+  após expand sem rebuild).
+
+**Fix (universal):** `engine/src/cmd/mod.rs` `commit`:
+- defer estrutural grava **`recalc_cascade = Some(changed)`** (seeds do paste/expand);
+- com **`recalc_pending`**, se `recalc_cascade` era `None`, inicializa com `changed`.
+
+**O que analisar (checklist):**
+- [ ] Há **ListObject**/tabela cujo `range` termina logo acima das linhas “presas”?
+- [ ] Células com fórmula têm **`Text("")` cacheado** vs `Empty`?
+- [ ] Paste/dispara **`structural`** + **`defer_structural`** / job pendente?
+- [ ] Grafo **`graph_is_current`** após expand sem **`invalidate_graph`**?
+- [ ] Job de calc: **`recalc_cascade`** cobre células de entrada coladas?
+
+**Implementado:** §7.3 + testes `pedido_procv_repro.rs`, assert em `structural_commands_defer…`.
+
+**Validar:**
+- `cargo test -p gridcraft-engine --test pedido_procv_repro` (com xlsm em Downloads).
+- Manual: abrir xlsm → Pedido → colar coluna de códigos a partir de A6 → **C6** e **C15**
+  com descrição; F9 se “Calculando…” foi cancelado.
+
 ### Fora de escopo (mantido)
 
 - Paralelismo completo de produção (E1 full).
