@@ -280,6 +280,11 @@ não preenchia **B–L**; a partir da **linha 15** sim.
 - defer estrutural grava **`recalc_cascade = Some(changed)`** (seeds do paste/expand);
 - com **`recalc_pending`**, se `recalc_cascade` era `None`, inicializa com `changed`.
 
+**Complemento (cache `Text("")`):**
+- `model::Cell::needs_formula_eval` — fórmula com `Empty` ou `Text("")` ainda precisa de avaliação;
+- `recalc_on_load` / `recalc_sheet_scoped` / `wb_switch_sheet` usam isso (Excel grava PROCV vazio como `t=str` sem `<v>`);
+- `tables::touch_table_formula_rows_for_input_edits` — colar/editar a 1.ª coluna da tabela inclui as fórmulas da mesma linha em `changed` (seeds do job dirty).
+
 **O que analisar (checklist):**
 - [ ] Há **ListObject**/tabela cujo `range` termina logo acima das linhas “presas”?
 - [ ] Células com fórmula têm **`Text("")` cacheado** vs `Empty`?

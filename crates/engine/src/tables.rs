@@ -436,6 +436,41 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
     }
 }
 
+/// When a table's input column (first column) changes, ensure calculated columns on the same row
+/// are in `changed` so deferred background jobs revisit PROCV/structured cells even if Excel
+/// left a cached `Text("")` that blocked dependency-only seeds.
+pub(crate) fn touch_table_formula_rows_for_input_edits(cx: &mut crate::cmd::Ctx) {
+    let sheet_count = cx.wb.sheets.len();
+    for si in 0..sheet_count {
+        let inputs: Vec<CellRef> = cx.changed.iter().filter(|(s, _)| *s == si).map(|(_, c)| *c).collect();
+        if inputs.is_empty() {
+            continue;
+        }
+        let tables = cx.wb.sheet(si).map(|sh| sh.tables.clone()).unwrap_or_default();
+        let mut touch = Vec::new();
+        for t in &tables {
+            let header = if t.header_row { 1 } else { 0 };
+            let body_start = t.range.start.row + header;
+            let body_end = if t.totals_row { t.range.end.row.saturating_sub(1) } else { t.range.end.row };
+            let input_col = t.range.start.col;
+            for c in &inputs {
+                if c.col != input_col || c.row < body_start || c.row > body_end {
+                    continue;
+                }
+                for col in (input_col + 1)..=t.range.end.col {
+                    let fref = CellRef::new(c.row, col);
+                    if cx.wb.sheet(si).and_then(|s| s.cell(fref)).is_some_and(|cl| cl.formula.is_some()) {
+                        touch.push(fref);
+                    }
+                }
+            }
+        }
+        for fref in touch {
+            cx.touch(si, fref);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gridcraft_core::Value;

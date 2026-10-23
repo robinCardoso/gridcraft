@@ -1673,6 +1673,23 @@ fn invalidate_graph_forces_rebuild_on_ensure() {
 }
 
 #[test]
+fn recalc_on_load_recomputes_empty_text_formula_cache() {
+    let mut wb = Workbook::new();
+    wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(11002048.0)));
+    wb.sheet_mut(0).unwrap().cells.set(
+        c("B1"),
+        Cell {
+            value: Value::text(""),
+            formula: Some(Arc::new(Formula::new("=A1+1"))),
+            style: Default::default(),
+        },
+    );
+    let mut calc = Calc::new();
+    calc.recalc_on_load(&mut wb);
+    assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Number(11002049.0));
+}
+
+#[test]
 fn update_nodes_while_invalid_is_a_noop() {
     let mut wb = chain(10);
     let mut calc = Calc::new();

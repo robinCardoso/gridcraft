@@ -71,6 +71,20 @@ impl Cell {
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none() && self.style == StyleId::DEFAULT
     }
+    /// Whether a formula still needs evaluation (no trustworthy cached result).
+    /// Excel often saves `Text("")` for empty PROCV/IFERROR results; that is not [`Value::Empty`]
+    /// but must still be recalculated when inputs change or on load.
+    pub fn needs_formula_eval(&self) -> bool {
+        let Some(f) = &self.formula else { return false };
+        if f.array.is_some() {
+            return true;
+        }
+        match &self.value {
+            Value::Empty => true,
+            Value::Text(t) if t.is_empty() => true,
+            _ => false,
+        }
+    }
     /// What the formula bar shows.
     pub fn input_text(&self) -> String {
         if let Some(f) = &self.formula {

@@ -1636,7 +1636,7 @@ impl Calc {
         let mut needed: Vec<Key> = Vec::new();
         for &k in self.graph.nodes.keys() {
             if let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1))
-                && (cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()))
+                && cell.needs_formula_eval()
             {
                 needed.push(k);
             }
@@ -1665,7 +1665,7 @@ impl Calc {
         for &k in self.graph.nodes.keys() {
             if k.0 == sheet
                 && let Some(cell) = wb.sheet(k.0).and_then(|s| s.cell(k.1))
-                && (cell.value.is_empty() || cell.formula.as_ref().is_some_and(|f| f.array.is_some()))
+                && cell.needs_formula_eval()
             {
                 needed.push(k);
             }

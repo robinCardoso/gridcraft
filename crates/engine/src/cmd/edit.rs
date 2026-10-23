@@ -437,7 +437,7 @@ impl crate::DocState {
             wb.active_sheet = i;
         }
         self.selection = self.sheet_selections.get(i).cloned().unwrap_or_default();
-        if self.wb.sheet(i).is_some_and(|sh| sh.cells.iter().any(|(_, c)| c.formula.is_some() && c.value.is_empty())) {
+        if self.wb.sheet(i).is_some_and(|sh| sh.cells.iter().any(|(_, c)| c.needs_formula_eval())) {
             let dirty = self.is_dirty();
             if !dirty {
                 self.saved = std::sync::Arc::new(gridcraft_model::Workbook::new());
