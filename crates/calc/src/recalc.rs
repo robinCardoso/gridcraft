@@ -49,7 +49,7 @@ use gridcraft_core::{Array, CellError, CellRef, RangeRef, Value};
 use gridcraft_formula::Expr;
 use gridcraft_model::{CalcMode, Workbook};
 
-use crate::eval::{Area, Evaluator, Host, precedents};
+use crate::eval::{apply_col_norm, Area, ColNorm, Evaluator, Host, precedents};
 
 pub type Key = (usize, CellRef);
 
@@ -590,8 +590,10 @@ struct PassHost<'a> {
     tainted: HashSet<Key>,
     /// Whether the formula being evaluated has read a previous value.
     taint: bool,
-    lookup_col_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
+    lookup_col_cache: HashMap<(usize, u32, u32, u32, ColNorm), HashMap<LookupExactKey, u32>>,
     lookup_row_cache: HashMap<(usize, u32, u32, u32), HashMap<LookupExactKey, u32>>,
+    /// Small `MATCH` haystacks (`naoServem`, …) keyed by content hash.
+    list_sets: HashMap<u64, Arc<std::collections::HashSet<LookupExactKey>>>,
     val_cache: HashMap<u64, Value>,
     /// Ranges materialized for this pass: many formulas read the same lookup table or criteria
     /// range, and arrays are `Arc`, so a hit is a pointer clone
@@ -602,7 +604,7 @@ struct PassHost<'a> {
     /// Equality index per range for this pass: value key → row-major positions. COUNTIFS/SUMIFS
     /// over the same big table build it once instead of scanning per criterion
     /// (docs/plano-responsividade.md, Fase 3).
-    criteria: HashMap<(usize, RangeRef), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
+    criteria: HashMap<(usize, RangeRef, ColNorm), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
     /// A cached range would go stale if a spill fills cells during the pass (or the workbook
     /// already has spills): the cache is off for such workbooks, correctness first.
     spills_possible: bool,
@@ -779,14 +781,14 @@ const RANGE_CACHE_CELLS: u64 = 1_500_000;
 const RANGE_CACHE_ENTRIES: usize = 128;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum LookupExactKey {
+pub(crate) enum LookupExactKey {
     Text(String),
     Number(u64),
     Bool(bool),
     Empty,
 }
 
-fn to_lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
+pub(crate) fn lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
     match v {
         Value::Text(s) => Some(LookupExactKey::Text(s.to_lowercase())),
         // Excel compares numbers at 15 significant digits, so the index keys the rounded value:
@@ -796,6 +798,24 @@ fn to_lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
         Value::Empty => Some(LookupExactKey::Empty),
         _ => None,
     }
+}
+
+fn hash_hay(hay: &[Value]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    hay.len().hash(&mut h);
+    for v in hay {
+        match v {
+            Value::Text(s) => s.hash(&mut h),
+            Value::Number(n) => n.to_bits().hash(&mut h),
+            Value::Bool(b) => b.hash(&mut h),
+            Value::Empty => 0u8.hash(&mut h),
+            Value::Error(e) => e.code().hash(&mut h),
+            Value::Array(a) => a.data.len().hash(&mut h),
+        }
+    }
+    h.finish()
 }
 
 impl<'a> PassHost<'a> {
@@ -829,6 +849,7 @@ impl<'a> PassHost<'a> {
             taint: false,
             lookup_col_cache: HashMap::default(),
             lookup_row_cache: HashMap::default(),
+            list_sets: HashMap::default(),
             val_cache: HashMap::default(),
             ranges: Vec::new(),
             range_cells: 0,
@@ -1209,7 +1230,7 @@ impl Host for PassHost<'_> {
         }
         Some(value)
     }
-    fn equality_positions(&mut self, sheet: usize, range: RangeRef, needle: &Value) -> Option<Arc<Vec<u32>>> {
+    fn equality_positions(&mut self, sheet: usize, range: RangeRef, needle: &Value, norm: ColNorm) -> Option<Arc<Vec<u32>>> {
         // The same guard as the range cache: a spill can fill cells during the pass.
         if self.spills_possible || !self.spills.is_empty() {
             return None;
@@ -1218,7 +1239,7 @@ impl Host for PassHost<'_> {
         if cells == 0 || cells > RANGE_CACHE_CELLS {
             return None;
         }
-        let key = (sheet, range);
+        let key = (sheet, range, norm);
         if !self.criteria.contains_key(&key) {
             if let Some(stats) = self.stats.as_mut() {
                 stats.eq_build += 1;
@@ -1236,7 +1257,8 @@ impl Host for PassHost<'_> {
                         }
                     }
                     let v = self.cell_value(sheet, CellRef::new(range.start.row + r, range.start.col + c));
-                    let Some(k) = to_lookup_exact_key(&v) else { continue };
+                    let v = apply_col_norm(&v, norm);
+                    let Some(k) = lookup_exact_key(&v) else { continue };
                     let pos = r * w + c;
                     match map.entry(k) {
                         std::collections::hash_map::Entry::Occupied(mut e) => Arc::make_mut(e.get_mut()).push(pos),
@@ -1250,7 +1272,7 @@ impl Host for PassHost<'_> {
         } else if let Some(stats) = self.stats.as_mut() {
             stats.eq_hit += 1;
         }
-        let needle_key = to_lookup_exact_key(needle)?;
+        let needle_key = lookup_exact_key(needle)?;
         Some(self.criteria.get(&key)?.get(&needle_key).cloned().unwrap_or_else(|| Arc::new(Vec::new())))
     }
     fn range_values(&mut self, sheet: usize, range: RangeRef) -> Vec<Value> {
@@ -1365,23 +1387,31 @@ impl Host for PassHost<'_> {
         *self.rng = x;
         (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
     }
-    fn lookup_find_row(&mut self, sheet: usize, search_col: u32, r0: u32, r1: u32, needle: &Value) -> Option<u32> {
+    fn lookup_find_row(
+        &mut self,
+        sheet: usize,
+        search_col: u32,
+        r0: u32,
+        r1: u32,
+        needle: &Value,
+        norm: ColNorm,
+    ) -> Option<u32> {
         let wild = matches!(needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
         if wild {
             return (r0..=r1).find(|&r| {
-                let key = self.cell_value(sheet, CellRef::new(r, search_col));
+                let key = apply_col_norm(&self.cell_value(sheet, CellRef::new(r, search_col)), norm);
                 gridcraft_functions::lookup_equal(needle, &key, true)
             });
         }
 
-        let Some(needle_key) = to_lookup_exact_key(needle) else {
+        let Some(needle_key) = lookup_exact_key(needle) else {
             return (r0..=r1).find(|&r| {
-                let key = self.cell_value(sheet, CellRef::new(r, search_col));
+                let key = apply_col_norm(&self.cell_value(sheet, CellRef::new(r, search_col)), norm);
                 gridcraft_functions::lookup_equal(needle, &key, false)
             });
         };
 
-        let key = (sheet, search_col, r0, r1);
+        let key = (sheet, search_col, r0, r1, norm);
         if !self.lookup_col_cache.contains_key(&key) {
             let mut map = HashMap::default();
             for (i, r) in (r0..=r1).enumerate() {
@@ -1391,8 +1421,8 @@ impl Host for PassHost<'_> {
                         return None;
                     }
                 }
-                let val = self.cell_value(sheet, CellRef::new(r, search_col));
-                if let Some(k) = to_lookup_exact_key(&val) {
+                let val = apply_col_norm(&self.cell_value(sheet, CellRef::new(r, search_col)), norm);
+                if let Some(k) = lookup_exact_key(&val) {
                     map.entry(k).or_insert(r);
                 }
             }
@@ -1409,7 +1439,7 @@ impl Host for PassHost<'_> {
             });
         }
 
-        let Some(needle_key) = to_lookup_exact_key(needle) else {
+        let Some(needle_key) = lookup_exact_key(needle) else {
             return (c0..=c1).find(|&c| {
                 let key = self.cell_value(sheet, CellRef::new(search_row, c));
                 gridcraft_functions::lookup_equal(needle, &key, false)
@@ -1427,7 +1457,7 @@ impl Host for PassHost<'_> {
                     }
                 }
                 let val = self.cell_value(sheet, CellRef::new(search_row, c));
-                if let Some(k) = to_lookup_exact_key(&val) {
+                if let Some(k) = lookup_exact_key(&val) {
                     map.entry(k).or_insert(c);
                 }
             }
@@ -1448,6 +1478,21 @@ impl Host for PassHost<'_> {
     }
     fn set_cached_val(&mut self, key: u64, val: Value) {
         self.val_cache.insert(key, val);
+    }
+    fn hay_membership_set(&mut self, hay: &[Value]) -> Arc<std::collections::HashSet<LookupExactKey>> {
+        let key = hash_hay(hay);
+        if let Some(s) = self.list_sets.get(&key) {
+            return Arc::clone(s);
+        }
+        let mut s = std::collections::HashSet::new();
+        for v in hay {
+            if let Some(k) = lookup_exact_key(v) {
+                s.insert(k);
+            }
+        }
+        let s = Arc::new(s);
+        self.list_sets.insert(key, Arc::clone(&s));
+        s
     }
 }
 
@@ -1649,9 +1694,22 @@ impl Calc {
         self.run(wb, all, true)
     }
 
+    /// How many formula cells still have no trustworthy cached result ([`Cell::needs_formula_eval`]).
+    pub fn formulas_pending_eval(wb: &Workbook) -> usize {
+        wb.sheets
+            .iter()
+            .flat_map(|sh| sh.cells.iter())
+            .filter(|(_, c)| c.formula.is_some() && c.needs_formula_eval())
+            .count()
+    }
+
     /// Recalculates after loading: builds the dependency graph and only evaluates formulas
     /// that do not already have a computed value or require dynamic-array spilling.
     /// Formulas whose values were pre-calculated and saved by Excel are preserved instantly.
+    ///
+    /// When more than 1_000 formulas need evaluation, only the active sheet (plus array
+    /// formulas elsewhere) is recalculated synchronously; the interface should run a full
+    /// recalculation job when [`Self::formulas_pending_eval`] is still non-zero after load.
     pub fn recalc_on_load(&mut self, wb: &mut Workbook) {
         let _ = self.rebuild(wb);
         for i in 0..wb.sheets.len() {

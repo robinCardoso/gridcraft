@@ -228,3 +228,22 @@ Para abrir o app e testar:
 
 cargo run --release -p gridcraft
 (ou rode o binário em target\release\gridcraft.exe e abra o LISTA REDUZIDA.xlsx)
+
+
+INSTALADOR
+
+O WiX instalou; o erro é que pwsh não existe nesta máquina (PowerShell 7). No Windows PowerShell use o script assim:
+
+
+cd c:\Users\Robson\source\grid-excel\gridcraft
+powershell -ExecutionPolicy Bypass -File packaging\windows\package.ps1 -Arch x64
+Ou, já dentro do PowerShell na pasta gridcraft:
+
+
+Set-ExecutionPolicy -Scope Process Bypass
+.\packaging\windows\package.ps1 -Arch x64
+Só depois de gerar o MSI:
+
+
+$msi = Get-Item dist\release\gridcraft-*-windows-x64.msi
+Start-Process msiexec -ArgumentList '/i', $msi.FullName -Verb RunAs

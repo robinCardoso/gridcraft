@@ -377,7 +377,7 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
         }
         "app.save" => wrap(app.run("file.save", json!({"path": s("path")}))),
         "app.quit" => {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            app.handle_viewport_close_request(ctx);
             ok(Json::Null)
         }
         // Anything else that names a command runs it.

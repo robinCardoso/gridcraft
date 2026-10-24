@@ -43,7 +43,9 @@ pub fn poll(inbox: &Inbox, app: &mut SheetApp, ctx: &egui::Context) {
                     app.open_path(p);
                 }
             }
-            Event::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Event::Quit => {
+                let _ = app.handle_viewport_close_request(ctx);
+            }
         }
     }
 }

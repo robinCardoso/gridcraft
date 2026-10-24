@@ -41,8 +41,14 @@ impl eframe::App for App {
         }
         self.0.logic(ctx);
         self.0.poll_printing(ctx);
-        if ctx.input(|input| input.viewport().close_requested()) && self.0.printing.busy() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if ctx.input(|input| input.viewport().close_requested()) {
+            // After the user confirms quit, `continue_viewport_quit` sends `Close`. That sets
+            // `close_requested` on the next frame; canceling again would leave a blank window open.
+            if !self.0.viewport_quit_ready_to_close()
+                && self.0.handle_viewport_close_request(ctx)
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
         }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {

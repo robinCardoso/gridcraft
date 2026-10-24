@@ -122,6 +122,10 @@ impl Evaluator<'_> {
             Ev::V(Value::Empty) if !none => Err(CellError::Calc),
             Ev::V(v) => Ok(Ev::V(v)),
             Ev::L(_) => Err(CellError::Value),
+            Ev::ColEq { area, needle, norm } => {
+                let v = self.deref(Ev::ColEq { area, needle, norm });
+                self.trim_ev(Ev::V(v), rows, cols)
+            }
         }
     }
 }

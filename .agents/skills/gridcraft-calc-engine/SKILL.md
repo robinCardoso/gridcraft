@@ -1,8 +1,8 @@
 ---
 name: gridcraft-calc-engine
 description: >-
-  Guia do motor de cálculo, localização de fórmulas em português (SOMA, PROCV, SE), otimizações
-  de dependências O(N+M), hash index para PROCV e barra de progresso do GridCraft.
+  Guia do motor de cálculo, recalc_on_load e recalc_pending ao abrir XLSX, localização PT
+  (SOMA, PROCV, SE), otimizações O(N+M), PROCV hash e barra de progresso do GridCraft.
 ---
 
 # Motor de Cálculo e Localização de Fórmulas no GridCraft
@@ -13,7 +13,7 @@ Este documento detalha o sistema de cálculo, as otimizações de performance ap
 
 ## 1. Localização de Fórmulas em Português (`FormulaLocale::Pt`)
 
-O GridCraft possui suporte a fórmulas em português ([`FormulaLocale::Pt`](file:///c:/Users/Robson-PC/.antigravity/projetos/grif-excel/gridcraft/crates/formula/src/input.rs)):
+O GridCraft possui suporte a fórmulas em português (`crates/formula/src/input.rs`, `FormulaLocale::Pt`):
 
 - **Separador de argumentos:** `;` (ponto-e-vírgula). Ex: `=SOMA(A1; B1)` ou `=SE(A1>0; "Sim"; "Não")`.
 - **Separador decimal:** `,` (vírgula). Ex: `1,5` ou `2,25`.
@@ -44,10 +44,28 @@ O GridCraft possui suporte a fórmulas em português ([`FormulaLocale::Pt`](file
 
 ---
 
-## 2. Otimizações de Recálculo
+## 2. Recálculo ao abrir (`recalc_on_load`) — contrato anti-regressão
+
+**Código:** `crates/calc/src/recalc.rs` (`recalc_on_load`, `formulas_pending_eval`), `crates/engine/src/lib.rs` (`DocState::new`).
+
+1. **`needs_formula_eval`:** fórmula ainda sem resultado confiável = `Value::Empty` ou `Text("")` (cache vazio de PROCV/SEERRO no XLSX). Valores numéricos/texto salvos pelo Excel **não** são recalculados na abertura (rápido).
+2. **`recalc_on_load`:** reconstrói o grafo; avalia só o que `needs_formula_eval`. Se **> 1.000** células, roda no máximo **1.000** na **aba ativa** (+ fórmulas de matriz dinâmica noutras abas).
+3. **Após o load:** se `Calc::formulas_pending_eval(wb) > 0` → **`DocState.recalc_pending = true`**. A UI deve disparar job F9 em background (`ui-egui`: `after_engine` + `calc_job_attempt(..., force: true)`). **Regressão clássica:** remover esse flag e deixar ~640k fórmulas sem valor visível.
+4. **CLI/testes sem UI:** `recalc_pending` fica true; usar `formulas.calculateNow` ou `recalc_document` explicitamente se o teste precisar de valores completos.
+
+**Testes:**
+
+- `cargo test -p gridcraft-calc recalc_on_load_leaves_pending`
+- `cargo test -p gridcraft-engine lista_v3_open_formula_coverage` (com `LISTA TESTE V3.xlsx` no repo)
+
+Detalhes de fechar janela / salvar: skill **`gridcraft-arquitetura`** §5.2.
+
+---
+
+## 3. Otimizações de Recálculo
 
 ### A. Otimização de Dependências Dirty Closure:
-- Localização: [`crates/engine/src/calc.rs`](file:///c:/Users/Robson-PC/.antigravity/projetos/grif-excel/gridcraft/crates/engine/src/calc.rs).
+- Localização: `crates/calc/src/recalc.rs` (grafo e dirty closure).
 - A verificação de dependências entre colunas inteiras foi otimizada de $O(N \times M)$ para $O(N + M)$ com conjuntos de colunas inteiras (`whole_col_deps`) e eliminação de duplicatas de colunas.
 
 ### B. Índice Hash $O(1)$ para PROCV / VLOOKUP Exato:
@@ -55,8 +73,8 @@ O GridCraft possui suporte a fórmulas em português ([`FormulaLocale::Pt`](file
 
 ---
 
-## 3. Indicador e Barra de Progresso na Barra de Status
+## 4. Indicador e Barra de Progresso na Barra de Status
 
-- Localização: [`crates/ui-egui/src/status_bar.rs`](file:///c:/Users/Robson-PC/.antigravity/projetos/grif-excel/gridcraft/crates/ui-egui/src/status_bar.rs) e [`SheetApp::calc_status`](file:///c:/Users/Robson-PC/.antigravity/projetos/grif-excel/gridcraft/crates/ui-egui/src/lib.rs).
+- Localização: `crates/ui-egui/src/status_bar.rs` e `SheetApp::calc_status` em `crates/ui-egui/src/lib.rs`.
 - Exibe o progresso em porcentagem e quantidade de fórmulas quando há recálculos pesados em andamento.
 - **Auto-ocultação:** Quando o cálculo atinge 100%, o indicador permanece visível por 2.5 segundos e depois some automaticamente para não poluir a interface.

@@ -4009,3 +4009,23 @@ fn equality_indexed_ifs_matches_the_function_path() {
     assert_eq!(v("I5"), Value::Number(1.0), "0.1+0.2 equals 0.3 at 15 digits");
     assert_eq!(v("I6"), Value::Number(1.0));
 }
+
+/// Switching sheets is view state: never run calc, even when the destination still
+/// `needs_formula_eval` (Text("") from PROCV / empty IF — stays true after a successful eval).
+#[test]
+fn sheet_activate_does_not_recalculate() {
+    let mut s = s();
+    s.execute("home.insertSheet", json!({"name": "Lookup"})).unwrap();
+    s.execute("sheet.activate", json!({"sheet": "Lookup"})).unwrap();
+    s.execute("cell.set", json!({"cell": "A1", "input": "=IF(1=0,\"x\",\"\")"})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::text(""));
+    assert!(
+        s.doc().unwrap().wb.active().unwrap().cell(CellRef::parse("A1").unwrap()).unwrap().needs_formula_eval(),
+        "empty-text formula cache still needs_formula_eval"
+    );
+    s.doc_mut().unwrap().calc.last_recalc_cells = 0;
+    s.execute("sheet.activate", json!({"sheet": 0})).unwrap();
+    s.execute("sheet.activate", json!({"sheet": "Lookup"})).unwrap();
+    assert_eq!(s.doc().unwrap().calc.last_recalc_cells, 0, "tab switch must not recalculate");
+    assert_eq!(s.doc().unwrap().wb.active_sheet, 1);
+}

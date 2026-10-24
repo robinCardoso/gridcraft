@@ -219,6 +219,7 @@ impl DocState {
     pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
         let mut calc = Calc::new();
         calc.recalc_on_load(&mut wb);
+        let recalc_pending = Calc::formulas_pending_eval(&wb) > 0;
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
@@ -236,7 +237,7 @@ impl DocState {
             unlocked_ranges: vec![],
             content_kind: None,
             defer_structural: false,
-            recalc_pending: false,
+            recalc_pending,
             recalc_cascade: None,
         }
     }
@@ -504,6 +505,7 @@ impl Session {
             "title": d.display_title(),
             "sheets": d.wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
             "warnings": warnings,
+            "recalcPending": d.recalc_pending,
         }))
     }
 

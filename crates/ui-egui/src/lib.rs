@@ -288,6 +288,9 @@ pub struct SheetApp {
     /// A `file.close` that arrived while a save of that document was still running: the close
     /// completes when the job ends and the document is clean (Fase 2: "salvar e fechar").
     pending_close_uid: Option<u64>,
+    /// The user asked to quit (window close, Quit menu, `app.quit`): walk `file.close` on every
+    /// dirty workbook and show the save prompt before `ViewportCommand::Close`.
+    pending_viewport_close: bool,
     /// Debug panel for the frame/commands budgets (Ctrl+Alt+Shift+P).
     pub perf_panel: bool,
     pub views: HashMap<(u64, usize), SheetView>,
@@ -362,6 +365,7 @@ impl SheetApp {
             last_edit_ms: 0.0,
             pending_save_uid: None,
             pending_close_uid: None,
+            pending_viewport_close: false,
             perf_panel: false,
             views: HashMap::new(),
             editor: None,
@@ -493,6 +497,12 @@ impl SheetApp {
         }
         if let Some(r) = self.run_ui_command(id, &params) {
             return r;
+        }
+        if id == "file.close" {
+            let force = params.get("force").and_then(Json::as_bool).unwrap_or(false);
+            if !force && !self.commit_edit(0, 0, false, false) {
+                return Ok(json!({"closed": false}));
+            }
         }
         // Per-command timing (Fase 0): every command is measured off the clock, slow ones logged
         // and kept for the perf panel (Ctrl+Alt+Shift+P). Desktop-only timing; wasm skips it.
@@ -987,6 +997,62 @@ impl SheetApp {
         }
     }
 
+    /// Quit is confirmed (no dirty workbooks left, no save prompt): the next `close_requested`
+    /// comes from our own [`ViewportCommand::Close`] and must **not** be canceled.
+    pub fn viewport_quit_ready_to_close(&self) -> bool {
+        if !self.pending_viewport_close {
+            return false;
+        }
+        if self.printing.busy() || self.loading.is_some() || self.dialog.is_some() {
+            return false;
+        }
+        !self.session.documents().iter().any(|d| d.is_dirty())
+    }
+
+    /// Window close / Quit: cancel the native close, then close each dirty workbook through the
+    /// same `file.close` → `saveChanges` flow as File › Close. Returns `true` when the host should
+    /// send `ViewportCommand::CancelClose` (always, except when we are already exiting).
+    pub fn handle_viewport_close_request(&mut self, ctx: &egui::Context) -> bool {
+        if self.printing.busy() {
+            return true;
+        }
+        self.pending_viewport_close = true;
+        self.continue_viewport_quit(ctx);
+        true
+    }
+
+    /// Continues a quit started by [`Self::handle_viewport_close_request`] after a dialog or save.
+    pub fn continue_viewport_quit(&mut self, ctx: &egui::Context) {
+        if !self.pending_viewport_close {
+            return;
+        }
+        if self.printing.busy() || self.loading.is_some() {
+            return;
+        }
+        if self.dialog.is_some() {
+            return;
+        }
+        if !self.commit_edit(0, 0, false, false) {
+            return;
+        }
+        if self.session.documents().iter().any(|d| d.is_dirty()) {
+            if self.session.active().is_some_and(|d| !d.is_dirty())
+                && let Some(i) = self.session.documents().iter().position(|d| d.is_dirty())
+            {
+                self.session.set_active(i);
+            }
+            match self.run("file.close", json!({})) {
+                Ok(r) if r.get("closed") == Some(&json!(true)) => ctx.request_repaint(),
+                Ok(_) => {}
+                Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e))),
+            }
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        // Keep `pending_viewport_close` true until the process exits. `logic()` runs before the
+        // viewport is destroyed; clearing here would spawn Book1 on the next frame.
+    }
+
     pub fn run_or_alert(&mut self, id: &str, params: Json) {
         // A menu/shortcut opens the settings first; the Print page's button submits explicitly.
         if id == "file.print" {
@@ -1202,13 +1268,17 @@ impl SheetApp {
                 }
             }
         }
-        if let Some(d) = self.session.active() {
+        if let Some(d) = self.session.active_mut() {
             if (d.uid, d.revision) != self.last_edit {
                 self.last_edit = (d.uid, d.revision);
                 self.last_edit_ms = now_ms();
             }
+            // Consume once: `last_recalc_cells` stays > 0 after a real calc, and every later
+            // command (sheet.activate, selection, …) would re-flash "Calculando… 100%" for 2.5s
+            // even though nothing was recalculated.
             if d.calc.last_recalc_cells > 0 {
                 self.calc_status = Some((1.0, d.calc.last_recalc_cells, now_ms()));
+                d.calc.last_recalc_cells = 0;
             }
         }
         // Fase 3 (docs/plano-responsividade.md): structural commands on big workbooks skip the
@@ -1751,7 +1821,11 @@ impl SheetApp {
             self.after_engine();
         }
         if self.session.active().is_none() {
-            self.session.new_workbook();
+            if self.pending_viewport_close {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.session.new_workbook();
+            }
         }
     }
 
@@ -1864,6 +1938,7 @@ impl SheetApp {
                 self.grid.last_title = Some(title);
             }
         }
+        self.continue_viewport_quit(&ctx);
     }
 
     fn ribbon_keys(&mut self, ctx: &egui::Context) {

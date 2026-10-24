@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use std::cmp::Ordering::Equal;
+
 use gridcraft_core::{Array, CellError, CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value, compare};
 use gridcraft_formula::{BinOp, Expr, RefKind, Reference, SheetSel, StructItem, StructRef, UnOp};
 use gridcraft_functions::{Arg, Ctx};
@@ -18,6 +20,29 @@ pub const MAX_CELLS: u64 = 16_000_000;
 /// formulas over them stay fast.
 const FULL_SIZE_CELLS: u64 = 16_384;
 const MAX_DEPTH: usize = 400;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ColNorm {
+    #[default]
+    Raw,
+    /// `UPPER` + strip spaces/dots/dashes after `TRIM` — LISTA_PRECO `Referencia` vs ORCAMENTO `Linha`.
+    ReferenceKey,
+}
+
+/// Same normalisation as ORCAMENTO `Linha` / `_xlpm.codigo` (trim, strip `.` `-` space, upper).
+pub fn reference_key_norm(v: &Value) -> Value {
+    match v.to_text() {
+        Ok(t) => Value::text(t.trim().replace([' ', '.', '-'], "").to_ascii_uppercase()),
+        Err(e) => Value::Error(e),
+    }
+}
+
+pub(crate) fn apply_col_norm(v: &Value, norm: ColNorm) -> Value {
+    match norm {
+        ColNorm::Raw => v.clone(),
+        ColNorm::ReferenceKey => reference_key_norm(v),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Area {
@@ -37,6 +62,9 @@ pub enum Ev {
     V(Value),
     R(Vec<Area>),
     L(Arc<Lambda>),
+    /// Column (or row) vector equal to a scalar — `MATCH(TRUE, col = x, 0)` / `SUM(--…)` without
+    /// materialising the lookup column on every row (docs/plano-desempenho-calculo.md, Q4).
+    ColEq { area: Area, needle: Value, norm: ColNorm },
 }
 
 impl From<Value> for Ev {
@@ -103,15 +131,29 @@ pub trait Host {
     /// Positions (row-major, 0-based) of the range's cells equal to `needle`, from a per-pass
     /// equality index; `None` when the host does not index it (the caller scans). Used by the
     /// COUNTIFS/SUMIFS fast path (docs/plano-responsividade.md, Fase 3).
-    fn equality_positions(&mut self, _sheet: usize, _range: RangeRef, _needle: &Value) -> Option<std::sync::Arc<Vec<u32>>> {
+    fn equality_positions(
+        &mut self,
+        _sheet: usize,
+        _range: RangeRef,
+        _needle: &Value,
+        _norm: ColNorm,
+    ) -> Option<std::sync::Arc<Vec<u32>>> {
         None
     }
     /// Exact lookup index for a range column: returns the first matching row for `needle`,
     /// or None if not found.
-    fn lookup_find_row(&mut self, sheet: usize, search_col: u32, r0: u32, r1: u32, needle: &Value) -> Option<u32> {
+    fn lookup_find_row(
+        &mut self,
+        sheet: usize,
+        search_col: u32,
+        r0: u32,
+        r1: u32,
+        needle: &Value,
+        norm: ColNorm,
+    ) -> Option<u32> {
         let wild = matches!(needle, Value::Text(t) if gridcraft_functions::has_wildcards(t));
         (r0..=r1).find(|&r| {
-            let key = self.cell_value(sheet, CellRef::new(r, search_col));
+            let key = apply_col_norm(&self.cell_value(sheet, CellRef::new(r, search_col)), norm);
             gridcraft_functions::lookup_equal(needle, &key, wild)
         })
     }
@@ -129,6 +171,18 @@ pub trait Host {
         None
     }
     fn set_cached_val(&mut self, _key: u64, _val: Value) {}
+    /// Keys of a small 1D `MATCH`/`XMATCH` lookup list, memoized for the pass (ORCAMENTO `naoServem`).
+    #[allow(private_interfaces)]
+    fn hay_membership_set(&mut self, hay: &[Value]) -> Arc<std::collections::HashSet<crate::recalc::LookupExactKey>> {
+        use crate::recalc::lookup_exact_key;
+        let mut s = std::collections::HashSet::new();
+        for v in hay {
+            if let Some(k) = lookup_exact_key(v) {
+                s.insert(k);
+            }
+        }
+        Arc::new(s)
+    }
     /// When true, the evaluator times top-level function calls (`GRIDCRAFT_CALC_STATS`).
     fn fn_timing_active(&self) -> bool {
         false
@@ -179,6 +233,11 @@ pub fn hash_expr<H: std::hash::Hasher>(e: &Expr, state: &mut H) {
         }
         Expr::Missing => 0u8.hash(state),
     }
+}
+
+/// No `#ThisRow`, relative refs, or volatile functions — same for every cell on the sheet.
+pub fn is_structure_invariant(e: &Expr) -> bool {
+    is_expr_invariant(e, &std::collections::HashSet::new())
 }
 
 pub fn is_expr_invariant(e: &Expr, variant_names: &std::collections::HashSet<&str>) -> bool {
@@ -292,11 +351,360 @@ impl<'h> Evaluator<'h> {
         match ev {
             Ev::V(v) => v,
             Ev::L(_) => Value::Error(CellError::Calc),
+            Ev::ColEq { area, needle, norm } => self.col_eq_as_array(&area, &needle, norm),
             Ev::R(areas) => match areas.as_slice() {
                 [a] => self.area_value(a),
                 _ => Value::Error(CellError::Value),
             },
         }
+    }
+
+    /// One-column (or one-row) `range = needle` as a boolean array.
+    fn col_eq_as_array(&mut self, area: &Area, needle: &Value, norm: ColNorm) -> Value {
+        if let Value::Error(e) = needle {
+            return Value::Error(*e);
+        }
+        let trimmed = self.trim(area);
+        let (h, w) = (trimmed.height() as usize, trimmed.width() as usize);
+        if h == 0 || w == 0 {
+            return Value::Error(CellError::Value);
+        }
+        if h == 1 || w == 1 {
+            if let Some(positions) = self.host.equality_positions(area.sheet, trimmed, needle, norm) {
+                let len = h * w;
+                let mut data = vec![Value::Bool(false); len];
+                for p in positions.iter() {
+                    if let Some(slot) = data.get_mut(*p as usize) {
+                        *slot = Value::Bool(true);
+                    }
+                }
+                return if w == 1 {
+                    Value::from(Array::column(data))
+                } else {
+                    Value::from(Array::row(data))
+                };
+            }
+        }
+        let mut data = Vec::with_capacity(h * w);
+        for r in 0..h {
+            for c in 0..w {
+                let cell = CellRef::new(trimmed.start.row + r as u32, trimmed.start.col + c as u32);
+                let key = apply_col_norm(&self.host.cell_value(area.sheet, cell), norm);
+                data.push(Value::Bool(compare(&key, needle) == Equal));
+            }
+        }
+        if w == 1 {
+            Value::from(Array::column(data))
+        } else {
+            Value::from(Array::row(data))
+        }
+    }
+
+    fn single_line_area(&mut self, e: &Expr) -> Option<Area> {
+        match e {
+            Expr::Ref(_) | Expr::Struct(_) => {
+                let Ev::R(areas) = self.eval(e) else { return None };
+                let [area] = areas.as_slice() else { return None };
+                let (h, w) = (area.range.height(), area.range.width());
+                if w == 1 || h == 1 { Some(*area) } else { None }
+            }
+            _ => None,
+        }
+    }
+
+    /// `col = scalar` or `scalar = col` before the boolean vector is built.
+    fn peel_column_equality(&mut self, e: &Expr) -> Option<(Area, Value, ColNorm)> {
+        let (left, right) = match e {
+            Expr::Binary(BinOp::Eq, a, b) => (a.as_ref(), b.as_ref()),
+            _ => return None,
+        };
+        if let Some(area) = self.parse_reference_key_column(left) {
+            let needle = self.value(right);
+            if !matches!(needle, Value::Array(_)) {
+                return Some((area, needle, ColNorm::ReferenceKey));
+            }
+        }
+        if let Some(area) = self.parse_reference_key_column(right) {
+            let needle = self.value(left);
+            if !matches!(needle, Value::Array(_)) {
+                return Some((area, needle, ColNorm::ReferenceKey));
+            }
+        }
+        if let Some(area) = self.single_line_area(left) {
+            let needle = self.value(right);
+            if !matches!(needle, Value::Array(_)) {
+                return Some((area, needle, ColNorm::Raw));
+            }
+        }
+        if let Some(area) = self.single_line_area(right) {
+            let needle = self.value(left);
+            if !matches!(needle, Value::Array(_)) {
+                return Some((area, needle, ColNorm::Raw));
+            }
+        }
+        None
+    }
+
+    /// `UPPER(SUBSTITUTE³(TRIM(col&"")))` over a one-column structured/ref range (ORCAMENTO `Linha`).
+    fn parse_reference_key_column(&mut self, e: &Expr) -> Option<Area> {
+        let Expr::Call(upper, args) = e else { return None };
+        if !upper.eq_ignore_ascii_case("UPPER") || args.len() != 1 {
+            return None;
+        }
+        self.parse_reference_key_substitute_dash(&args[0])
+    }
+
+    fn parse_reference_key_substitute_dash(&mut self, e: &Expr) -> Option<Area> {
+        let (inner, from, _to) = self.substitute_parts(e)?;
+        if from != "-" {
+            return None;
+        }
+        self.parse_reference_key_substitute_dot(inner)
+    }
+
+    fn parse_reference_key_substitute_dot(&mut self, e: &Expr) -> Option<Area> {
+        let (inner, from, _to) = self.substitute_parts(e)?;
+        if from != "." {
+            return None;
+        }
+        self.parse_reference_key_substitute_space(inner)
+    }
+
+    fn parse_reference_key_substitute_space(&mut self, e: &Expr) -> Option<Area> {
+        let (inner, from, _to) = self.substitute_parts(e)?;
+        if from != " " {
+            return None;
+        }
+        self.parse_reference_key_trim_column(inner)
+    }
+
+    fn substitute_parts<'a>(&self, e: &'a Expr) -> Option<(&'a Expr, &'a str, &'a str)> {
+        let Expr::Call(name, args) = e else { return None };
+        if !name.eq_ignore_ascii_case("SUBSTITUTE") || args.len() != 3 {
+            return None;
+        }
+        let Expr::Text(from) = &args[1] else { return None };
+        let Expr::Text(to) = &args[2] else { return None };
+        Some((&args[0], from.as_ref(), to.as_ref()))
+    }
+
+    fn parse_reference_key_trim_column(&mut self, e: &Expr) -> Option<Area> {
+        let inner = match e {
+            Expr::Call(name, args) if name.eq_ignore_ascii_case("TRIM") && args.len() == 1 => &args[0],
+            other => other,
+        };
+        match inner {
+            Expr::Binary(BinOp::Concat, left, right) if matches!(right.as_ref(), Expr::Text(t) if t.is_empty()) => {
+                self.single_line_area(left)
+            }
+            _ => self.single_line_area(inner),
+        }
+    }
+
+    fn is_match_true_needle(v: &Value) -> bool {
+        matches!(v.scalar(), Value::Bool(true))
+    }
+
+    fn match_true_col_eq(&mut self, area: &Area, needle: &Value, norm: ColNorm) -> Option<f64> {
+        if matches!(needle, Value::Error(_)) {
+            return None;
+        }
+        let trimmed = self.trim(area);
+        let pos = if area.range.width() == 1 {
+            self.host
+                .lookup_find_row(area.sheet, area.range.start.col, trimmed.start.row, trimmed.end.row, needle, norm)?
+                .saturating_sub(area.range.start.row)
+        } else if area.range.height() == 1 {
+            self.host
+                .lookup_find_col(area.sheet, area.range.start.row, trimmed.start.col, trimmed.end.col, needle)?
+                .saturating_sub(area.range.start.col)
+        } else {
+            return None;
+        };
+        Some((pos + 1) as f64)
+    }
+
+    fn match_true_from_expr(&mut self, e: &Expr) -> Option<Ev> {
+        match self.eval(e) {
+            Ev::ColEq { area, needle, norm } => self.match_true_col_eq(&area, &needle, norm).map(|n| Ev::V(Value::number(n))),
+            _ => self.peel_column_equality(e).and_then(|(area, needle, norm)| {
+                self.match_true_col_eq(&area, &needle, norm).map(|n| Ev::V(Value::number(n)))
+            }),
+        }
+    }
+
+    fn double_unary_inner<'a>(e: &'a Expr) -> Option<&'a Expr> {
+        match e {
+            Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
+                Expr::Unary(UnOp::Neg, x) => Some(x.as_ref()),
+                _ => None,
+            },
+            Expr::Unary(UnOp::Plus, inner) => match inner.as_ref() {
+                Expr::Unary(UnOp::Plus, x) => Some(x.as_ref()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `SUM(--achou)` when `achou` is a column-equality vector: count matches via the equality index.
+    fn sum_coerced_col_eq(&mut self, e: &Expr) -> Option<f64> {
+        let inner = Self::double_unary_inner(e)?;
+        let (area, needle, norm) = match self.eval(inner) {
+            Ev::ColEq { area, needle, norm } => (area, needle, norm),
+            _ => self.peel_column_equality(inner)?,
+        };
+        if matches!(needle, Value::Error(_)) {
+            return None;
+        }
+        let trimmed = self.trim(&area);
+        if let Some(positions) = self.host.equality_positions(area.sheet, trimmed, &needle, norm) {
+            return Some(positions.len() as f64);
+        }
+        let mut count = 0.0;
+        for r in trimmed.start.row..=trimmed.end.row {
+            for c in trimmed.start.col..=trimmed.end.col {
+                let key = apply_col_norm(&self.host.cell_value(area.sheet, CellRef::new(r, c)), norm);
+                if compare(&key, &needle) == Equal {
+                    count += 1.0;
+                }
+            }
+        }
+        Some(count)
+    }
+
+    fn trimmed_lookup_key(v: &Value) -> Option<crate::recalc::LookupExactKey> {
+        let t = v.to_text().ok()?;
+        crate::recalc::lookup_exact_key(&Value::text(t.trim()))
+    }
+
+    fn hay_list_1d(v: &Value) -> Option<&[Value]> {
+        let Value::Array(a) = v else { return None };
+        if a.cols == 1 || a.rows == 1 {
+            Some(&a.data)
+        } else {
+            None
+        }
+    }
+
+    fn match_exact_zero_args(args: &[Expr]) -> Option<(&Expr, &Expr)> {
+        if args.len() != 3 {
+            return None;
+        }
+        match args.get(2) {
+            Some(Expr::Number(n)) if *n == 0.0 => {}
+            Some(Expr::Missing) => {}
+            _ => return None,
+        }
+        Some((&args[0], &args[1]))
+    }
+
+    fn peel_trim_column(e: &Expr) -> Option<&Expr> {
+        match e {
+            Expr::Call(name, args) if name.eq_ignore_ascii_case("TRIM") && args.len() == 1 => Some(&args[0]),
+            _ => Some(e),
+        }
+    }
+
+    /// `ISNA(MATCH(TRIM(col), list, 0))` over a column without lifting MATCH (ORCAMENTO `atende`).
+    fn isna_match_column_batch(&mut self, inner: &Expr) -> Option<Value> {
+        let Expr::Call(mname, margs) = inner else { return None };
+        if !mname.eq_ignore_ascii_case("MATCH") {
+            return None;
+        }
+        let (needle_e, hay_e) = Self::match_exact_zero_args(margs)?;
+        let col_e = Self::peel_trim_column(needle_e)?;
+        let area = self.single_line_area(col_e)?;
+        let hay = self.value(hay_e);
+        let hay = Self::hay_list_1d(&hay)?;
+        let set = self.host.hay_membership_set(hay);
+        let trimmed = self.trim(&area);
+        let w = trimmed.width() as usize;
+        let mut data = Vec::with_capacity(trimmed.height() as usize * w.max(1));
+        for r in trimmed.start.row..=trimmed.end.row {
+            for c in trimmed.start.col..=trimmed.end.col {
+                let raw = self.host.cell_value(area.sheet, CellRef::new(r, c));
+                let Some(key) = Self::trimmed_lookup_key(&raw) else {
+                    data.push(Value::Bool(true));
+                    continue;
+                };
+                data.push(Value::Bool(!set.contains(&key)));
+            }
+        }
+        if w == 1 {
+            Some(Value::from(Array::column(data)))
+        } else {
+            Some(Value::from(Array::row(data)))
+        }
+    }
+
+    fn expr_same(a: &Expr, b: &Expr) -> bool {
+        match (a, b) {
+            (Expr::Name(x), Expr::Name(y)) => x.eq_ignore_ascii_case(y),
+            (Expr::Ref(x), Expr::Ref(y)) => x == y,
+            (Expr::Struct(x), Expr::Struct(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    fn is_filter_name(n: &str) -> bool {
+        n.eq_ignore_ascii_case("FILTER") || n.ends_with(".FILTER")
+    }
+
+    fn parse_min_filter_mask(e: &Expr) -> Option<(&Expr, &Expr)> {
+        let Expr::Binary(BinOp::Eq, pn_e, min_e) = e else { return None };
+        let Expr::Call(min_name, min_args) = min_e.as_ref() else { return None };
+        if !min_name.eq_ignore_ascii_case("MIN") || min_args.len() != 1 {
+            return None;
+        }
+        let Expr::Call(filt, fa) = &min_args[0] else { return None };
+        if !Self::is_filter_name(filt) || fa.len() != 2 || !Self::expr_same(pn_e, &fa[0]) {
+            return None;
+        }
+        Some((&fa[1], &fa[0]))
+    }
+
+    fn parse_xmatch_min_price_mask(e: &Expr) -> Option<(&Expr, &Expr)> {
+        if let Some(p) = Self::parse_min_filter_mask(e) {
+            return Some(p);
+        }
+        let Expr::Binary(BinOp::Mul, a, b) = e else { return None };
+        Self::parse_min_filter_mask(a).or_else(|| Self::parse_min_filter_mask(b))
+    }
+
+    fn value_truthy(v: &Value) -> bool {
+        matches!(v.to_bool(), Ok(true))
+    }
+
+    /// `XMATCH(1, ok*(pn=MIN(FILTER(pn,ok))))` — first minimum-price row among `ok` (ORCAMENTO `Linha`).
+    fn xmatch_first_min_price(&mut self, mask_e: &Expr) -> Option<f64> {
+        let (ok_e, pn_e) = Self::parse_xmatch_min_price_mask(mask_e)?;
+        let ok = self.value(ok_e);
+        let pn = self.value(pn_e);
+        let ok = Self::hay_list_1d(&ok)?;
+        let pn = Self::hay_list_1d(&pn)?;
+        let n = ok.len().min(pn.len());
+        let mut min = f64::INFINITY;
+        for i in 0..n {
+            if !Self::value_truthy(&ok[i]) {
+                continue;
+            }
+            if let Ok(v) = pn[i].to_number()
+                && v > 0.0
+                && v < min
+            {
+                min = v;
+            }
+        }
+        if !min.is_finite() {
+            return None;
+        }
+        for i in 0..n {
+            if Self::value_truthy(&ok[i]) && pn[i].to_number().ok() == Some(min) {
+                return Some((i + 1) as f64);
+            }
+        }
+        None
     }
 
     pub fn area_value(&mut self, a: &Area) -> Value {
@@ -869,7 +1277,7 @@ impl<'h> Evaluator<'h> {
                             (trimmed.start.row..=trimmed.end.row).map(|r| self.host.cell_value(area.sheet, CellRef::new(r, search_col))).collect();
                         gridcraft_functions::bsearch_last(&needle, &keys, false).map(|i| trimmed.start.row + i as u32)
                     } else {
-                        self.host.lookup_find_row(area.sheet, search_col, trimmed.start.row, trimmed.end.row, &needle)
+                        self.host.lookup_find_row(area.sheet, search_col, trimmed.start.row, trimmed.end.row, &needle, ColNorm::Raw)
                     };
                     let Some(r) = match_row else {
                         return err(CellError::NA);
@@ -899,6 +1307,12 @@ impl<'h> Evaluator<'h> {
                 // the generic path below.
                 let exact = matches!(args.get(2), Some(e) if !matches!(e, Expr::Missing))
                     && matches!(self.value(&args[2]).scalar(), Value::Number(n) if n == 0.0);
+                if exact {
+                    let lookup = self.arg_val(args, 0).unwrap_or_default().scalar();
+                    if Self::is_match_true_needle(&lookup) && let Some(r) = self.match_true_from_expr(&args[1]) {
+                        return r;
+                    }
+                }
                 if exact
                     && let Ev::R(areas) = self.eval(&args[1])
                     && let [area] = areas.as_slice()
@@ -911,7 +1325,7 @@ impl<'h> Evaluator<'h> {
                             let trimmed = self.trim(&area);
                             let pos = if w == 1 {
                                 self.host
-                                    .lookup_find_row(area.sheet, area.range.start.col, trimmed.start.row, trimmed.end.row, &x)
+                                    .lookup_find_row(area.sheet, area.range.start.col, trimmed.start.row, trimmed.end.row, &x, ColNorm::Raw)
                                     .map(|r| r - area.range.start.row)
                             } else {
                                 self.host
@@ -962,6 +1376,9 @@ impl<'h> Evaluator<'h> {
                     Ev::V(Value::Error(e)) => err(e),
                     Ev::V(_) => Ev::V(Value::Number(1.0)),
                     Ev::L(_) => err(CellError::Value),
+                    Ev::ColEq { area, .. } => {
+                        Ev::V(Value::number(if is_rows { area.range.height() } else { area.range.width() } as f64))
+                    }
                 }
             }
             "AREAS" => match args.first().map(|a| self.eval(a)) {
@@ -1081,6 +1498,21 @@ impl<'h> Evaluator<'h> {
                 }
                 self.builtin(name, args)
             }
+            "ISNA" if args.len() == 1 => {
+                if let Some(v) = args.first().and_then(|e| self.isna_match_column_batch(e)) {
+                    Ev::V(v)
+                } else {
+                    self.builtin(name, args)
+                }
+            }
+            "XMATCH" if args.len() >= 2 => {
+                let one = matches!(self.value(&args[0]).scalar(), Value::Number(n) if n == 1.0);
+                if one && let Some(idx) = args.get(1).and_then(|e| self.xmatch_first_min_price(e)) {
+                    Ev::V(Value::number(idx))
+                } else {
+                    self.builtin(name, args)
+                }
+            }
             _ => self.builtin(name, args),
         }
     }
@@ -1120,7 +1552,7 @@ impl<'h> Evaluator<'h> {
         }
         let mut positions: Option<Arc<Vec<u32>>> = None;
         for (i, ((sheet, range), _)) in pairs.iter().enumerate() {
-            let found = self.host.equality_positions(*sheet, *range, &needles[i])?;
+            let found = self.host.equality_positions(*sheet, *range, &needles[i], ColNorm::Raw)?;
             positions = Some(match positions.take() {
                 None => found,
                 Some(prev) => Arc::new(intersect(&prev, &found)),
@@ -1225,6 +1657,9 @@ impl<'h> Evaluator<'h> {
     /// after another, as the array path does, so volatile formulas (like `RAND`) see the same order.
     /// Only `SUM`, `COUNT` and `AVG` are supported currently.
     fn aggregate(&mut self, kind: Agg, args: &[Expr]) -> Ev {
+        if kind == Agg::Sum && args.len() == 1 && let Some(n) = self.sum_coerced_col_eq(&args[0]) {
+            return Ev::V(Value::number(n));
+        }
         let mut acc = Acc::default();
         let mut first_error = None;
         for a in args {
@@ -1312,6 +1747,64 @@ impl<'h> Evaluator<'h> {
         r
     }
 
+    fn hash_value_for_cache(v: &Value, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match v {
+            Value::Text(s) => s.hash(hasher),
+            Value::Number(n) => n.to_bits().hash(hasher),
+            Value::Bool(b) => b.hash(hasher),
+            Value::Empty => 0u8.hash(hasher),
+            Value::Error(e) => e.code().hash(hasher),
+            Value::Array(a) => {
+                a.data.len().hash(hasher);
+                for x in &a.data {
+                    Self::hash_value_for_cache(x, hasher);
+                }
+            }
+        }
+    }
+
+    fn hash_ev_for_cache(ev: &Ev, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match ev {
+            Ev::V(v) => Self::hash_value_for_cache(v, hasher),
+            Ev::ColEq { area, needle, norm } => {
+                area.hash(hasher);
+                Self::hash_value_for_cache(needle, hasher);
+                norm.hash(hasher);
+            }
+            Ev::R(areas) => {
+                areas.len().hash(hasher);
+                for a in areas {
+                    a.hash(hasher);
+                }
+            }
+            Ev::L(_) => 255u8.hash(hasher),
+        }
+    }
+
+    /// Hash of LET/LAMBDA names referenced by `e` (ORCAMENTO `cadOk` / `naoServem` vs `filial`).
+    fn env_fingerprint(&self, e: &Expr) -> u64 {
+        use std::collections::HashSet;
+        use std::hash::{Hash, Hasher};
+        let mut names = HashSet::new();
+        e.walk(&mut |node| {
+            if let Expr::Name(n) = node {
+                names.insert(n.to_ascii_uppercase());
+            }
+        });
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut ordered: Vec<_> = names.into_iter().collect();
+        ordered.sort();
+        for n in ordered {
+            n.hash(&mut hasher);
+            if let Some((_, ev)) = self.env.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(&n)) {
+                Self::hash_ev_for_cache(ev, &mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     fn let_(&mut self, args: &[Expr]) -> Ev {
         if args.len() < 3 || args.len().is_multiple_of(2) {
             return err(CellError::Value);
@@ -1328,21 +1821,13 @@ impl<'h> Evaluator<'h> {
                 self.env.truncate(base);
                 return err(CellError::Value);
             };
-            let val = if is_expr_invariant(v, &variant_names) {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                n.hash(&mut hasher);
-                hash_expr(v, &mut hasher);
-                let h = hasher.finish();
-                if let Some(cached) = self.host.get_cached_val(h) {
-                    Ev::V(cached)
-                } else {
-                    let ev = self.eval(v);
-                    if let Ev::V(ref val) = ev {
-                        self.host.set_cached_val(h, val.clone());
-                    }
-                    ev
-                }
+            let val = if let Some((area, needle, norm)) = self.peel_column_equality(v) {
+                Ev::ColEq { area, needle, norm }
+            } else if is_expr_invariant(v, &variant_names) {
+                self.let_cached_binding(n, v, 0)
+            } else if is_structure_invariant(v) {
+                let fp = self.env_fingerprint(v);
+                self.let_cached_binding(n, v, fp)
             } else {
                 variant_names.insert(n.as_str());
                 self.eval(v)
@@ -1355,6 +1840,23 @@ impl<'h> Evaluator<'h> {
         };
         self.env.truncate(base);
         r
+    }
+
+    fn let_cached_binding(&mut self, name: &str, v: &Expr, env_fp: u64) -> Ev {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut hasher);
+        hash_expr(v, &mut hasher);
+        env_fp.hash(&mut hasher);
+        let h = hasher.finish();
+        if let Some(cached) = self.host.get_cached_val(h) {
+            return Ev::V(cached);
+        }
+        let ev = self.eval(v);
+        if let Ev::V(ref val) = ev {
+            self.host.set_cached_val(h, val.clone());
+        }
+        ev
     }
 
     /// A worksheet function given by name where a function is expected (`BYROW(A1:C3,SUM)`,
@@ -1668,6 +2170,10 @@ impl<'h> Evaluator<'h> {
                 }
             }
             Ev::L(_) => err(CellError::Value),
+            Ev::ColEq { area, needle, norm } => {
+                let v = self.col_eq_as_array(&area, &needle, norm);
+                self.index_one(Ev::V(v), row, col, area_n, two_args)
+            }
         }
     }
 
@@ -1840,6 +2346,14 @@ impl<'h> Evaluator<'h> {
                 }
                 Ev::V(Value::Array(a)) => values.extend(a.data.iter().filter(|v| !(skip_errors && v.is_error())).cloned()),
                 Ev::V(v) => values.push(v),
+                Ev::ColEq { area, needle, norm } => {
+                    let v = self.col_eq_as_array(&area, &needle, norm);
+                    if let Value::Array(a) = v {
+                        values.extend(a.data.iter().filter(|v| !(skip_errors && v.is_error())).cloned());
+                    } else {
+                        values.push(v);
+                    }
+                }
                 Ev::L(_) => return err(CellError::Value),
             }
         }
@@ -2108,6 +2622,7 @@ fn ev_shape(ev: &Ev) -> Option<(u32, u32)> {
             [a] => Some((a.range.height(), a.range.width())),
             _ => None,
         },
+        Ev::ColEq { area, .. } => Some((area.range.height(), area.range.width())),
         Ev::V(Value::Array(a)) => Some((u32::try_from(a.rows).unwrap_or(u32::MAX), u32::try_from(a.cols).unwrap_or(u32::MAX))),
         Ev::V(_) => Some((1, 1)),
         Ev::L(_) => None,

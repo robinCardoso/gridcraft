@@ -663,6 +663,64 @@ fn same_lookup_key_two_rows_same_match_index() {
     assert_eq!(t.get("E2"), Value::from("Bravo"));
 }
 
+/// ORCAMENTO `atende`: batch `ISNA(MATCH(TRIM(col), list, 0))` without lifting MATCH.
+#[test]
+fn isna_match_trim_column_batch() {
+    let mut t = T::new();
+    t.set("A2", " Acme ");
+    t.set("A3", "Beta");
+    t.set("A4", "Gamma");
+    t.set("C1", "BETA");
+    t.set("C2", "delta");
+    t.set("D1", "=SUM(--ISNA(MATCH(TRIM(A2:A4),C1:C2,0)))");
+    assert_eq!(t.num("D1"), 2.0, "Acme and Gamma not in exclusion list");
+}
+
+/// ORCAMENTO block: `cadOk` / `naoServem` depend on `filial` only — reuse via pass cache when `codigo` differs per row.
+#[test]
+fn let_pass_cache_nao_servem_block() {
+    let mut t = T::new();
+    t.set("B1", "RJ");
+    t.set("A2", "TODAS");
+    t.set("A3", "RJ");
+    t.set("A4", "SP");
+    t.set("B2", "SupA");
+    t.set("B3", "SupB");
+    t.set("B4", "SupC");
+    let inner = concat!(
+        "LET(cadF,UPPER(A2:A4),",
+        "cadOk,(cadF=\"\")+(cadF=\"TODAS\")+(cadF=filial),",
+        "naoServem,FILTER(B2:B4,cadOk=0),",
+        "ROWS(naoServem)+LEN(codigo)-LEN(codigo))",
+    );
+    let f1 = format!("=LET(filial,UPPER(TRIM(B1)),codigo,C1,{inner})");
+    let f2 = format!("=LET(filial,UPPER(TRIM(B1)),codigo,C2,{inner})");
+    t.set("C1", "MB001");
+    t.set("C2", "MB002");
+    t.set("D1", &f1);
+    t.set("D2", &f2);
+    assert_eq!(t.num("D1"), 1.0, "only SupC excluded (SP)");
+    assert_eq!(t.num("D2"), 1.0, "cached naoServem must match row 1");
+}
+
+/// ORCAMENTO `Linha`: `XMATCH(1, ok*(pn=MIN(FILTER(pn,ok))))` without materialising FILTER.
+#[test]
+fn xmatch_first_min_price_among_ok() {
+    let mut t = T::new();
+    t.set("A2", "1");
+    t.set("A3", "0");
+    t.set("A4", "1");
+    t.set("B2", "10");
+    t.set("B3", "5");
+    t.set("B4", "8");
+    let f = concat!(
+        "=LET(ok,A2:A4,pn,B2:B4,",
+        "XMATCH(1,ok*(pn=MIN(FILTER(pn,ok)))))",
+    );
+    t.set("C1", f);
+    assert_eq!(t.num("C1"), 3.0);
+}
+
 /// `recalc_keys` must refresh formula seeds even when the dependency graph was structurally
 /// invalidated (deferred rebuild) — otherwise clear/set of the lookup input leaves INDEX stale.
 #[test]
@@ -1722,6 +1780,21 @@ fn invalidate_graph_forces_rebuild_on_ensure() {
     assert!(calc.graph_is_current());
     calc.recalc_all(&mut wb);
     assert_eq!(wb.sheet(0).unwrap().value(c("B1")), Value::Number(9.0));
+}
+
+#[test]
+fn recalc_on_load_leaves_pending_when_more_than_1000_formulas_need_eval() {
+    let mut wb = Workbook::new();
+    let sh = wb.sheet_mut(0).unwrap();
+    for r in 0..1_500u32 {
+        sh.cells.set(
+            CellRef::new(r, 0),
+            Cell::formula(Formula::new("=1")),
+        );
+    }
+    let mut calc = Calc::new();
+    calc.recalc_on_load(&mut wb);
+    assert_eq!(Calc::formulas_pending_eval(&wb), 500, "only 1000 of 1500 run synchronously on load");
 }
 
 #[test]

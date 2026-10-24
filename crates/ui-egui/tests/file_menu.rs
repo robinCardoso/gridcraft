@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use egui_kittest::kittest::Queryable as _;
 use gridcraft_engine::{Session, core::CellRef, core::Value};
+use gridcraft_ui_egui::control::ControlRequest;
 use gridcraft_ui_egui::{Services, SheetApp};
+use serde_json::json;
+use std::sync::mpsc;
 
 fn harness(services: Services) -> egui_kittest::Harness<'static, SheetApp> {
     let mut session = Session::new();
@@ -106,6 +109,32 @@ fn save_actions_include_the_cell_draft_and_close_keeps_the_unsaved_prompt() {
     assert_eq!(h.state().session.documents().len(), 1);
     assert_eq!(h.state().dialog.as_ref().map(|d| d.name()), Some("saveChanges"));
     assert_eq!(h.state().session.active().unwrap().wb.active().unwrap().value(CellRef::new(0, 0)), Value::Number(123.0));
+}
+
+#[test]
+fn viewport_quit_dont_save_does_not_spawn_book1() {
+    let mut h = harness(Services::default());
+    h.input_mut().events.push(egui::Event::Text("1".into()));
+    h.run_steps(2);
+    let (tx, rx) = mpsc::channel();
+    h.state_mut().control_rx = Some(rx);
+    let (req, _reply) = ControlRequest::new("app.quit", json!({}));
+    tx.send(req).unwrap();
+    h.run_steps(3);
+    assert_eq!(h.state().dialog.as_ref().map(|d| d.name()), Some("saveChanges"));
+    click(&mut h, "Don't Save");
+    h.run_steps(3);
+    assert_eq!(h.state().session.documents().len(), 0);
+    assert!(
+        h.state().viewport_quit_ready_to_close(),
+        "host must not CancelClose the programmatic Close after Don't Save"
+    );
+    h.run_steps(3);
+    assert_eq!(
+        h.state().session.documents().len(),
+        0,
+        "while quitting, logic must not open a blank Book1"
+    );
 }
 
 #[test]

@@ -417,7 +417,9 @@ impl crate::DocState {
         if let Some(slot) = self.sheet_selections.get_mut(cur) {
             *slot = self.selection.clone();
         }
-        // The active sheet is view state: change it without making the workbook dirty.
+        // The active sheet is view state only: change it without dirtying the workbook and
+        // without recalculating. Cells that still `needs_formula_eval` (Text("") from PROCV,
+        // array formulas, …) would otherwise re-run on every tab click.
         let dirty = self.is_dirty();
         if !dirty {
             // Temporarily replace self.saved with a dummy Arc so that self.wb has strong_count == 1,
@@ -437,18 +439,6 @@ impl crate::DocState {
             wb.active_sheet = i;
         }
         self.selection = self.sheet_selections.get(i).cloned().unwrap_or_default();
-        if self.wb.sheet(i).is_some_and(|sh| sh.cells.iter().any(|(_, c)| c.needs_formula_eval())) {
-            let dirty = self.is_dirty();
-            if !dirty {
-                self.saved = std::sync::Arc::new(gridcraft_model::Workbook::new());
-                let wb = std::sync::Arc::make_mut(&mut self.wb);
-                self.calc.recalc_sheet_scoped(wb, i, 500);
-                self.saved = self.wb.clone();
-            } else {
-                let wb = std::sync::Arc::make_mut(&mut self.wb);
-                self.calc.recalc_sheet_scoped(wb, i, 500);
-            }
-        }
     }
 }
 

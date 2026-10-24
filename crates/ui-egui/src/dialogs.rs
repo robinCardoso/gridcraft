@@ -1205,6 +1205,7 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                             open = false;
                         }
                         if ui.button(lang.tr("Cancel")).clicked() {
+                            app.pending_viewport_close = false;
                             open = false;
                         }
                         // File operations must include the cell the user is still editing (as the File > Save menu item already does).

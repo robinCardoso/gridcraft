@@ -124,13 +124,21 @@ fn test_inspect_cotacao_table() {
         }
     }
     println!("  Rows 2..{sample_rows} of Col F took {:.2?}", t_col.elapsed());
-    println!("Testing DocState and wb_switch_sheet(1) to LISTA_PRECO:");
+    println!("Testing DocState and wb_switch_sheet(1) to LISTA_PRECO (view only, no recalc):");
     let mut doc = gridcraft_engine::DocState::new(wb, None, "Test".into());
     let t_switch = Instant::now();
     doc.wb_switch_sheet(1);
     println!("  wb_switch_sheet(1) took {:.2?}", t_switch.elapsed());
 
-    println!("Checking cells in LISTA_PRECO after wb_switch_sheet(1):");
+    // Sheet activate must not calculate; evaluate LISTA_PRECO explicitly for the assertions.
+    let t_recalc = Instant::now();
+    {
+        let wb = std::sync::Arc::make_mut(&mut doc.wb);
+        doc.calc.recalc_sheet(wb, 1);
+    }
+    println!("  recalc_sheet(1) took {:.2?}", t_recalc.elapsed());
+
+    println!("Checking cells in LISTA_PRECO after recalc_sheet(1):");
     if let Some(sh1) = doc.wb.sheet(1) {
         for r in 1..=4 {
             for c in [0, 1, 5, 6, 8] {
