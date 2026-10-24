@@ -3824,6 +3824,44 @@ fn automatic_edit_cascades_cross_sheet_or_marks_pending() {
     assert_eq!(s.doc().unwrap().wb.sheet(1).unwrap().value(CellRef::new(big - 1, 0)), Value::Number(11.0));
 }
 
+/// Post-open job: `uncomputed_only` fills pending formulas without a full-workbook F9.
+#[test]
+fn recalc_document_uncomputed_only_skips_cached_formulas() {
+    let mut s = s();
+    {
+        let d = s.doc_mut().unwrap();
+        let wb = std::sync::Arc::make_mut(&mut d.wb);
+        let sh = wb.sheet_mut(0).unwrap();
+        for r in 0..1_500u32 {
+            sh.cells.set(CellRef::new(r, 0), gridcraft_model::Cell::formula(gridcraft_model::Formula::new("=1")));
+        }
+        for r in 0..200u32 {
+            sh.cells.set(
+                CellRef::new(r, 1),
+                gridcraft_model::Cell {
+                    value: Value::Number(7.0),
+                    formula: Some(std::sync::Arc::new(gridcraft_model::Formula::new("=99"))),
+                    style: Default::default(),
+                },
+            );
+        }
+        d.calc = crate::calc::Calc::new();
+        d.calc.recalc_on_load(wb);
+        d.recalc_pending = crate::calc::Calc::formulas_pending_eval(wb) > 0;
+        d.recalc_cascade = None;
+    }
+    let d = s.doc().unwrap();
+    assert!(d.recalc_pending);
+    assert!(d.calc.graph_is_current());
+    let pending = crate::calc::Calc::formulas_pending_eval(&d.wb);
+    assert_eq!(pending, 500);
+    let seeds = d.calc.seeds();
+    let (wb, _, cells) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, None, true);
+    assert_eq!(cells, 500, "open job evaluates only unpaid formulas, not the whole graph");
+    assert_eq!(crate::calc::Calc::formulas_pending_eval(&wb), 0);
+    assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(0, 1)), Value::Number(7.0));
+}
+
 /// Fase 3: `recalc_document` reuses a current graph (skip rebuild) and matches a fresh Calc.
 #[test]
 fn recalc_document_reuses_current_graph() {
@@ -3834,8 +3872,8 @@ fn recalc_document_reuses_current_graph() {
     let d = s.doc().unwrap();
     assert!(d.calc.graph_is_current());
     let seeds = d.calc.seeds();
-    let (wb_inc, calc_inc, _) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, None);
-    let (wb_full, calc_full, _) = crate::recalc_document(&d.wb, crate::calc::Calc::new(), None, None, seeds, None);
+    let (wb_inc, calc_inc, _) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, None, false);
+    let (wb_full, calc_full, _) = crate::recalc_document(&d.wb, crate::calc::Calc::new(), None, None, seeds, None, false);
     assert!(calc_inc.graph_is_current());
     assert!(calc_full.graph_is_current());
     assert_eq!(wb_inc, wb_full);
@@ -3859,7 +3897,7 @@ fn deferred_cascade_seeds_drive_recalc_document() {
     let cascade = d.recalc_cascade.clone().expect("paste records cascade seeds");
     assert!(cascade.len() as u32 >= n, "seeds cover the pasted formulas");
     let seeds = d.calc.seeds();
-    let (wb_cas, _, cells) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, Some(cascade));
+    let (wb_cas, _, cells) = crate::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, Some(cascade), false);
     assert!(cells > 0);
     assert_eq!(wb_cas.sheet(0).unwrap().value(gridcraft_core::CellRef::new(0, 1)), gridcraft_core::Value::Number(2.0));
 }

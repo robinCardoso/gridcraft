@@ -1696,11 +1696,36 @@ impl Calc {
 
     /// How many formula cells still have no trustworthy cached result ([`Cell::needs_formula_eval`]).
     pub fn formulas_pending_eval(wb: &Workbook) -> usize {
-        wb.sheets
-            .iter()
-            .flat_map(|sh| sh.cells.iter())
-            .filter(|(_, c)| c.formula.is_some() && c.needs_formula_eval())
-            .count()
+        Self::pending_formula_keys(wb).len()
+    }
+
+    /// Formula cells that still need evaluation ([`Cell::needs_formula_eval`]).
+    pub fn pending_formula_keys(wb: &Workbook) -> Vec<Key> {
+        let mut needed = Vec::new();
+        for (si, sh) in wb.sheets.iter().enumerate() {
+            for (c, cell) in sh.cells.iter() {
+                if cell.formula.is_some() && cell.needs_formula_eval() {
+                    needed.push((si, c));
+                }
+            }
+        }
+        needed
+    }
+
+    /// Evaluates only formulas that still have no trustworthy cached result (post-open debt).
+    /// Prefer this over [`Self::recalc_all`] after [`Self::recalc_on_load`]: Excel-saved caches
+    /// stay, and large books (hundreds of thousands of formulas) only pay for the unpaid set.
+    /// Returns `false` only when a background caller cancelled (`Calc::hooks`).
+    pub fn recalc_uncomputed(&mut self, wb: &mut Workbook) -> bool {
+        if !self.ensure_graph(wb) {
+            return false;
+        }
+        let needed = Self::pending_formula_keys(wb);
+        if needed.is_empty() {
+            self.last_recalc_cells = 0;
+            return true;
+        }
+        self.run(wb, needed, false)
     }
 
     /// Recalculates after loading: builds the dependency graph and only evaluates formulas
@@ -1708,8 +1733,9 @@ impl Calc {
     /// Formulas whose values were pre-calculated and saved by Excel are preserved instantly.
     ///
     /// When more than 1_000 formulas need evaluation, only the active sheet (plus array
-    /// formulas elsewhere) is recalculated synchronously; the interface should run a full
-    /// recalculation job when [`Self::formulas_pending_eval`] is still non-zero after load.
+    /// formulas elsewhere) is recalculated synchronously; the interface should run
+    /// [`Self::recalc_uncomputed`] (or a job that does) when [`Self::formulas_pending_eval`]
+    /// is still non-zero after load — not a blind [`Self::recalc_all`].
     pub fn recalc_on_load(&mut self, wb: &mut Workbook) {
         let _ = self.rebuild(wb);
         for i in 0..wb.sheets.len() {

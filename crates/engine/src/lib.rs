@@ -616,6 +616,8 @@ pub fn run_analysis(
 /// (`rand()` stream, fixed "now") so the result matches the inline calculation.
 /// `cascade` prefers an Automatic dirty-set recalc (`cells_changed`) over a full workbook pass
 /// when a deferred paste/edit recorded its changed keys — avoiding a needless 640k F9.
+/// `uncomputed_only` (post-open debt with a current graph) evaluates only
+/// [`Calc::formulas_pending_eval`] cells — Excel-saved caches stay; explicit F9 keeps `false`.
 #[must_use]
 pub fn recalc_document(
     wb: &Workbook,
@@ -624,6 +626,7 @@ pub fn recalc_document(
     hooks: Option<Arc<gridcraft_calc::CalcHooks>>,
     seeds: gridcraft_calc::CalcSeeds,
     cascade: Option<Vec<calc::Key>>,
+    uncomputed_only: bool,
 ) -> (Workbook, Calc, usize) {
     let mut wb = (*wb).clone();
     calc.set_seeds(seeds);
@@ -638,6 +641,9 @@ pub fn recalc_document(
         None => match cascade {
             Some(keys) if !keys.is_empty() => {
                 let _ = calc.cells_changed(&mut wb, &keys);
+            }
+            _ if uncomputed_only => {
+                let _ = calc.recalc_uncomputed(&mut wb);
             }
             _ => {
                 let _ = calc.recalc_all(&mut wb);

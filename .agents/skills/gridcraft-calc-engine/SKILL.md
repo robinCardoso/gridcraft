@@ -50,8 +50,8 @@ O GridCraft possui suporte a fórmulas em português (`crates/formula/src/input.
 
 1. **`needs_formula_eval`:** fórmula ainda sem resultado confiável = `Value::Empty` ou `Text("")` (cache vazio de PROCV/SEERRO no XLSX). Valores numéricos/texto salvos pelo Excel **não** são recalculados na abertura (rápido).
 2. **`recalc_on_load`:** reconstrói o grafo; avalia só o que `needs_formula_eval`. Se **> 1.000** células, roda no máximo **1.000** na **aba ativa** (+ fórmulas de matriz dinâmica noutras abas).
-3. **Após o load:** se `Calc::formulas_pending_eval(wb) > 0` → **`DocState.recalc_pending = true`**. A UI deve disparar job F9 em background (`ui-egui`: `after_engine` + `calc_job_attempt(..., force: true)`). **Regressão clássica:** remover esse flag e deixar ~640k fórmulas sem valor visível.
-4. **CLI/testes sem UI:** `recalc_pending` fica true; usar `formulas.calculateNow` ou `recalc_document` explicitamente se o teste precisar de valores completos.
+3. **Após o load:** se `Calc::formulas_pending_eval(wb) > 0` → **`DocState.recalc_pending = true`**. A UI dispara job em background (`after_engine` + `calc_job_attempt(..., force: true)`). Com grafo válido e sem seeds de edição, o job chama **`recalc_uncomputed`** (só pendentes, ~17k no V3), **não** `recalc_all` (640k). **Regressão clássica:** remover o flag e deixar fórmulas sem valor; ou forçar F9 completo no open e voltar a minutos de “Calculando…”.
+4. **CLI/testes sem UI:** `recalc_pending` fica true; usar `formulas.calculateNow`, `Calc::recalc_uncomputed` ou `recalc_document(..., uncomputed_only: true)` conforme o caso.
 
 **Testes:**
 

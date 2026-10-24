@@ -83,7 +83,8 @@ Use esta seção quando alterar **`file.open`**, **`file.close`**, **`DocState::
 2. `recalc_on_load` só calcula **sincronamente** fórmulas sem cache confiável; se forem **> 1.000**, limita à **aba ativa** (mais fórmulas de matriz dinâmica).
 3. Se ainda restarem fórmulas com `Cell::needs_formula_eval()` (`Value::Empty` ou `Text("")`), **`DocState.recalc_pending` deve ser `true`** (`Calc::formulas_pending_eval`).
 4. Na UI nativa, `SheetApp::after_engine` enfileira job de cálculo (`calc_job_attempt(true, true)`) enquanto `recalc_pending` — o usuário vê progresso na barra de status; **não** deixar a grade “vazia” sem job em livros com dezenas/centenas de mil fórmulas.
-5. `file.open` pode expor `"recalcPending": true` no JSON de `install_document`.
+5. Esse job pós-abrir, com grafo ainda válido e sem `recalc_cascade`, usa **`recalc_uncomputed`** (só fórmulas `needs_formula_eval`) — **não** um F9 de 640k. F9 explícito e defer estrutural (grafo invalidado) continuam em `recalc_all`.
+6. `file.open` pode expor `"recalcPending": true` no JSON de `install_document`.
 
 **Sintoma de regressão:** abrir `LISTA TESTE V3.xlsx` e ver colunas calculadas (LISTA_PRECO, ORCAMENTO) todas em branco, sem “Calculando…”.
 

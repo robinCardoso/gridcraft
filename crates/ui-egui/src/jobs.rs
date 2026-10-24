@@ -272,6 +272,7 @@ impl JobManager {
     /// passes a clone of the live `calc` so a current dependency graph skips the full rebuild, and
     /// passes `seeds` so the background result matches the inline one. `cascade` (when `Some`)
     /// evaluates only the Automatic dirty set from those seeds instead of every formula.
+    /// `uncomputed_only` (post-open) fills formulas still lacking a cache instead of a full F9.
     pub fn spawn_calc(
         &mut self,
         doc_uid: u64,
@@ -281,6 +282,7 @@ impl JobManager {
         sheet: usize,
         seeds: gridcraft_engine::calc::CalcSeeds,
         cascade: Option<Vec<gridcraft_engine::calc::Key>>,
+        uncomputed_only: bool,
         title: String,
     ) -> JobId {
         let (tx, rx) = mpsc::channel::<JobMessage>();
@@ -318,7 +320,7 @@ impl JobManager {
                     let sheet = (!full).then_some(sheet);
                     let hooks_run = Some(hooks.clone());
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        gridcraft_engine::recalc_document(&wb, calc, sheet, hooks_run, seeds, cascade)
+                        gridcraft_engine::recalc_document(&wb, calc, sheet, hooks_run, seeds, cascade, uncomputed_only)
                     })) {
                         // A cancelled run stops halfway: its snapshot is never applied.
                         Ok(_) if cancel.load(Ordering::Relaxed) || hooks.cancelled() => Err(CANCELLED.to_string()),

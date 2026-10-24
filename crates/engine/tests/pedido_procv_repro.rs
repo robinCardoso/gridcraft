@@ -81,7 +81,7 @@ fn pedido_deferred_table_expand_job_uses_paste_seeds() {
     let c6 = (pedido, CellRef::parse("C6").unwrap());
     assert!(cascade.contains(&c6), "body formula C6 must be a cascade seed");
 
-    let (wb, _, _) = gridcraft_engine::recalc_document(&d.wb, d.calc.clone(), None, None, d.calc.seeds(), Some(cascade));
+    let (wb, _, _) = gridcraft_engine::recalc_document(&d.wb, d.calc.clone(), None, None, d.calc.seeds(), Some(cascade), false);
     let sh = wb.sheet(pedido).unwrap();
     let c6 = sh.value(CellRef::parse("C6").unwrap());
     let c15 = sh.value(CellRef::parse("C15").unwrap());
@@ -122,7 +122,7 @@ fn pedido_deferred_paste_a6_a23_fills_table_body_and_expanded_rows() {
 
     let seeds = d.calc.seeds();
     let (wb, calc, cells) =
-        gridcraft_engine::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, Some(cascade));
+        gridcraft_engine::recalc_document(&d.wb, d.calc.clone(), None, None, seeds, Some(cascade), false);
     assert!(cells > 0, "job must evaluate formulas");
     let sh = wb.sheet(pedido).unwrap();
     let c6 = sh.value(CellRef::parse("C6").unwrap());
@@ -159,7 +159,7 @@ fn pedido_deferred_paste_inside_table_body_without_expand() {
     if d.recalc_pending {
         let cascade = d.recalc_cascade.clone().unwrap();
         let (wb, _, _) =
-            gridcraft_engine::recalc_document(&d.wb, d.calc.clone(), None, None, d.calc.seeds(), Some(cascade));
+            gridcraft_engine::recalc_document(&d.wb, d.calc.clone(), None, None, d.calc.seeds(), Some(cascade), false);
         let sh = wb.sheet(pedido).unwrap();
         let c6 = sh.value(CellRef::parse("C6").unwrap());
         assert!(matches!(c6, Value::Text(ref t) if !t.is_empty()), "C6: {c6:?}");

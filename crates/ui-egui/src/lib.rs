@@ -666,8 +666,14 @@ impl SheetApp {
         // Deferred Automatic jobs carry the changed-cell seeds so the worker runs a dirty
         // cascade instead of re-evaluating the whole workbook. Explicit F9 stays full.
         let cascade = if force { d.recalc_cascade.clone() } else { None };
+        // Post-open debt: graph is still current and there are no edit seeds → fill only
+        // formulas that still need eval (~17k on LISTA V3) instead of a 640k F9. Structural
+        // defer invalidates the graph first, so that path still gets a full rebuild+recalc.
+        // Explicit F9 uses `force: false` → always full.
+        let uncomputed_only =
+            force && cascade.as_ref().map_or(true, Vec::is_empty) && d.calc.graph_is_current();
         let title = format!("Calculating {}", d.display_title());
-        self.jobs.spawn_calc(uid, wb, calc, full, active_sheet, seeds, cascade, title);
+        self.jobs.spawn_calc(uid, wb, calc, full, active_sheet, seeds, cascade, uncomputed_only, title);
         Some(Ok(json!({"pending": true})))
     }
 

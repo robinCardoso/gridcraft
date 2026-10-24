@@ -1798,6 +1798,34 @@ fn recalc_on_load_leaves_pending_when_more_than_1000_formulas_need_eval() {
 }
 
 #[test]
+fn recalc_uncomputed_pays_open_debt_without_touching_cached_formulas() {
+    let mut wb = Workbook::new();
+    let sh = wb.sheet_mut(0).unwrap();
+    for r in 0..1_500u32 {
+        sh.cells.set(CellRef::new(r, 0), Cell::formula(Formula::new("=1")));
+    }
+    // Excel-style cache: formula present, trustworthy Number — must not be re-evaluated.
+    for r in 0..500u32 {
+        sh.cells.set(
+            CellRef::new(r, 1),
+            Cell {
+                value: Value::Number(42.0),
+                formula: Some(Arc::new(Formula::new("=99"))),
+                style: Default::default(),
+            },
+        );
+    }
+    let mut calc = Calc::new();
+    calc.recalc_on_load(&mut wb);
+    assert_eq!(Calc::formulas_pending_eval(&wb), 500);
+    assert!(calc.graph_is_current());
+    assert!(calc.recalc_uncomputed(&mut wb));
+    assert_eq!(Calc::formulas_pending_eval(&wb), 0);
+    assert_eq!(calc.last_recalc_cells, 500, "only unpaid formulas are evaluated");
+    assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(0, 1)), Value::Number(42.0), "cached results stay");
+}
+
+#[test]
 fn recalc_on_load_recomputes_empty_text_formula_cache() {
     let mut wb = Workbook::new();
     wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(11002048.0)));
