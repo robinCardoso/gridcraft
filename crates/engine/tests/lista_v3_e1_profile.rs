@@ -1,8 +1,15 @@
-//! Profile: edit COTACAO!E1 on LISTA TESTE V3 (user report ~20391 formulas, ~2 min).
+//! Profile: edit COTACAO!E1 / B1 / B2 on LISTA TESTE V3 (user report ~20391 formulas, ~2 min).
 //! Run (release recommended):
 //!   $env:GRIDCRAFT_CALC_STATS='1'
 //!   cargo test -p gridcraft-engine lista_v3_e1_edit_profile --release -- --nocapture
+//!   cargo test -p gridcraft-engine lista_v3_b1_b2_cascade_size --release -- --nocapture
 #![allow(clippy::disallowed_methods)]
+
+/// Full-book graph size and dirty closure for global UF inputs (matches Excel bar ~520231 on B1).
+const LISTA_V3_GRAPH_NODES: usize = 620_450;
+const LISTA_V3_F9_RECALC_CELLS: usize = LISTA_V3_GRAPH_NODES;
+const LISTA_V3_B1_RECALC_CELLS: usize = 520_231;
+const LISTA_V3_B2_RECALC_CELLS: usize = 148_835;
 
 use std::time::Instant;
 
@@ -29,6 +36,15 @@ fn sheet_index(s: &Session, name: &str) -> usize {
         .iter()
         .position(|sh| sh.name.eq_ignore_ascii_case(name))
         .unwrap_or_else(|| panic!("sheet {name:?} not found"))
+}
+
+fn open_lista_v3_on_cotacao() -> Option<(Session, String)> {
+    let path = xlsx_path()?;
+    let mut s = Session::new();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    let cotacao = sheet_index(&s, "COTACAO");
+    s.execute("sheet.activate", json!({"index": cotacao})).unwrap();
+    Some((s, path))
 }
 
 #[test]
@@ -149,5 +165,42 @@ fn lista_v3_cotacao_calculate_sheet_profile() {
         "E1 after warm sheet: {:.2?} | last_recalc_cells={}",
         t.elapsed(),
         s.doc().unwrap().calc.last_recalc_cells
+    );
+}
+
+/// Regression: changing `COTACAO!B1` / `B2` after a full recalc must match the known dirty
+/// closure (same denominator as Excel “Calculando… / 520231” on filial change).
+#[test]
+fn lista_v3_b1_b2_cascade_size() {
+    let Some((mut s, path)) = open_lista_v3_on_cotacao() else {
+        eprintln!("skip lista_v3_b1_b2_cascade_size: LISTA TESTE V3.xlsx not found");
+        return;
+    };
+
+    assert_eq!(
+        s.doc().unwrap().calc.graph.len(),
+        LISTA_V3_GRAPH_NODES,
+        "graph size drifted for {path}"
+    );
+
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(
+        s.doc().unwrap().calc.last_recalc_cells,
+        LISTA_V3_F9_RECALC_CELLS,
+        "F9 should evaluate the full formula graph"
+    );
+
+    s.execute("cell.set", json!({"cell": "B1", "input": "PR"})).unwrap();
+    assert_eq!(
+        s.doc().unwrap().calc.last_recalc_cells,
+        LISTA_V3_B1_RECALC_CELLS,
+        "FILIAL_COMPRA (B1) should invalidate LISTA_PRECO + COTACAO block"
+    );
+
+    s.execute("cell.set", json!({"cell": "B2", "input": "RJ"})).unwrap();
+    assert_eq!(
+        s.doc().unwrap().calc.last_recalc_cells,
+        LISTA_V3_B2_RECALC_CELLS,
+        "UF_CLIENTE (B2) dirty set after B1=PR"
     );
 }

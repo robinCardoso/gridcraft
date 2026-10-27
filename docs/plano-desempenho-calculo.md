@@ -247,6 +247,36 @@ inteira continuavam no range antigo.
 **Testes:** `paste_expands_structured_calc_columns_like_cotacao` (engine),
 `expanding_table_refreshes_whole_column_structured_precedents` (calc).
 
+### 7.4 Índice de igualdade entre passes + ColEq em `=` (2026-10-26)
+
+**Problema:** após F9 quente, editar escalares globais (ex. filial/UF) reavalia ~520k
+fórmulas e rematerializa colunas de lookup estáticas (`col = codigo`, `MATCH(TRUE,…)`).
+
+**Fix (universal, `calc`):**
+- `Calc::persisted_eq` / `persisted_lookup_col`: reutiliza índices da passada anterior
+  quando **nenhuma célula do intervalo** entrou no `dirty` da passada atual; limpa em
+  `invalidate_graph`.
+- `Evaluator::binary`: `col = escalar` → `Ev::ColEq` fora de `LET` (Q4 / `achou`).
+
+**Testes:** `column_equality_in_expression_not_only_let_binding` (calc); regressão
+`lista_v3_b1_b2_cascade_size` (engine, corpus V3).
+
+**Pendente:** M2 com write-back parcial (só ordenação por aba ativa no `run_scoped`);
+E1/E3; orçamento adaptativo M3.
+
+### 7.5 Deduplicação do índice de igualdade por coluna (2026-10-26)
+
+**Problema:** após §7.4, `equality hit` subiu no B1, mas `build` ainda ficava na ordem de
+**~10⁵** por passada — chave `(sheet, RangeRef, norm)` diferia por âncora de linha
+(`A100:A5000` vs `A2:A5000` na mesma coluna), reconstruindo o mesmo índice lógico.
+
+**Fix (universal, `calc`):**
+- Índice de coluna único por `(sheet, col, ColNorm)` com linhas **absolutas**; consultas em
+  subintervalos filtram/reutilizam sem novo scan quando o span já está coberto.
+- Linha única / plano 2D: mesma ideia para `(sheet, row, norm)` e `plane_eq` (COUNTIFS).
+
+**Teste:** `column_equality_index_shared_across_row_subranges` (`calc`).
+
 ### Ainda pendente (decisão em dados — próxima sprint)
 
 1. **Reteste manual** no corpus denso: clear/edit na coluna Referencia — dirty/progresso

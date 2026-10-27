@@ -369,21 +369,21 @@ impl<'h> Evaluator<'h> {
         if h == 0 || w == 0 {
             return Value::Error(CellError::Value);
         }
-        if h == 1 || w == 1 {
-            if let Some(positions) = self.host.equality_positions(area.sheet, trimmed, needle, norm) {
-                let len = h * w;
-                let mut data = vec![Value::Bool(false); len];
-                for p in positions.iter() {
-                    if let Some(slot) = data.get_mut(*p as usize) {
-                        *slot = Value::Bool(true);
-                    }
+        if (h == 1 || w == 1)
+            && let Some(positions) = self.host.equality_positions(area.sheet, trimmed, needle, norm)
+        {
+            let len = h * w;
+            let mut data = vec![Value::Bool(false); len];
+            for p in positions.iter() {
+                if let Some(slot) = data.get_mut(*p as usize) {
+                    *slot = Value::Bool(true);
                 }
-                return if w == 1 {
-                    Value::from(Array::column(data))
-                } else {
-                    Value::from(Array::row(data))
-                };
             }
+            return if w == 1 {
+                Value::from(Array::column(data))
+            } else {
+                Value::from(Array::row(data))
+            };
         }
         let mut data = Vec::with_capacity(h * w);
         for r in 0..h {
@@ -418,6 +418,10 @@ impl<'h> Evaluator<'h> {
             Expr::Binary(BinOp::Eq, a, b) => (a.as_ref(), b.as_ref()),
             _ => return None,
         };
+        self.peel_column_equality_pair(left, right)
+    }
+
+    fn peel_column_equality_pair(&mut self, left: &Expr, right: &Expr) -> Option<(Area, Value, ColNorm)> {
         if let Some(area) = self.parse_reference_key_column(left) {
             let needle = self.value(right);
             if !matches!(needle, Value::Array(_)) {
@@ -533,7 +537,7 @@ impl<'h> Evaluator<'h> {
         }
     }
 
-    fn double_unary_inner<'a>(e: &'a Expr) -> Option<&'a Expr> {
+    fn double_unary_inner(e: &Expr) -> Option<&Expr> {
         match e {
             Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
                 Expr::Unary(UnOp::Neg, x) => Some(x.as_ref()),
@@ -1037,6 +1041,9 @@ impl<'h> Evaluator<'h> {
                 }
             }
             _ => {
+                if matches!(op, BinOp::Eq) && let Some((area, needle, norm)) = self.peel_column_equality_pair(a, b) {
+                    return Ev::ColEq { area, needle, norm };
+                }
                 // A long chain such as A1+A2+…+A500 nests to the left: fold it in a loop instead
                 // of one level of recursion per operator (past the depth limit it was #CALC!).
                 let mut rest = vec![(op, b)];

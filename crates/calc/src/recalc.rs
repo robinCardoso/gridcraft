@@ -519,6 +519,14 @@ pub struct Calc {
     pub last_recalc_cells: usize,
     /// Background cooperation (progress + cancel); `None` = run to completion, as always.
     pub hooks: Option<Arc<CalcHooks>>,
+    /// Single-column equality index reused across passes when the column span was not dirty.
+    persisted_col_eq: HashMap<(usize, u32, ColNorm), Arc<ColEqIndex>>,
+    /// Single-row equality index (same invalidation as [`Self::persisted_col_eq`]).
+    persisted_row_eq: HashMap<(usize, u32, ColNorm), Arc<RowEqIndex>>,
+    /// Non-line (2D) equality ranges for COUNTIFS-style criteria.
+    persisted_plane_eq: HashMap<(usize, RangeRef, ColNorm), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
+    /// First-row exact lookup columns, same invalidation as [`Self::persisted_eq`].
+    persisted_lookup_col: HashMap<(usize, u32, u32, u32, ColNorm), HashMap<LookupExactKey, u32>>,
 }
 
 impl Default for Calc {
@@ -531,6 +539,10 @@ impl Default for Calc {
             circular: vec![],
             last_recalc_cells: 0,
             hooks: None,
+            persisted_col_eq: HashMap::default(),
+            persisted_row_eq: HashMap::default(),
+            persisted_plane_eq: HashMap::default(),
+            persisted_lookup_col: HashMap::default(),
         }
     }
 }
@@ -601,10 +613,12 @@ struct PassHost<'a> {
     ranges: Vec<(usize, RangeRef, Value)>,
     /// Cells held by `ranges` (the memory budget for the cache).
     range_cells: u64,
-    /// Equality index per range for this pass: value key → row-major positions. COUNTIFS/SUMIFS
-    /// over the same big table build it once instead of scanning per criterion
-    /// (docs/plano-responsividade.md, Fase 3).
-    criteria: HashMap<(usize, RangeRef, ColNorm), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
+    /// Single-column equality: one index per `(sheet, col, norm)` with absolute row numbers.
+    column_eq: HashMap<(usize, u32, ColNorm), ColEqIndex>,
+    /// Single-row equality: one index per `(sheet, row, norm)` with absolute column numbers.
+    row_eq: HashMap<(usize, u32, ColNorm), RowEqIndex>,
+    /// 2D equality index per range (COUNTIFS over blocks that are not a single line).
+    plane_eq: HashMap<(usize, RangeRef, ColNorm), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
     /// A cached range would go stale if a spill fills cells during the pass (or the workbook
     /// already has spills): the cache is off for such workbooks, correctness first.
     spills_possible: bool,
@@ -617,6 +631,12 @@ struct PassHost<'a> {
     compute_steps: usize,
     /// Set when hooks request cancel mid-tree; `run_scoped` aborts the pass without write-back.
     aborted: bool,
+    /// Cells recalculated this pass — used to skip stale persisted equality / lookup indexes.
+    dirty: HashSet<Key>,
+    persisted_col_eq: HashMap<(usize, u32, ColNorm), Arc<ColEqIndex>>,
+    persisted_row_eq: HashMap<(usize, u32, ColNorm), Arc<RowEqIndex>>,
+    persisted_plane_eq: HashMap<(usize, RangeRef, ColNorm), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
+    persisted_lookup_col: HashMap<(usize, u32, u32, u32, ColNorm), HashMap<LookupExactKey, u32>>,
     /// Last cooperative report/cancel tick (native). Wasm keeps step-only sampling.
     #[cfg(not(target_arch = "wasm32"))]
     last_coop: Instant,
@@ -780,7 +800,7 @@ const RANGE_CACHE_CELLS: u64 = 1_500_000;
 /// Most distinct ranges kept per pass.
 const RANGE_CACHE_ENTRIES: usize = 128;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LookupExactKey {
     Text(String),
     Number(u64),
@@ -798,6 +818,50 @@ pub(crate) fn lookup_exact_key(v: &Value) -> Option<LookupExactKey> {
         Value::Empty => Some(LookupExactKey::Empty),
         _ => None,
     }
+}
+
+fn range_touched_by_dirty(sheet: usize, range: RangeRef, dirty: &HashSet<Key>) -> bool {
+    dirty.iter().any(|&(s, c)| s == sheet && range.contains(c))
+}
+
+fn col_span_touched_by_dirty(sheet: usize, col: u32, r0: u32, r1: u32, dirty: &HashSet<Key>) -> bool {
+    dirty.iter().any(|&(s, c)| s == sheet && c.col == col && c.row >= r0 && c.row <= r1)
+}
+
+fn row_span_touched_by_dirty(sheet: usize, row: u32, c0: u32, c1: u32, dirty: &HashSet<Key>) -> bool {
+    dirty.iter().any(|&(s, c)| s == sheet && c.row == row && c.col >= c0 && c.col <= c1)
+}
+
+/// Equality index for one column: match keys → absolute row numbers on the sheet.
+#[derive(Clone, Debug)]
+struct ColEqIndex {
+    r0: u32,
+    r1: u32,
+    map: HashMap<LookupExactKey, Arc<Vec<u32>>>,
+}
+
+/// Equality index for one row: match keys → absolute column numbers on the sheet.
+#[derive(Clone, Debug)]
+struct RowEqIndex {
+    c0: u32,
+    c1: u32,
+    map: HashMap<LookupExactKey, Arc<Vec<u32>>>,
+}
+
+fn relative_col_positions(abs_rows: &[u32], q_r0: u32, q_r1: u32) -> Vec<u32> {
+    abs_rows
+        .iter()
+        .filter(|&r| *r >= q_r0 && *r <= q_r1)
+        .map(|r| r - q_r0)
+        .collect()
+}
+
+fn relative_row_positions(abs_cols: &[u32], q_c0: u32, q_c1: u32) -> Vec<u32> {
+    abs_cols
+        .iter()
+        .filter(|&c| *c >= q_c0 && *c <= q_c1)
+        .map(|c| c - q_c0)
+        .collect()
 }
 
 fn hash_hay(hay: &[Value]) -> u64 {
@@ -827,6 +891,11 @@ impl<'a> PassHost<'a> {
         now: f64,
         hooks: Option<Arc<CalcHooks>>,
         progress_total: usize,
+        dirty: HashSet<Key>,
+        persisted_col_eq: HashMap<(usize, u32, ColNorm), Arc<ColEqIndex>>,
+        persisted_row_eq: HashMap<(usize, u32, ColNorm), Arc<RowEqIndex>>,
+        persisted_plane_eq: HashMap<(usize, RangeRef, ColNorm), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
+        persisted_lookup_col: HashMap<(usize, u32, u32, u32, ColNorm), HashMap<LookupExactKey, u32>>,
     ) -> Self {
         PassHost {
             wb,
@@ -853,12 +922,19 @@ impl<'a> PassHost<'a> {
             val_cache: HashMap::default(),
             ranges: Vec::new(),
             range_cells: 0,
-            criteria: HashMap::default(),
+            column_eq: HashMap::default(),
+            row_eq: HashMap::default(),
+            plane_eq: HashMap::default(),
             spills_possible: wb.sheets.iter().any(|s| !s.spill.is_empty() || !s.spill_ranges.is_empty()),
             hooks,
             progress_total: progress_total.max(1),
             compute_steps: 0,
             aborted: false,
+            dirty,
+            persisted_col_eq,
+            persisted_row_eq,
+            persisted_plane_eq,
+            persisted_lookup_col,
             #[cfg(not(target_arch = "wasm32"))]
             last_coop: Instant::now(),
             stats: calc_stats_enabled().then(|| Box::new(CalcStats::new())),
@@ -1135,6 +1211,267 @@ impl PassHost<'_> {
             }
         })
     }
+
+    fn note_eq_hit(&mut self) {
+        if let Some(stats) = self.stats.as_mut() {
+            stats.eq_hit += 1;
+        }
+    }
+
+    fn note_eq_build(&mut self) {
+        if let Some(stats) = self.stats.as_mut() {
+            stats.eq_build += 1;
+        }
+    }
+
+    fn scan_col_rows(&mut self, sheet: usize, col: u32, r0: u32, r1: u32, norm: ColNorm, into: &mut ColEqIndex) -> bool {
+        let mut n = 0u32;
+        for r in r0..=r1 {
+            n = n.wrapping_add(1);
+            if n.is_multiple_of(4096) {
+                self.coop();
+                if self.aborted {
+                    return false;
+                }
+            }
+            let v = apply_col_norm(&self.cell_value(sheet, CellRef::new(r, col)), norm);
+            let Some(k) = lookup_exact_key(&v) else { continue };
+            match into.map.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => Arc::make_mut(e.get_mut()).push(r),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(Arc::new(vec![r]));
+                }
+            }
+        }
+        true
+    }
+
+    fn ensure_col_eq_index(&mut self, sheet: usize, col: u32, q_r0: u32, q_r1: u32, norm: ColNorm) -> bool {
+        let key = (sheet, col, norm);
+        if !self.column_eq.contains_key(&key) {
+            self.note_eq_build();
+            let mut idx = ColEqIndex { r0: q_r0, r1: q_r1, map: HashMap::default() };
+            if !self.scan_col_rows(sheet, col, q_r0, q_r1, norm, &mut idx) {
+                return false;
+            }
+            self.column_eq.insert(key, idx);
+            return true;
+        }
+        let mut built = false;
+        let extend_lo = self.column_eq.get(&key).is_some_and(|idx| q_r0 < idx.r0);
+        if extend_lo {
+            self.note_eq_build();
+            built = true;
+            let Some(mut idx) = self.column_eq.remove(&key) else {
+                return true;
+            };
+            let hi = idx.r0.saturating_sub(1);
+            if !self.scan_col_rows(sheet, col, q_r0, hi, norm, &mut idx) {
+                return false;
+            }
+            idx.r0 = q_r0;
+            self.column_eq.insert(key, idx);
+        }
+        let extend_hi = self.column_eq.get(&key).is_some_and(|idx| q_r1 > idx.r1);
+        if extend_hi {
+            self.note_eq_build();
+            built = true;
+            let Some(mut idx) = self.column_eq.remove(&key) else {
+                return true;
+            };
+            let lo = idx.r1.saturating_add(1);
+            if !self.scan_col_rows(sheet, col, lo, q_r1, norm, &mut idx) {
+                return false;
+            }
+            idx.r1 = q_r1;
+            self.column_eq.insert(key, idx);
+        }
+        if !built {
+            self.note_eq_hit();
+        }
+        true
+    }
+
+    fn col_equality_positions(
+        &mut self,
+        sheet: usize,
+        col: u32,
+        q_r0: u32,
+        q_r1: u32,
+        norm: ColNorm,
+        needle: &Value,
+    ) -> Option<Arc<Vec<u32>>> {
+        let key = (sheet, col, norm);
+        let touched = col_span_touched_by_dirty(sheet, col, q_r0, q_r1, &self.dirty);
+        if !self.column_eq.contains_key(&key)
+            && !touched
+            && let Some(p) = self.persisted_col_eq.get(&key)
+        {
+            self.column_eq.insert(key, p.as_ref().clone());
+            self.note_eq_hit();
+        }
+        if !self.ensure_col_eq_index(sheet, col, q_r0, q_r1, norm) {
+            return None;
+        }
+        let needle_key = lookup_exact_key(needle)?;
+        let idx = self.column_eq.get(&key)?;
+        let abs: &[u32] = idx
+            .map
+            .get(&needle_key)
+            .map(|v| v.as_ref() as &[u32])
+            .unwrap_or(&[]);
+        let rel = relative_col_positions(abs, q_r0, q_r1);
+        Some(Arc::new(rel))
+    }
+
+    fn scan_row_cols(&mut self, sheet: usize, row: u32, c0: u32, c1: u32, norm: ColNorm, into: &mut RowEqIndex) -> bool {
+        let mut n = 0u32;
+        for c in c0..=c1 {
+            n = n.wrapping_add(1);
+            if n.is_multiple_of(4096) {
+                self.coop();
+                if self.aborted {
+                    return false;
+                }
+            }
+            let v = apply_col_norm(&self.cell_value(sheet, CellRef::new(row, c)), norm);
+            let Some(k) = lookup_exact_key(&v) else { continue };
+            match into.map.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => Arc::make_mut(e.get_mut()).push(c),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(Arc::new(vec![c]));
+                }
+            }
+        }
+        true
+    }
+
+    fn ensure_row_eq_index(&mut self, sheet: usize, row: u32, q_c0: u32, q_c1: u32, norm: ColNorm) -> bool {
+        let key = (sheet, row, norm);
+        if !self.row_eq.contains_key(&key) {
+            self.note_eq_build();
+            let mut idx = RowEqIndex { c0: q_c0, c1: q_c1, map: HashMap::default() };
+            if !self.scan_row_cols(sheet, row, q_c0, q_c1, norm, &mut idx) {
+                return false;
+            }
+            self.row_eq.insert(key, idx);
+            return true;
+        }
+        let mut built = false;
+        let extend_lo = self.row_eq.get(&key).is_some_and(|idx| q_c0 < idx.c0);
+        if extend_lo {
+            self.note_eq_build();
+            built = true;
+            let Some(mut idx) = self.row_eq.remove(&key) else {
+                return true;
+            };
+            let hi = idx.c0.saturating_sub(1);
+            if !self.scan_row_cols(sheet, row, q_c0, hi, norm, &mut idx) {
+                return false;
+            }
+            idx.c0 = q_c0;
+            self.row_eq.insert(key, idx);
+        }
+        let extend_hi = self.row_eq.get(&key).is_some_and(|idx| q_c1 > idx.c1);
+        if extend_hi {
+            self.note_eq_build();
+            built = true;
+            let Some(mut idx) = self.row_eq.remove(&key) else {
+                return true;
+            };
+            let lo = idx.c1.saturating_add(1);
+            if !self.scan_row_cols(sheet, row, lo, q_c1, norm, &mut idx) {
+                return false;
+            }
+            idx.c1 = q_c1;
+            self.row_eq.insert(key, idx);
+        }
+        if !built {
+            self.note_eq_hit();
+        }
+        true
+    }
+
+    fn row_equality_positions(
+        &mut self,
+        sheet: usize,
+        row: u32,
+        q_c0: u32,
+        q_c1: u32,
+        norm: ColNorm,
+        needle: &Value,
+    ) -> Option<Arc<Vec<u32>>> {
+        let key = (sheet, row, norm);
+        let touched = row_span_touched_by_dirty(sheet, row, q_c0, q_c1, &self.dirty);
+        if !self.row_eq.contains_key(&key)
+            && !touched
+            && let Some(p) = self.persisted_row_eq.get(&key)
+        {
+            self.row_eq.insert(key, p.as_ref().clone());
+            self.note_eq_hit();
+        }
+        if !self.ensure_row_eq_index(sheet, row, q_c0, q_c1, norm) {
+            return None;
+        }
+        let needle_key = lookup_exact_key(needle)?;
+        let idx = self.row_eq.get(&key)?;
+        let abs: &[u32] = idx
+            .map
+            .get(&needle_key)
+            .map(|v| v.as_ref() as &[u32])
+            .unwrap_or(&[]);
+        let rel = relative_row_positions(abs, q_c0, q_c1);
+        Some(Arc::new(rel))
+    }
+
+    fn plane_equality_positions(
+        &mut self,
+        sheet: usize,
+        range: RangeRef,
+        norm: ColNorm,
+        needle: &Value,
+    ) -> Option<Arc<Vec<u32>>> {
+        let key = (sheet, range, norm);
+        if !self.plane_eq.contains_key(&key)
+            && !range_touched_by_dirty(sheet, range, &self.dirty)
+            && let Some(map) = self.persisted_plane_eq.get(&key)
+        {
+            self.plane_eq.insert(key, Arc::clone(map));
+            self.note_eq_hit();
+        }
+        if !self.plane_eq.contains_key(&key) {
+            self.note_eq_build();
+            let (h, w) = (range.height(), range.width());
+            let mut map: HashMap<LookupExactKey, Arc<Vec<u32>>> = HashMap::default();
+            let mut n = 0u32;
+            for r in 0..h {
+                for c in 0..w {
+                    n = n.wrapping_add(1);
+                    if n.is_multiple_of(4096) {
+                        self.coop();
+                        if self.aborted {
+                            return None;
+                        }
+                    }
+                    let v = self.cell_value(sheet, CellRef::new(range.start.row + r, range.start.col + c));
+                    let v = apply_col_norm(&v, norm);
+                    let Some(k) = lookup_exact_key(&v) else { continue };
+                    let pos = r * w + c;
+                    match map.entry(k) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => Arc::make_mut(e.get_mut()).push(pos),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(Arc::new(vec![pos]));
+                        }
+                    }
+                }
+            }
+            self.plane_eq.insert(key, Arc::new(map));
+        } else {
+            self.note_eq_hit();
+        }
+        let needle_key = lookup_exact_key(needle)?;
+        Some(self.plane_eq.get(&key)?.get(&needle_key).cloned().unwrap_or_else(|| Arc::new(Vec::new())))
+    }
 }
 
 /// A legacy (Ctrl+Shift+Enter) array formula's result fitted to the range it was entered in, as
@@ -1231,7 +1568,6 @@ impl Host for PassHost<'_> {
         Some(value)
     }
     fn equality_positions(&mut self, sheet: usize, range: RangeRef, needle: &Value, norm: ColNorm) -> Option<Arc<Vec<u32>>> {
-        // The same guard as the range cache: a spill can fill cells during the pass.
         if self.spills_possible || !self.spills.is_empty() {
             return None;
         }
@@ -1239,41 +1575,13 @@ impl Host for PassHost<'_> {
         if cells == 0 || cells > RANGE_CACHE_CELLS {
             return None;
         }
-        let key = (sheet, range, norm);
-        if !self.criteria.contains_key(&key) {
-            if let Some(stats) = self.stats.as_mut() {
-                stats.eq_build += 1;
-            }
-            let (h, w) = (range.height(), range.width());
-            let mut map: HashMap<LookupExactKey, Arc<Vec<u32>>> = HashMap::default();
-            let mut n = 0u32;
-            for r in 0..h {
-                for c in 0..w {
-                    n = n.wrapping_add(1);
-                    if n.is_multiple_of(4096) {
-                        self.coop();
-                        if self.aborted {
-                            return None;
-                        }
-                    }
-                    let v = self.cell_value(sheet, CellRef::new(range.start.row + r, range.start.col + c));
-                    let v = apply_col_norm(&v, norm);
-                    let Some(k) = lookup_exact_key(&v) else { continue };
-                    let pos = r * w + c;
-                    match map.entry(k) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => Arc::make_mut(e.get_mut()).push(pos),
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert(Arc::new(vec![pos]));
-                        }
-                    }
-                }
-            }
-            self.criteria.insert(key, Arc::new(map));
-        } else if let Some(stats) = self.stats.as_mut() {
-            stats.eq_hit += 1;
+        if range.width() == 1 {
+            return self.col_equality_positions(sheet, range.start.col, range.start.row, range.end.row, norm, needle);
         }
-        let needle_key = lookup_exact_key(needle)?;
-        Some(self.criteria.get(&key)?.get(&needle_key).cloned().unwrap_or_else(|| Arc::new(Vec::new())))
+        if range.height() == 1 {
+            return self.row_equality_positions(sheet, range.start.row, range.start.col, range.end.col, norm, needle);
+        }
+        self.plane_equality_positions(sheet, range, norm, needle)
     }
     fn range_values(&mut self, sheet: usize, range: RangeRef) -> Vec<Value> {
         let (h, w) = (range.height() as usize, range.width() as usize);
@@ -1412,6 +1720,12 @@ impl Host for PassHost<'_> {
         };
 
         let key = (sheet, search_col, r0, r1, norm);
+        if !self.lookup_col_cache.contains_key(&key)
+            && !col_span_touched_by_dirty(sheet, search_col, r0, r1, &self.dirty)
+            && let Some(map) = self.persisted_lookup_col.get(&key)
+        {
+            self.lookup_col_cache.insert(key, map.clone());
+        }
         if !self.lookup_col_cache.contains_key(&key) {
             let mut map = HashMap::default();
             for (i, r) in (r0..=r1).enumerate() {
@@ -1518,6 +1832,27 @@ impl Calc {
     /// recalculation: row/col insert/delete, sheet rename, etc.).
     pub fn invalidate_graph(&mut self) {
         self.graph_valid = false;
+        self.persisted_col_eq.clear();
+        self.persisted_row_eq.clear();
+        self.persisted_plane_eq.clear();
+        self.persisted_lookup_col.clear();
+    }
+
+    fn absorb_pass_caches(
+        &mut self,
+        col_eq: HashMap<(usize, u32, ColNorm), ColEqIndex>,
+        row_eq: HashMap<(usize, u32, ColNorm), RowEqIndex>,
+        plane_eq: HashMap<(usize, RangeRef, ColNorm), Arc<HashMap<LookupExactKey, Arc<Vec<u32>>>>>,
+        lookup_col: HashMap<(usize, u32, u32, u32, ColNorm), HashMap<LookupExactKey, u32>>,
+    ) {
+        for (k, v) in col_eq {
+            self.persisted_col_eq.insert(k, Arc::new(v));
+        }
+        for (k, v) in row_eq {
+            self.persisted_row_eq.insert(k, Arc::new(v));
+        }
+        self.persisted_plane_eq.extend(plane_eq);
+        self.persisted_lookup_col.extend(lookup_col);
     }
 
     /// Rebuilds the graph from scratch and marks it current.
@@ -1973,7 +2308,8 @@ impl Calc {
                 }
             }
             // Row-major order is a good topological guess; on-demand evaluation fixes the rest.
-            // Active/scoped sheet cells are evaluated first so visible cells update earlier.
+            // M2 (docs/plano-desempenho-calculo.md): active/scoped sheet formulas are sorted first
+            // within the pass (earlier `compute` + write-back at end of the round — no parity split).
             let target_sheet = scope_sheet.or(Some(wb.active_sheet));
             dirty.sort_by_key(|(s, c)| (target_sheet.is_some_and(|ts| *s != ts), *s, c.row, c.col));
             if let Some(hooks) = self.hooks.as_ref()
@@ -1996,8 +2332,25 @@ impl Calc {
             let now = self.now();
             let mut rng = self.rng;
             let tp = prof_now();
-            let (results, spills, cycles) = {
-                let mut host = PassHost::new(wb, &exprs, &mut rng, now, self.hooks.clone(), total);
+            let dirty_set: HashSet<Key> = dirty.iter().copied().collect();
+            let persisted_col_eq = self.persisted_col_eq.clone();
+            let persisted_row_eq = self.persisted_row_eq.clone();
+            let persisted_plane_eq = self.persisted_plane_eq.clone();
+            let persisted_lookup_col = self.persisted_lookup_col.clone();
+            let (results, spills, cycles, pass_col_eq, pass_row_eq, pass_plane_eq, pass_lookup_col) = {
+                let mut host = PassHost::new(
+                    wb,
+                    &exprs,
+                    &mut rng,
+                    now,
+                    self.hooks.clone(),
+                    total,
+                    dirty_set,
+                    persisted_col_eq,
+                    persisted_row_eq,
+                    persisted_plane_eq,
+                    persisted_lookup_col,
+                );
                 host.iterate = wb.calc.iterative;
                 for (i, k) in dirty.iter().enumerate() {
                     host.compute(*k);
@@ -2029,8 +2382,17 @@ impl Calc {
                     }
                 }
                 host.finish_stats();
-                (host.results, host.spills, host.cycles)
+                (
+                    host.results,
+                    host.spills,
+                    host.cycles,
+                    host.column_eq,
+                    host.row_eq,
+                    host.plane_eq,
+                    host.lookup_col_cache,
+                )
             };
+            self.absorb_pass_caches(pass_col_eq, pass_row_eq, pass_plane_eq, pass_lookup_col);
             self.rng = rng;
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
                 eprintln!("  eval {} formulas {:.1} ms", results.len(), prof_now() - tp);
@@ -2155,7 +2517,19 @@ pub fn evaluate(wb: &Workbook, sheet: usize, at: CellRef, formula: &str) -> Valu
 pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> Value {
     let exprs = HashMap::default();
     let mut rng = 0x1234_5678_9ABC_DEF0u64;
-    let mut host = PassHost::new(wb, &exprs, &mut rng, now_serial(), None, 1);
+    let mut host = PassHost::new(
+        wb,
+        &exprs,
+        &mut rng,
+        now_serial(),
+        None,
+        1,
+        HashSet::default(),
+        HashMap::default(),
+        HashMap::default(),
+        HashMap::default(),
+        HashMap::default(),
+    );
     let mut ev = Evaluator::new(&mut host, sheet, at);
     ev.value(expr)
 }
@@ -2179,7 +2553,7 @@ pub(crate) mod tests {
     use gridcraft_core::{CellRef, RangeRef, Value};
     use gridcraft_model::{Cell, Formula, Workbook};
 
-    use super::{Calc, HashMap, Host, Intervals, Key, PassHost};
+    use super::{Calc, HashMap, HashSet, Host, Intervals, Key, PassHost};
 
     /// xorshift64 for repeatable pseudo-random cases.
     fn rng(state: &mut u64) -> u64 {
@@ -2395,7 +2769,19 @@ pub(crate) mod tests {
         // of a real pass partway through; `visit_range` has to cope with the formulas it reads
         // being calculated under it.
         let mut rng = 1u64;
-        let mut host = PassHost::new(wb, &exprs, &mut rng, 0.0, None, 1);
+        let mut host = PassHost::new(
+            wb,
+            &exprs,
+            &mut rng,
+            0.0,
+            None,
+            1,
+            HashSet::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+        );
 
         let mut seen = Vec::new();
         host.visit_range(0, range, &mut |v| {

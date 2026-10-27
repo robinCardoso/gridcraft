@@ -631,9 +631,33 @@ fn let_lambda() {
     assert_eq!(t.num("A4"), 14.0);
 }
 
-/// Two rows with the same lookup key must resolve to the same MATCH index (and thus the same
-/// INDEX description). Guards against LET/`val_cache` or ThisRow bugs that only show up when
-/// keys collide rather than when every row differs.
+/// Different row anchors on the same column (`A2:A5` vs `A1:A5`) share one column equality index.
+#[test]
+fn column_equality_index_shared_across_row_subranges() {
+    let mut t = T::new();
+    for r in 1..=5 {
+        t.set(&format!("A{r}"), &format!("K{r:03}"));
+    }
+    t.set("C1", "K001");
+    t.set("C2", "K002");
+    t.set("D1", "=MATCH(TRUE,A$1:A$5=C1,0)");
+    t.set("D2", "=MATCH(TRUE,A$2:A$5=C2,0)");
+    assert_eq!(t.num("D1"), 1.0);
+    assert_eq!(t.num("D2"), 1.0, "second subrange reuses the column index with correct relative positions");
+}
+
+/// `MATCH(TRUE, col = codigo, 0)` outside an inner LET binding still uses the ColEq fast path.
+#[test]
+fn column_equality_in_expression_not_only_let_binding() {
+    let mut t = T::new();
+    t.set("A1", "MB001");
+    t.set("A2", "MB006");
+    t.set("A3", "MB003");
+    t.set("C1", "MB006");
+    t.set("D1", "=IF(SUM(--(A$1:A$3=C1))=0,0,MATCH(TRUE,A$1:A$3=C1,0))");
+    assert_eq!(t.num("D1"), 2.0);
+}
+
 #[test]
 fn same_lookup_key_two_rows_same_match_index() {
     let mut t = T::new();
