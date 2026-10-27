@@ -1224,6 +1224,19 @@ impl PassHost<'_> {
         }
     }
 
+    fn single_cell_equality_positions(
+        &mut self,
+        sheet: usize,
+        at: CellRef,
+        norm: ColNorm,
+        needle: &Value,
+    ) -> Option<Arc<Vec<u32>>> {
+        self.note_eq_hit();
+        let key = apply_col_norm(&self.cell_value(sheet, at), norm);
+        let hit = gridcraft_functions::lookup_equal(needle, &key, false);
+        Some(Arc::new(if hit { vec![0] } else { vec![] }))
+    }
+
     fn scan_col_rows(&mut self, sheet: usize, col: u32, r0: u32, r1: u32, norm: ColNorm, into: &mut ColEqIndex) -> bool {
         let mut n = 0u32;
         for r in r0..=r1 {
@@ -1260,7 +1273,6 @@ impl PassHost<'_> {
         let mut built = false;
         let extend_lo = self.column_eq.get(&key).is_some_and(|idx| q_r0 < idx.r0);
         if extend_lo {
-            self.note_eq_build();
             built = true;
             let Some(mut idx) = self.column_eq.remove(&key) else {
                 return true;
@@ -1274,7 +1286,6 @@ impl PassHost<'_> {
         }
         let extend_hi = self.column_eq.get(&key).is_some_and(|idx| q_r1 > idx.r1);
         if extend_hi {
-            self.note_eq_build();
             built = true;
             let Some(mut idx) = self.column_eq.remove(&key) else {
                 return true;
@@ -1360,7 +1371,6 @@ impl PassHost<'_> {
         let mut built = false;
         let extend_lo = self.row_eq.get(&key).is_some_and(|idx| q_c0 < idx.c0);
         if extend_lo {
-            self.note_eq_build();
             built = true;
             let Some(mut idx) = self.row_eq.remove(&key) else {
                 return true;
@@ -1374,7 +1384,6 @@ impl PassHost<'_> {
         }
         let extend_hi = self.row_eq.get(&key).is_some_and(|idx| q_c1 > idx.c1);
         if extend_hi {
-            self.note_eq_build();
             built = true;
             let Some(mut idx) = self.row_eq.remove(&key) else {
                 return true;
@@ -1574,6 +1583,9 @@ impl Host for PassHost<'_> {
         let cells = u64::from(range.height()) * u64::from(range.width());
         if cells == 0 || cells > RANGE_CACHE_CELLS {
             return None;
+        }
+        if range.width() == 1 && range.height() == 1 {
+            return self.single_cell_equality_positions(sheet, range.start, norm, needle);
         }
         if range.width() == 1 {
             return self.col_equality_positions(sheet, range.start.col, range.start.row, range.end.row, norm, needle);

@@ -1,4 +1,7 @@
 //! Profile: edit COTACAO!E1 / B1 / B2 on LISTA TESTE V3 (user report ~20391 formulas, ~2 min).
+//! Planilha: `COTACAO!L1` e coluna `ORCAMENTO[Linha]` otimizadas (ColEq `refEq` + fast path `n=1`);
+//! dirty counts in `LISTA_V3_*` unchanged. Backups: `LISTA TESTE V3.backup.xlsx` (pré-L1),
+//! `LISTA TESTE V3.pre-linha.xlsx` (pré-Linha). Paridade Linha: `lista_v3_linha_parity.rs`.
 //! Run (release recommended):
 //!   $env:GRIDCRAFT_CALC_STATS='1'
 //!   cargo test -p gridcraft-engine lista_v3_e1_edit_profile --release -- --nocapture

@@ -273,7 +273,10 @@ E1/E3; orçamento adaptativo M3.
 **Fix (universal, `calc`):**
 - Índice de coluna único por `(sheet, col, ColNorm)` com linhas **absolutas**; consultas em
   subintervalos filtram/reutilizam sem novo scan quando o span já está coberto.
+- Igualdade em **uma célula** (`1×1`): comparação direta, sem estender o índice de coluna
+  (evita O(n²) quando milhares de fórmulas ThisRow fazem `[@col]=escalar`).
 - Linha única / plano 2D: mesma ideia para `(sheet, row, norm)` e `plane_eq` (COUNTIFS).
+- `build` em stats conta só criação de índice novo, não extensão de span.
 
 **Teste:** `column_equality_index_shared_across_row_subranges` (`calc`).
 
@@ -328,6 +331,40 @@ sempre `rebuild` quando `!graph_valid` (também com grafo vazio pós-cancel).
 - `cargo test -p gridcraft-ui-egui --test pedido_paste_recalc`
 - Manual: abrir xlsm → Pedido → colar códigos em A6+ → esperar job → **C6** e **C14**
   com descrição **sem** precisar editar A3/B.
+
+### 7.4 COTACAO `L1` otimizado na planilha (2026-10-27)
+
+**Problema:** `L1` materializava `LISTA_PRECO[Referencia]` normalizado em `_xlpm.chave` e só
+depois comparava com `_xlpm.codigo`, impedindo o fast path **ColEq** do motor (`equality_positions`).
+
+**Planilha (`LISTA TESTE V3.xlsx`, backup `LISTA TESTE V3.backup.xlsx`):**
+
+- `_xlpm.refEq` = igualdade direta `UPPER(SUBSTITUTE³(TRIM(LISTA_PRECO[Referencia]))) = codigo`.
+- `n = SUM(--refEq)` para NL.
+- Se `n = 1`: `MATCH(TRUE, refEq, 0)` + checagem `atende` + `TEXT(ri)` (sem `FILTER`/`SORTBY`/`TEXTJOIN` na coluna inteira).
+- Se `n > 1`: ramo anterior (`TEXTJOIN` de índices ordenados por preço), com `refEq` no lugar de `achou`.
+
+**Paridade GridCraft:** `E1=87428610`, `B1=B2=SC` → `L1`, `L16`, `E16` idênticos ao backup.
+**Perf (release, `GRIDCRAFT_CALC_STATS=1`):** `L1` deixa de dominar o p99 no cascade `B1`/`B2`; max `L1` ~45–95 ms vs dezenas de segundos antes no mesmo corpus.
+
+### 7.5 ORCAMENTO `[Linha]` otimizado na planilha (2026-10-27)
+
+**Problema:** após §7.4, o p99 do cascade `B1`/`B2` migrou para `L16`/`E16` — a coluna calculada
+`ORCAMENTO[Linha]` ainda usava `LET` + `achou` (igualdade em coluna inteira) e **sempre** ramo
+`XMATCH`/`FILTER` mesmo com uma única referência na lista.
+
+**Planilha (`LISTA TESTE V3.xlsx`, backup `LISTA TESTE V3.pre-linha.xlsx` / `LISTA TESTE V3.backup.xlsx`):**
+
+- `_xlpm.refEq` = igualdade direta `UPPER(SUBSTITUTE³(TRIM(LISTA_PRECO[Referencia]))) = codigo` (ColEq).
+- `n = SUM(--refEq)`; `n = 0` → `0` (sem match).
+- `n = 1`: `MATCH(TRUE, col=codigo, 0)` + filial `naoServem` + preço &gt; 0 → índice ou `-1` (sem `XMATCH`/`FILTER` de preço mínimo).
+- `n &gt; 1`: ramo anterior (`ok = refEq * atende * (pn&gt;0)` + `XMATCH` no menor preço).
+
+**Paridade GridCraft:** `E1=87428610`, `B1=B2=SC` → `D16=MB006` → `L16=7`, `E16`/`J16` iguais ao `pre-linha`; `D16=50017390` → `L16=6110`.
+
+**Script:** `gridcraft/scripts/patch_lista_v3_linha.py` (30 ocorrências: coluna da tabela + células `L16:L44`).
+
+**Teste:** `lista_v3_linha_ref_eq_parity_mb006` em `lista_v3_linha_parity.rs`.
 
 ### Fora de escopo (mantido)
 
