@@ -21,3 +21,6 @@ row*.txt
 .idea/
 .vscode/
 Thumbs.db
+__pycache__/
+*.py[cod]
+

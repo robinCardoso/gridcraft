@@ -366,6 +366,40 @@ depois comparava com `_xlpm.codigo`, impedindo o fast path **ColEq** do motor (`
 
 **Teste:** `lista_v3_linha_ref_eq_parity_mb006` em `lista_v3_linha_parity.rs`.
 
+### 7.6 ORCAMENTO `[Preco_Unit]` / coluna L (`[Linha]`) — validação de preço (2026-10-27)
+
+**Escopo:** o índice de lista para preço é a coluna calculada **`ORCAMENTO[Linha]`** (planilha **L**);
+**`ORCAMENTO[Preco_Unit]`** (planilha **J**) só faz `INDEX(LISTA_PRECO[Preco_Venda|Preco_Revenda], Linha)`
+com ramo `UPPER(TRIM($B$1))` vs cliente (`$B$2` ou `$B$1`). Não há `chave`/`achou` em J/K — o padrão
+`refEq` + `n=1` aplica-se a **Linha** (§7.5). **`Total` (K)** = `Preco_Unit * N(Qtd)` quando `ISNUMBER(Preco_Unit)`.
+
+**Backup:** `LISTA TESTE V3.pre-preco.xlsx` (estado pós-Linha/L1, antes de futuras edições de preço).
+
+**Paridade GridCraft** (`E1=87428610`, `B1=B2=SC`):
+
+| Cenário | L16 | J16 (`Preco_Unit`) | K16 (`Total`) | E16 |
+|---|---:|---:|---:|---|
+| `D16=MB006` | 7 | 3503,982558… | 0 (Qtd vazia) | CABEÇOTE - OM 352 A - 30° (1318) |
+| `D16=87428610` | 5101 | 153,532392… | 0 | BRONZINA DE BIELA (025) MB OM-352 OM-352 |
+
+**Script:** `gridcraft/scripts/patch_lista_v3_preco.py` (reaplica `patch_lista_v3_linha.py` se ainda existir `achou`).
+
+**Teste:** `lista_v3_preco_parity_mb006_and_e1_ref` em `lista_v3_preco_parity.rs`.
+
+### 7.7 COTACAO `M1` + `L1` split (cache E1 / edit B1) (2026-10-27)
+
+**Problema:** com `L1` monolítico, mudar **B1/B2** ainda reexecutava `refEq` em `LISTA_PRECO[Referencia]`
+(mesmo com ColEq no motor) — gargalo no cascade B1.
+
+**Planilha:** **`M1`** depende só de **`$E$1`**: `refEq`, `n`, e cache **numérico** da linha (`n=1`) ou `M{n}` / `NL`.
+**`L1`** usa `$M$1`: `ISNUMBER($M$1)` → só filial/`naoServem` na linha; texto `M…` → `TEXTJOIN` multi.
+
+**Backup:** `LISTA TESTE V3.pre-l1-split.xlsx`. **Script:** `gridcraft/scripts/patch_lista_v3_l1_e1_cache.py`.
+
+**Teste:** `lista_v3_l1_m1_stable_on_b1_change` — `M1` estável após `B1`; `L1` igual ao backup pré-split.
+
+**Replicação:** qualquer cotação pode usar célula auxiliar **só-E1** + fórmula de filial separada; não é automático em outros `.xlsx`.
+
 ### Fora de escopo (mantido)
 
 - Paralelismo completo de produção (E1 full).
