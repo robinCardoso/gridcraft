@@ -112,6 +112,19 @@ fn save_actions_include_the_cell_draft_and_close_keeps_the_unsaved_prompt() {
 }
 
 #[test]
+fn dont_save_discard_closes_immediately_even_if_idle() {
+    let mut h = harness(Services::default());
+    h.input_mut().events.push(egui::Event::Text("9".into()));
+    h.run_steps(2);
+    let closed = h
+        .state_mut()
+        .run("file.close", json!({"force": true, "discard": true}))
+        .expect("discard close");
+    assert_eq!(closed["closed"], json!(true));
+    assert!(h.state().session.active().is_none());
+}
+
+#[test]
 fn viewport_quit_dont_save_does_not_spawn_book1() {
     let mut h = harness(Services::default());
     h.input_mut().events.push(egui::Event::Text("1".into()));

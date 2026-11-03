@@ -122,7 +122,7 @@ cargo test -p gridcraft-engine lista_v3_open_formula_coverage -- --nocapture
 **Comportamento de `saveChanges` (UI):**
 
 - **Salvar** → `file.save` (+ save em background se grande) → `file.close` force quando limpo ou save enfileirado (`pending_close_uid`).
-- **Não salvar** → `file.close` com `force: true`.
+- **Não salvar** → `file.close` com `force: true` + **`discard: true`**: cancela jobs de calc/análise/save, remove o doc e **libera `DocState` pesado off-thread** (native). Sem `discard`, um save em voo ainda conclui (Salvar → Fechar).
 - **Cancelar** → fecha o diálogo; se era quit da janela, **`pending_viewport_close = false`** (não fechar o app).
 
 **Sintoma de regressão:** alterar A1, clicar no **X** e o app encerrar sem pergunta; ou **Arquivo → Fechar** sem diálogo com livro sujo.

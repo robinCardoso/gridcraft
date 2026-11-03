@@ -230,7 +230,10 @@ fn close(s: &mut Session, p: &Json) -> Result<Json> {
         return Ok(json!({"closed": false, "dirty": true}));
     }
     let i = s.active_index();
-    s.close_document(i);
+    // Ownership of the closed document is dropped here for CLI / tests / callers that do not
+    // intercept `file.close` with `force`. The desktop UI takes the document out itself and
+    // frees heavy books off the interface thread (see `SheetApp::force_close_active_document`).
+    drop(s.close_document(i));
     Ok(json!({"closed": true}))
 }
 

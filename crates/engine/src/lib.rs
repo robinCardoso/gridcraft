@@ -461,13 +461,17 @@ impl Session {
         self.active = self.docs.len() - 1;
         self.active
     }
-    pub fn close_document(&mut self, i: usize) {
-        if i < self.docs.len() {
-            self.docs.remove(i);
-            if self.active >= self.docs.len() {
-                self.active = self.docs.len().saturating_sub(1);
-            }
+    /// Removes document `i` from the session and returns it so the caller can drop it (a large
+    /// workbook's `Drop` can hitch the UI for seconds — the desktop UI frees it off-thread).
+    pub fn close_document(&mut self, i: usize) -> Option<DocState> {
+        if i >= self.docs.len() {
+            return None;
         }
+        let removed = self.docs.remove(i);
+        if self.active >= self.docs.len() {
+            self.active = self.docs.len().saturating_sub(1);
+        }
+        Some(removed)
     }
     /// A new blank workbook titled `BookN`.
     pub fn new_workbook(&mut self) -> usize {

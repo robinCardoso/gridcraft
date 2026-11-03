@@ -1206,7 +1206,8 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                     ui.label(lang.tr("Do you want to save the changes you made to {title}?").replace("{title}", title));
                     ui.horizontal(|ui| {
                         if ui.button(lang.tr("Don't Save")).clicked() {
-                            app.run_or_alert("file.close", json!({"force": true}));
+                            // `discard`: cancel calc/save jobs and free the book off-thread (large xlsx).
+                            app.run_or_alert("file.close", json!({"force": true, "discard": true}));
                             open = false;
                         }
                         if ui.button(lang.tr("Cancel")).clicked() {
