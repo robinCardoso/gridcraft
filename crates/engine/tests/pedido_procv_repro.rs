@@ -1,4 +1,4 @@
-﻿//! Regression: aba Pedido em "10 LISTA SC para Outros.xlsm" (Tabela3 + PROCV).
+//! Regression: aba Pedido em "10 LISTA SC para Outros.xlsm" (Tabela3 + PROCV).
 //! Sintoma: códigos colados em A (linhas do corpo) não atualizam C–L; expand abaixo sim.
 #![allow(clippy::disallowed_methods)]
 
@@ -8,8 +8,8 @@ use serde_json::json;
 
 fn xlsm_path() -> Option<std::path::PathBuf> {
     const CANDIDATES: &[&str] = &[
-        r"c:\Users\Robson\Downloads\10 LISTA SC para Outros.xlsm",
         r"c:\Users\Robson\source\grid-excel\10 LISTA SC para Outros.xlsm",
+        r"c:\Users\Robson\Downloads\10 LISTA SC para Outros.xlsm",
     ];
     CANDIDATES
         .iter()

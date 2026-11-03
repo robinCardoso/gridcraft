@@ -91,6 +91,28 @@ impl CellStore {
             inner.len += 1;
         }
     }
+    /// Puts every cell in the band its row says and recounts the length — serialized band keys
+    /// and the cached count are derived state, and the ones a file carries are not trusted. Cells
+    /// outside the sheet grid are dropped; returns how many (#1008).
+    pub fn rebuild(&mut self) -> usize {
+        let mut out = CellStore::new();
+        let mut dropped = 0;
+        let bands = std::mem::take(&mut self.inner_mut().bands);
+        for (_, band) in bands {
+            for (row, cols) in band.rows.iter() {
+                for (col, cell) in cols.iter() {
+                    let at = CellRef::new(*row, *col);
+                    if at.is_valid() {
+                        out.set(at, cell.clone());
+                    } else {
+                        dropped += 1;
+                    }
+                }
+            }
+        }
+        *self = out;
+        dropped
+    }
     pub fn remove(&mut self, c: CellRef) -> Option<Cell> {
         let key = c.row / BAND;
         let inner = self.inner_mut();
@@ -163,6 +185,30 @@ impl CellStore {
     }
     /// Positions whose cells differ between `self` and `other` (stored on one side only, or not
     /// equal). Stores that share the same inner `Arc`, and bands both stores share, are skipped.
+    
+    pub fn contiguous_value_run(&self, from: CellRef, cap: u32) -> Option<u32> {
+        let mut last = None;
+        let mut expect = from.row;
+        while expect <= cap {
+            let band_key = expect / BAND;
+            let Some(band) = self.inner.bands.get(&band_key) else { break };
+            let band_hi = ((band_key + 1) * BAND - 1).min(cap);
+            let mut advanced = false;
+            for (r, cols) in band.rows.range(expect..=band_hi) {
+                if *r != expect || cols.get(&from.col).is_none_or(|c| c.value.is_empty()) {
+                    return last;
+                }
+                last = Some(expect);
+                expect += 1;
+                advanced = true;
+            }
+            if !advanced {
+                break;
+            }
+        }
+        last
+    }
+
     pub fn diff(&self, other: &CellStore) -> Vec<CellRef> {
         self.diff_by(other, |a, b| a != b)
     }
@@ -208,6 +254,56 @@ impl CellStore {
             }
         }
         out
+    }
+    /// An estimate of the heap storage `self` retains when `newer` (a later snapshot) shares
+    /// unchanged bands with it: modified or dropped bands, plus strings/arrays whose contents
+    /// were rewritten.
+    pub fn retained_bytes_against(&self, newer: &CellStore) -> usize {
+        use std::mem::size_of;
+
+        if self.shares_storage_with(newer) {
+            return 0;
+        }
+
+        let mut bytes = 0usize;
+        for (key, band) in &self.inner.bands {
+            let next = newer.inner.bands.get(key);
+            if next.is_some_and(|b| Arc::ptr_eq(b, band)) {
+                continue;
+            }
+            bytes = bytes.saturating_add(size_of::<Band>());
+            for (row, cols) in &band.rows {
+                bytes = bytes.saturating_add(size_of::<u32>() + 3 * size_of::<usize>());
+                for (col, cell) in cols {
+                    bytes = bytes.saturating_add(size_of::<u32>() + size_of::<Cell>() + 3 * size_of::<usize>());
+                    let next_cell = next.and_then(|b| b.rows.get(row)).and_then(|r| r.get(col));
+                    if let Some(formula) = &cell.formula
+                        && !next_cell.and_then(|c| c.formula.as_ref()).is_some_and(|f| Arc::ptr_eq(f, formula))
+                    {
+                        bytes = bytes.saturating_add(size_of::<crate::cell::Formula>() + formula.text.len());
+                        if let Some(expr) = &formula.expr {
+                            expr.walk(&mut |_| bytes = bytes.saturating_add(size_of::<gridcraft_formula::Expr>()));
+                        }
+                    }
+                    match &cell.value {
+                        gridcraft_core::Value::Text(text)
+                            if !next_cell.and_then(|c| c.value.as_text()).is_some_and(|t| std::ptr::eq(t, text.as_ref())) =>
+                        {
+                            bytes = bytes.saturating_add(text.len());
+                        }
+                        gridcraft_core::Value::Array(array)
+                            if !next_cell.is_some_and(|c| matches!(&c.value, gridcraft_core::Value::Array(a) if Arc::ptr_eq(a, array))) =>
+                        {
+                            bytes = bytes.saturating_add(
+                                size_of::<gridcraft_core::Array>() + array.data.len().saturating_mul(size_of::<gridcraft_core::Value>()),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        bytes
     }
     /// Removes every cell in `r` and returns them.
     pub fn take_range(&mut self, r: RangeRef) -> Vec<(CellRef, Cell)> {

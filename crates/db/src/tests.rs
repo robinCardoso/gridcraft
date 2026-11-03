@@ -118,7 +118,7 @@ fn workbook_round_trips_through_a_db() {
     sh.set_value(CellRef::new(1, 1), Value::Number(4.0));
     sh.set_cell(
         CellRef::new(1, 2),
-        Cell { value: Value::Number(8.0), formula: Some(std::sync::Arc::new(Formula::new("=B2*2"))), style: Default::default() },
+        Cell { value: Value::Number(8.0), formula: Some(std::sync::Arc::new(Formula::new("=B2*2"))), style: Default::default(), py: None },
     );
     write_workbook(&wb, &db).expect("write");
 

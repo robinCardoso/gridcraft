@@ -1,4 +1,5 @@
 //! UI formula syntax boundary. Engine commands, control/API callers and XLSX keep English.
+use crate::i18n::Language;
 use gridcraft_engine::formula::{self, FormulaLocale, ParseError};
 use gridcraft_engine::model::Workbook;
 
@@ -27,15 +28,7 @@ pub(crate) fn canonical(
     {
         let known = |name: &str| wb.name(name, sheet).is_some() || wb.table(name).is_some();
         // Match the engine's existing convenience for missing closing parentheses.
-        let mut body = body.to_string();
-        let mut expr = formula::parse_input(&body, locale, known);
-        for _ in 0..8 {
-            if expr.is_ok() {
-                break;
-            }
-            body.push(')');
-            expr = formula::parse_input(&body, locale, known);
-        }
+        let expr = formula::parse_closing_parens(body, |text| formula::parse_input(text, locale, known));
         return Ok(format!("={}", formula::print(&expr?)));
     }
     // Decimal-comma number entry follows the same preference, without rewriting text or dates.
@@ -86,134 +79,48 @@ fn hide_udf_prefix(text: &str, locale: FormulaLocale) -> String {
     out
 }
 
-// Descriptions/signatures for the supported Spanish function table; untranslated functions
-// retain their English help. Parameter punctuation follows the same locale as entry.
-const SPANISH_HELP: &[(&str, &str, &str)] = &[
-    ("SUM", "SUMA(número1; [número2]; ...)", "Suma los números."),
-    ("AVERAGE", "PROMEDIO(número1; [número2]; ...)", "Devuelve el promedio de los números."),
-    ("IF", "SI(prueba_lógica; valor_si_verdadero; [valor_si_falso])", "Devuelve un valor según una condición."),
-    ("COUNT", "CONTAR(valor1; [valor2]; ...)", "Cuenta las celdas que contienen números."),
-    ("SUMIF", "SUMAR.SI(rango; criterio; [rango_suma])", "Suma las celdas que cumplen un criterio."),
-    ("COUNTIF", "CONTAR.SI(rango; criterio)", "Cuenta las celdas que cumplen un criterio."),
-    ("VLOOKUP", "BUSCARV(valor_buscado; matriz; indicador_columnas; [ordenado])", "Busca un valor en la primera columna de una tabla."),
-    ("TODAY", "HOY()", "Devuelve la fecha actual."),
-    ("TRUE", "VERDADERO()", "Devuelve el valor lógico VERDADERO."),
-    ("FALSE", "FALSO()", "Devuelve el valor lógico FALSO."),
-];
-
-const PORTUGUESE_HELP: &[(&str, &str, &str)] = &[
-    ("SUM", "SOMA(número1; [número2]; ...)", "Soma todos os números em um intervalo de células."),
-    ("AVERAGE", "MÉDIA(número1; [número2]; ...)", "Retorna a média aritmética dos argumentos."),
-    (
-        "IF",
-        "SE(teste_lógico; valor_se_verdadeiro; [valor_se_falso])",
-        "Verifica se uma condição foi satisfeita e retorna um valor se for VERDADEIRO e outro se for FALSO.",
-    ),
-    (
-        "IFS",
-        "SES(teste_lógico1; valor_se_verdadeiro1; ...)",
-        "Verifica se uma ou mais condições foram satisfeitas e retorna o valor correspondente à primeira condição VERDADEIRA.",
-    ),
-    (
-        "IFERROR",
-        "SEERRO(valor; valor_se_erro)",
-        "Retorna um valor especificado se a fórmula resultar em erro; caso contrário, retorna o resultado da fórmula.",
-    ),
-    ("COUNT", "CONT.NÚM(valor1; [valor2]; ...)", "Calcula o número de células em um intervalo que contêm números."),
-    ("COUNTA", "CONT.VALORES(valor1; [valor2]; ...)", "Calcula o número de células não vazias em um intervalo."),
-    ("COUNTIF", "CONT.SE(intervalo; critérios)", "Calcula o número de células que atendem aos critérios determinados."),
-    ("COUNTIFS", "CONT.SES(intervalo_critérios1; critérios1; ...)", "Conta o número de vezes que várias condições são atendidas."),
-    ("SUMIF", "SOMASE(intervalo; critérios; [intervalo_soma])", "Adiciona as células especificadas por um determinado critério ou condição."),
-    (
-        "SUMIFS",
-        "SOMASES(intervalo_soma; intervalo_critérios1; critérios1; ...)",
-        "Soma as células em um intervalo que atendem a múltiplos critérios.",
-    ),
-    (
-        "VLOOKUP",
-        "PROCV(valor_procurado; matriz_tabela; núm_índice_coluna; [procurar_intervalo])",
-        "Procura um valor na primeira coluna à esquerda de uma tabela e retorna um valor na mesma linha de outra coluna especificada.",
-    ),
-    (
-        "XLOOKUP",
-        "PROCX(pesquisa_valor; matriz_pesquisa; matriz_retorno; [se_não_encontrada]; [modo_correspondência]; [modo_pesquisa])",
-        "Pesquisa um intervalo ou matriz e retorna o item correspondente da matriz de retorno.",
-    ),
-    (
-        "MATCH",
-        "CORRESP(valor_procurado; matriz_procurada; [tipo_correspondência])",
-        "Retorna a posição relativa de um item em uma matriz correspondente a um valor especificado.",
-    ),
-    (
-        "XMATCH",
-        "CORRESPX(pesquisa_valor; matriz_pesquisa; [modo_correspondência]; [modo_pesquisa])",
-        "Retorna a posição relativa de um item em uma matriz ou intervalo de células.",
-    ),
-    (
-        "INDEX",
-        "ÍNDICE(matriz; núm_linha; [núm_coluna])",
-        "Retorna o valor de um elemento em uma tabela ou matriz, selecionado pelos índices de linha e coluna.",
-    ),
-    (
-        "CHOOSE",
-        "ESCOLHER(núm_índice; valor1; [valor2]; ...)",
-        "Escolhe um valor ou uma ação a ser executada a partir de uma lista de valores com base em um número de índice.",
-    ),
-    (
-        "OFFSET",
-        "DESLOC(ref; linhas; cols; [altura]; [largura])",
-        "Retorna uma referência a um intervalo que é um número especificado de linhas e colunas de uma célula ou intervalo.",
-    ),
-    ("AND", "E(lógico1; [lógico2]; ...)", "Verifica se todos os argumentos são VERDADEIRO e retorna VERDADEIRO se todos forem verdadeiros."),
-    ("OR", "OU(lógico1; [lógico2]; ...)", "Verifica se qualquer um dos argumentos é VERDADEIRO e retorna VERDADEIRO ou FALSO."),
-    ("NOT", "NÃO(lógico)", "Inverte o valor lógico do argumento."),
-    ("TODAY", "HOJE()", "Retorna a data atual formatada como data."),
-    ("NOW", "AGORA()", "Retorna a data e hora atuais formatadas como data e hora."),
-    ("ROUND", "ARRED(número; núm_dígitos)", "Arredonda um número até uma quantidade especificada de dígitos."),
-    ("CONCATENATE", "CONCATENAR(texto1; [texto2]; ...)", "Agrupa várias sequências de caracteres de texto em uma única sequência."),
-    ("LEFT", "ESQUERDA(texto; [núm_caract])", "Retorna os primeiros caracteres à esquerda de uma sequência de texto."),
-    ("RIGHT", "DIREITA(texto; [núm_caract])", "Retorna os últimos caracteres à direita de uma sequência de texto."),
-    (
-        "MID",
-        "EXT.TEXTO(texto; núm_inicial; núm_caract)",
-        "Retorna um número específico de caracteres de uma sequência de texto, a partir da posição especificada.",
-    ),
-    ("LEN", "NÚM.CARACT(texto)", "Retorna o número de caracteres em uma sequência de texto."),
-    ("UNIQUE", "ÚNICO(matriz; [por_coluna]; [exatamente_uma_vez])", "Retorna uma lista de valores exclusivos em uma lista ou intervalo."),
-    ("FILTER", "FILTRO(matriz; incluir; [se_vazia])", "Filtra um intervalo de dados com base nos critérios definidos."),
-    ("SORT", "CLASSIFICAR(matriz; [índice_ordenação]; [ordem_classificação]; [por_coluna])", "Classifica o conteúdo de um intervalo ou matriz."),
-    ("TRUE", "VERDADEIRO()", "Retorna o valor lógico VERDADEIRO."),
-    ("FALSE", "FALSO()", "Retorna o valor lógico FALSO."),
-];
-
-pub(crate) fn signature(name: &str, locale: FormulaLocale) -> Option<String> {
-    let canonical = locale.canonical_name(name);
-    if locale == FormulaLocale::Es
-        && let Some((_, signature, _)) = SPANISH_HELP.iter().find(|(name, ..)| *name == canonical)
-    {
-        return Some((*signature).into());
-    }
-    if locale == FormulaLocale::Pt
-        && let Some((_, signature, _)) = PORTUGUESE_HELP.iter().find(|(name, ..)| *name == canonical)
-    {
-        return Some((*signature).into());
-    }
-    crate::formula_bar::function_signature(canonical).map(|s| s.replace(',', &locale.list_separator().to_string()))
+/// A function's argument hint. The name and separators follow the formula syntax; the argument
+/// names follow the interface language, all of them or none, so a hint never mixes two languages.
+pub(crate) fn signature(name: &str, locale: FormulaLocale, language: Language) -> Option<String> {
+    let english = crate::formula_bar::function_signature(locale.canonical_name(name))?;
+    let Some((head, args)) = split_signature(&english) else { return Some(english) };
+    let separator = format!("{} ", locale.list_separator());
+    let args = match args.iter().map(|arg| translate_argument(arg, language)).collect::<Option<Vec<_>>>() {
+        Some(translated) => translated.join(&separator),
+        None => args.join(&separator),
+    };
+    Some(format!("{}({args})", locale.function_name(head)))
 }
 
-pub(crate) fn description(name: &str, locale: FormulaLocale) -> Option<String> {
-    let canonical = locale.canonical_name(name);
-    if locale == FormulaLocale::Es
-        && let Some((_, _, description)) = SPANISH_HELP.iter().find(|(name, ..)| *name == canonical)
-    {
-        return Some((*description).into());
+/// A function's description in the interface language (English while untranslated).
+pub(crate) fn description(name: &str, locale: FormulaLocale, language: Language) -> Option<String> {
+    let english = crate::formula_bar::function_description(locale.canonical_name(name))?;
+    Some(language.function_description(&english).map_or(english, str::to_string))
+}
+
+/// `SUM(number1, [number2], ...)` -> `SUM` and its arguments as written.
+fn split_signature(signature: &str) -> Option<(&str, Vec<&str>)> {
+    let (head, rest) = signature.split_once('(')?;
+    let inner = rest.strip_suffix(')')?;
+    Some((head, if inner.is_empty() { Vec::new() } else { inner.split(", ").collect() }))
+}
+
+/// `[number2]` -> `number`. A bracket can open or close on its own (SWITCH's
+/// `[default_or_value2, result2]`, LAMBDA's `[parameter1, ...]`).
+fn argument_name(arg: &str) -> &str {
+    let arg = arg.strip_prefix('[').unwrap_or(arg);
+    let arg = arg.strip_suffix(']').unwrap_or(arg);
+    arg.trim_end_matches(|c: char| c.is_ascii_digit())
+}
+
+/// `[number2]` -> `[número2]`: brackets, index and `...` stay.
+fn translate_argument(arg: &str, language: Language) -> Option<String> {
+    let name = argument_name(arg);
+    if name == "..." {
+        return Some(arg.to_string());
     }
-    if locale == FormulaLocale::Pt
-        && let Some((_, _, description)) = PORTUGUESE_HELP.iter().find(|(name, ..)| *name == canonical)
-    {
-        return Some((*description).into());
-    }
-    crate::formula_bar::function_description(canonical)
+    // `arg` is `[`? + `name` + index + `]`?, so the first match is the name itself.
+    Some(arg.replacen(name, language.function_argument(name)?, 1))
 }
 
 /// Avoid suggesting an alias that would call a workbook/table name instead of the function.
@@ -232,4 +139,35 @@ pub(crate) fn display_template(text: &str, locale: FormulaLocale, wb: &Workbook,
         return format!("={}(", completion_name(name, locale, wb, sheet));
     }
     display(text, locale, wb, sheet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hint for `name`, empty when there is none.
+    fn sig(name: &str, locale: FormulaLocale, language: Language) -> String {
+        signature(name, locale, language).unwrap_or_default()
+    }
+
+    /// Hints keep the formula syntax's name and separators and translate the argument names
+    /// only when the interface language has them all.
+    #[test]
+    fn function_help_follows_the_interface_language_and_the_formula_syntax() {
+        use FormulaLocale::{En, Es};
+        // Spanish help over English formulas: the name and `,` stay as typed; brackets, indexes
+        // and `...` survive.
+        assert_eq!(sig("IF", En, Language::Es), "IF(prueba_lógica, [valor_si_verdadero], [valor_si_falso])");
+        assert_eq!(sig("SUM", En, Language::Es), "SUM(número1, [número2], ...)");
+        assert_eq!(description("IF", En, Language::Es).as_deref(), Some("Devuelve un valor según una condición."));
+        // Spanish names and separators, from a localized name.
+        assert_eq!(sig("suma", Es, Language::Es), "SUMA(número1; [número2]; ...)");
+        assert_eq!(description("SUMA", Es, Language::Es).as_deref(), Some("Suma los números."));
+        // An argument list Spanish covers only in part stays English instead of mixing (the name
+        // is whatever the Spanish formula table calls SUMIFS).
+        let sumifs = sig("SUMIFS", Es, Language::Es);
+        assert!(sumifs.ends_with("(sum_range; criteria_range1; criteria1; ...)"), "{sumifs}");
+        assert_eq!(description("SUMIFS", Es, Language::Es).as_deref(), Some("Adds the cells that meet every condition."));
+        assert_eq!(sig("IF", En, Language::En), "IF(logical_test, [value_if_true], [value_if_false])");
+    }
 }

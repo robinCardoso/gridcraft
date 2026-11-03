@@ -1717,7 +1717,7 @@ fn automatic_cascade_keeps_cross_sheet_dependents_past_thousand() {
     let n = 1_100u32;
     let mut t = T::new();
     t.wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new("Data")));
-    t.wb.active_sheet = 0;
+    t.wb.active_sheet = 0.into();
     t.wb.sheet_mut(0).unwrap().cells.set(c("A1"), Cell::value(Value::Number(1.0)));
     // Active-sheet formula that reads a cross-sheet dependent (the "static" symptom).
     t.wb.sheet_mut(0).unwrap().cells.set(c("B1"), Cell::formula(Formula::new("=Data!A1")));
@@ -1836,6 +1836,7 @@ fn recalc_uncomputed_pays_open_debt_without_touching_cached_formulas() {
                 value: Value::Number(42.0),
                 formula: Some(Arc::new(Formula::new("=99"))),
                 style: Default::default(),
+                py: None,
             },
         );
     }
@@ -1859,6 +1860,7 @@ fn recalc_on_load_recomputes_empty_text_formula_cache() {
             value: Value::text(""),
             formula: Some(Arc::new(Formula::new("=A1+1"))),
             style: Default::default(),
+            py: None,
         },
     );
     let mut calc = Calc::new();

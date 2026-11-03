@@ -2,331 +2,749 @@
 
 use serde_json::{Value as Json, json};
 
-use super::*;
+use super::{CommandSpec, Result, Session, always, bad, bool_param, cmd, edit, has_doc, ok, str_param, target_sheet, u32_param};
+
 use crate::DocState;
 
 pub fn specs() -> Vec<CommandSpec> {
+
     vec![
+
         cmd!(noundo "file.new", "New Workbook", ["File"], Some("Cmd+N"), "{sample?: \"budget\"|\"sales\"|\"grades\"}", always, new_workbook),
+
         cmd!(noundo "file.open", "Open…", ["File"], Some("Cmd+O"), "{path} | {name, base64}, plus {password} for a password-protected workbook and {csvAsText?: bool} to keep every csv/tsv/txt field as text, with no number or date conversion (xlsx, xlsm, xls import, xlsb and ods data import, csv, tsv, txt, json, SQLite .db: every table is a sheet)", always, open),
+
         cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?} (xlsx by default; .csv/.tsv/.json/.html/.pdf by extension)", has_doc, save),
+
         cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet)", has_doc, save_as),
+
         cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html} → {base64}", has_doc, save_bytes),
-        cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
-        cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
+
+        cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool, document?: bool} (closes the active window, or with `document` the workbook and all its windows; the workbook closes with its last window)", has_doc, close),
+
+        cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?, values?: bool} → {path, bytes}: writes the cells as displayed, like Excel's Save As CSV; `values: true` writes raw values instead (full-precision numbers, ISO 8601 dates and times, TRUE/FALSE)", has_doc, |s, p| export(s, p, "csv")),
+
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
+
         cmd!(noundo "file.importXlsxToDb", "Convert Workbook to Database", ["File", "Export"], None, "{path, out?, open?: bool (default true)} streams an .xlsx into a SQLite .db (one table per sheet, row 1 = column names) without loading it in memory → {out, tables: [{sheet, rows, columns}], warnings}", always, import_xlsx_to_db),
+
         cmd!("file.properties", "Properties", ["File"], None, "{title?, subject?, author?, company?, keywords?, description?}", has_doc, properties),
+
         cmd!(
+
             query "file.options",
+
             "Options",
+
             ["File"],
+
             None,
+
             "{} → {calculation: {mode, iterative, maxIterations, maxChange}} for the active workbook (the interface opens File › Options; change settings with their own commands, e.g. formulas.calculationOptions, view.theme, app.language.set)",
+
             always,
+
             options
+
         ),
-        cmd!(noundo "window.activate", "Switch Window", ["Window"], None, "{index}", has_doc, activate_window),
+
+        cmd!(noundo "window.activate", "Switch Window", ["Window"], None, "{window} | {doc} | {index} (a window id, a workbook id, or the workbook's position in the list)", has_doc, activate_window),
+
+        cmd!(noundo "window.close", "Close Window", ["Window"], None, "{window?, doc?, force?: bool} → {closed, document}: closes a window (the active one by default); its workbook closes with its last window, asking first when it has unsaved changes unless `force`", has_doc, close_window),
+
+        cmd!(query "window.list", "Windows", ["Window"], None, "{} → [{window, doc, index, title, dirty, active, hidden}]", always, |s, _| Ok(s.window_list())),
+
     ]
+
 }
 
 fn new_workbook(s: &mut Session, p: &Json) -> Result<Json> {
+
     let i = match str_param(p, "sample") {
+
         Some(name) => {
+
             let wb = crate::sample::build(name).ok_or_else(|| bad("file.new", format!("unknown sample `{name}`")))?;
+
             let title = crate::sample::title(name);
-            s.add_document(DocState::new(wb, None, title))
+
+            s.add_document(DocState::new(wb, None, title, crate::Trust::Local))
+
         }
+
         None => s.new_workbook(),
+
     };
+
     Ok(json!({"index": i, "title": s.doc()?.display_title()}))
+
 }
 
 fn open(s: &mut Session, p: &Json) -> Result<Json> {
+
     if let Some(path) = str_param(p, "path") {
+
         // Already open? Switch to it.
+
         if let Some(i) = s.documents().iter().position(|d| d.path.as_deref() == Some(path)) {
+
             s.set_active(i);
+
             return Ok(json!({"index": i, "alreadyOpen": true}));
+
         }
+
     } else if str_param(p, "base64").is_none() {
+
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
+
         return ok();
+
     }
+
     let (doc, warnings) = load_document(p, None)?;
+
     s.install_document(doc, warnings)
+
 }
 
 /// Loads a document from path or base64 without needing a Session, allowing background execution.
+
 pub fn load_document(p: &Json, mut progress: Option<Box<dyn FnMut(&str) + Send>>) -> Result<(DocState, Vec<String>)> {
+
     let (name, bytes) = if let Some(b) = str_param(p, "base64") {
+
         if let Some(cb) = &mut progress {
+
             cb("Decodificando dados da planilha...");
+
         }
+
         (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
+
     } else if let Some(path) = str_param(p, "path") {
+
         let is_db = crate::dbfile::is_db_path(path);
+
         if let Some(cb) = &mut progress {
+
             if is_db {
+
                 cb("Abrindo banco SQLite...");
+
             } else {
+
                 cb("Lendo dados do arquivo...");
+
             }
+
         }
+
         (path.to_string(), if is_db { Vec::new() } else { crate::io::read_file(path)? })
+
     } else {
+
         return Err(bad("file.open", "missing `path` or `base64`"));
+
     };
+
     let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
+
     let (mut wb, warnings) = if crate::dbfile::is_db_path(&name) {
+
         let (w, mut warns) = crate::dbfile::open(&name)?;
+
         if str_param(p, "path").is_some_and(|p| !crate::dbfile::is_db_path(p)) {
+
             warns.push("Workbook opened via high-performance SQLite database (.db).".into());
+
         }
+
         (w, warns)
+
     } else {
+
         if let Some(cb) = &mut progress {
+
             cb("Processando dados e fórmulas...");
+
         }
+
         crate::io::open_bytes_with(&name, &bytes, str_param(p, "password"), bool_param(p, "csvAsText").unwrap_or(false))?
+
     };
+
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
+
+    // What `CELL("filename")` reports (#1489). A workbook opened from bytes knows its name but
+
+    // never a folder, so it reports `[name]Sheet` with none; an import reports the file it came
+
+    // from, as Excel does, even though Save must still ask where to put the .xlsx.
+
+    wb.source_path = match str_param(p, "path") {
+
+        Some(path) => crate::io::source_path(path),
+
+        None => Some(std::path::PathBuf::from(&name)),
+
+    };
+
     let imported =
+
         matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb | crate::io::FileKind::Xls))
+
             || matches!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb | gridcraft_xlsx::Format::Xls);
+
     let title = if imported {
-        format!("{} (imported).xlsx", std::path::Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or("Book"))
+
+        format!("{} (imported).xlsx", std::path::Path::new(&name).file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("Book"))
+
     } else {
-        std::path::Path::new(&name).file_name().and_then(|n| n.to_str()).unwrap_or("Book").to_string()
+
+        std::path::Path::new(&name).file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("Book").to_string()
+
     };
+
     let path = if crate::dbfile::is_db_path(&name) {
+
         Some(name.clone())
+
     } else {
+
         str_param(p, "path").filter(|_| !imported && !encrypted).map(str::to_string)
+
     };
+
     if let Some(cb) = &mut progress {
+
         cb("Recalculando e preparando visualização...");
+
     }
-    let mut doc = DocState::new(wb, path, title);
+
+    // Someone else may have made the file: its active content asks before it runs.
+
+    let mut doc = DocState::new(wb, path, title, crate::Trust::FromFile);
+
     if crate::io::FileKind::from_path(&name).is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Xlsx {
+
         doc.content_kind = Some(crate::io::FileKind::Xlsx);
+
     }
+
     Ok((doc, warnings))
+
 }
 
 /// A save collected on the interface thread — [`SavePlan::prepare`] is an `Arc` clone and two
+
 /// string checks — and executed as a pure function ([`SavePlan::execute`]: serialization plus the
+
 /// atomic file write, no `Session`, no UI). The engine command `file.save` runs the same two steps
+
 /// inline; the interface's JobManager runs `execute` on a background thread
+
 /// (docs/plano-responsividade.md, Fase 2), so a big workbook saves without freezing the window.
+
 pub struct SavePlan {
+
     /// The snapshot written: the document's workbook at preparation time. Edits meanwhile leave
+
     /// the document dirty against exactly this snapshot.
-    pub wb: std::sync::Arc<Workbook>,
+
+    pub wb: std::sync::Arc<gridcraft_model::Workbook>,
+
     pub path: String,
+
     /// The format to save in: the document's own file keeps the format its content had when
+
     /// opened; any other path goes by its extension. `None` fails in `execute` when the
+
     /// extension names no format.
+
     pub kind: Option<crate::io::FileKind>,
+
     /// Deflate level for the package formats: 6 (manual save) or 1 (fast AutoSave,
+
     /// docs/plano-responsividade.md, Fase 2 — a background save trades file size for time).
+
     pub compression: i64,
+
 }
 
 /// What a save wrote.
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+
 pub struct SaveOutcome {
+
     pub path: String,
+
     pub bytes: usize,
+
 }
 
 impl SavePlan {
+
     /// Collects the plan for a save to `path` (cheap: no I/O, no serialization).
+
     pub fn prepare(d: &DocState, path: String) -> SavePlan {
+
         let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
+
         SavePlan { wb: d.wb.clone(), path, kind, compression: 6 }
+
     }
 
     /// The long part of a save. Relative paths to linked workbooks are rewritten for the target
+
     /// file's folder, the bytes are serialized and written atomically (`write_file`): a process
+
     /// that dies halfway never corrupts the workbook. `progress` reports fractions 0..1.
+
     pub fn execute(&self, progress: Option<&mut dyn FnMut(f64)>) -> Result<SaveOutcome> {
+
         let mut progress = progress;
+
         let mut report = |f: f64| {
+
             if let Some(cb) = progress.as_mut() {
+
                 (cb)(f);
+
             }
+
         };
+
         let rebased = crate::io::source_dir(&self.path).and_then(|f| gridcraft_xlsx::rebase_links(&self.wb, &f));
+
         let wb = rebased.as_ref().unwrap_or(&self.wb);
+
         report(0.05);
+
         let bytes = match self.kind {
+
             Some(kind) => crate::io::save_bytes_as_level(wb, &self.path, kind, self.compression)?,
+
             None => crate::io::save_bytes(wb, &self.path)?,
+
         };
+
         report(0.9);
+
         crate::io::write_file(&self.path, &bytes)?;
+
         report(1.0);
+
         Ok(SaveOutcome { path: self.path.clone(), bytes: bytes.len() })
+
     }
+
 }
 
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
+
     let path = match str_param(p, "path").map(str::to_string).or_else(|| s.active().and_then(|d| d.path.clone())) {
+
         Some(p) => p,
+
         None => {
+
             s.ui_requests.push(crate::UiRequest::Dialog("saveAs".into(), json!({})));
+
             return ok();
+
         }
+
     };
+
     // A PDF is a print of the sheet (Page Setup applies), not a copy of the workbook: the
+
     // document keeps its file and its unsaved changes.
-    if std::path::Path::new(&path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+
+    if std::path::Path::new(&path).extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+
         return super::print::export_pdf(s, &json!({"path": path}));
+
     }
+
     let d = s.doc_mut()?;
+
     // A database stores values and formulas only (no formatting, charts...), so saving to another
+
     // path is a copy that leaves the document and its unsaved changes alone, like a PDF export.
+
     // Saving a document opened from that very database writes it back and clears the changes.
+
     if crate::dbfile::is_db_path(&path) {
+
         crate::dbfile::save(&d.wb, &path)?;
+
         if d.path.as_deref() == Some(path.as_str()) {
+
             d.saved = d.wb.clone();
+
         }
+
         return Ok(json!({"path": path, "database": true}));
+
     }
-    let plan = SavePlan::prepare(d, path.clone());
-    let outcome = plan.execute(None)?;
+
+    // The document's own file keeps the format its content had when opened; any other path
+
+    // goes by its extension. Relative paths to linked workbooks are rewritten for the new folder.
+
+    let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
+
+    let rebased = crate::io::source_dir(&path).and_then(|f| gridcraft_xlsx::rebase_links(&d.wb, &f));
+
+    let wb = rebased.as_ref().unwrap_or(&d.wb);
+
+    let bytes = match kind {
+
+        Some(kind) => crate::io::save_bytes_as(wb, &path, kind)?,
+
+        None => crate::io::save_bytes(wb, &path)?,
+
+    };
+
+    crate::io::write_file(&path, &bytes)?;
+
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
-    if matches!(plan.kind, Some(crate::io::FileKind::Xlsx | crate::io::FileKind::Json)) {
-        let d = s.doc_mut()?;
-        d.saved = plan.wb;
-        d.path = Some(outcome.path.clone());
+
+    if matches!(kind, Some(crate::io::FileKind::Xlsx | crate::io::FileKind::Json)) {
+
+        // The new file is the workbook's own now, so `CELL("filename")` reports it (#1489). Set
+
+        // before the `saved` snapshot, or the workbook would read as dirty the moment it was
+
+        // saved; and only when it changes, so an ordinary Save does not clone the workbook.
+
+        let file = crate::io::source_path(&path);
+
+        if d.wb.source_path != file {
+
+            std::sync::Arc::make_mut(&mut d.wb).source_path = file;
+
+        }
+
+        d.saved = d.wb.clone();
+
+        d.path = Some(path.clone());
+
     }
+
+    let plan = SavePlan::prepare(d, path.clone());
+
+    let outcome = plan.execute(None)?;
+
+    // Only a full-fidelity format clears the dirty flag and becomes the document's file.
+
+    if matches!(plan.kind, Some(crate::io::FileKind::Xlsx | crate::io::FileKind::Json)) {
+
+        let d = s.doc_mut()?;
+
+        d.saved = plan.wb;
+
+        d.path = Some(outcome.path.clone());
+
+    }
+
     Ok(json!({"path": outcome.path, "bytes": outcome.bytes}))
+
 }
 
 fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
+
     if str_param(p, "path").is_none() {
+
         s.ui_requests.push(crate::UiRequest::Dialog("saveAs".into(), json!({})));
+
         return ok();
+
     }
+
     save(s, p)
+
 }
 
 fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
+
     let fmt = str_param(p, "format").unwrap_or("xlsx");
+
     let d = s.doc()?;
-    let bytes = crate::io::save_bytes(&d.wb, &format!("x.{fmt}"))?;
+
     let name = format!("{}.{fmt}", std::path::Path::new(&d.display_title()).file_stem().and_then(|x| x.to_str()).unwrap_or("Book"));
+
+    // The file name goes into a PivotChart's link to its PivotTable.
+
+    let bytes = crate::io::save_bytes(&d.wb, &name)?;
+
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
+
 }
 
+/// File › Close closes the active window; the workbook closes with its last window.
+
 fn close(s: &mut Session, p: &Json) -> Result<Json> {
-    let force = bool_param(p, "force").unwrap_or(false);
-    let d = s.doc()?;
-    if d.is_dirty() && !force {
-        s.ui_requests.push(crate::UiRequest::Dialog("saveChanges".into(), json!({"title": d.display_title()})));
-        return Ok(json!({"closed": false, "dirty": true}));
+
+    if !bool_param(p, "document").unwrap_or(false)
+
+        && let Some(id) = s.active_window()
+
+        && let Some(doc) = s.window(id).map(|w| w.doc_uid)
+
+        && s.windows().iter().filter(|w| w.doc_uid == doc).count() > 1
+
+    {
+
+        s.close_window(id);
+
+        return Ok(json!({"closed": true, "document": false}));
+
     }
+
+    let force = bool_param(p, "force").unwrap_or(false);
+
+    let d = s.doc()?;
+
+    if d.is_dirty() && !force {
+
+        s.ui_requests.push(crate::UiRequest::Dialog("saveChanges".into(), json!({"title": d.display_title()})));
+
+        return Ok(json!({"closed": false, "dirty": true}));
+
+    }
+
     let i = s.active_index();
+
     // Ownership of the closed document is dropped here for CLI / tests / callers that do not
+
     // intercept `file.close` with `force`. The desktop UI takes the document out itself and
+
     // frees heavy books off the interface thread (see `SheetApp::force_close_active_document`).
-    drop(s.close_document(i));
+
+    let _ = s.close_document(i);
+
     Ok(json!({"closed": true}))
+
 }
 
 fn export(s: &mut Session, p: &Json, ext: &str) -> Result<Json> {
+
     let path = str_param(p, "path").ok_or_else(|| bad("file.export", "missing `path`"))?.to_string();
+
     let d = s.doc()?;
-    // Only exporting another sheet touches the workbook (its active sheet); the common case
-    // serializes the snapshot directly (an export is a copy: the document keeps its file).
-    let own;
-    let wb: &Workbook = match p.get("sheet") {
-        Some(_) => {
-            let mut wb = (*d.wb).clone();
-            wb.active_sheet = target_sheet(s, p)?;
-            own = std::sync::Arc::new(wb);
-            &own
-        }
-        None => &d.wb,
-    };
+
+    let mut wb = (*d.wb).clone();
+
+    if p.get("sheet").is_some() {
+
+        wb.active_sheet = target_sheet(s, p)?.into();
+
+    }
+
     let target = if path.ends_with(&format!(".{ext}")) { path.clone() } else { format!("{path}.{ext}") };
-    let bytes = crate::io::save_bytes(wb, &target)?;
+
+    let bytes = if ext == "csv" && bool_param(p, "values").unwrap_or(false) {
+
+        crate::io::csv_values_bytes(&wb)?
+
+    } else {
+
+        crate::io::save_bytes(&wb, &target)?
+
+    };
+
     crate::io::write_file(&target, &bytes)?;
+
     Ok(json!({"path": target, "bytes": bytes.len()}))
+
 }
 
 fn properties(s: &mut Session, p: &Json) -> Result<Json> {
+
     edit(s, |cx| {
+
         let pr = &mut cx.wb.props;
+
         for (k, slot) in [
+
             ("title", &mut pr.title),
+
             ("subject", &mut pr.subject),
+
             ("author", &mut pr.author),
+
             ("company", &mut pr.company),
+
             ("keywords", &mut pr.keywords),
+
             ("description", &mut pr.description),
+
         ] {
+
             if let Some(v) = str_param(p, k) {
+
                 *slot = v.to_string();
+
             }
+
         }
+
         Ok(serde_json::to_value(&cx.wb.props).unwrap_or_default())
+
     })
+
 }
 
 /// File › Options: reports the workbook-level settings and asks the interface to show its Options
+
 /// page. Nothing changes here; every setting has its own command.
+
 fn options(s: &mut Session, _: &Json) -> Result<Json> {
+
     s.ui_requests.push(crate::UiRequest::Dialog("options".into(), json!({})));
+
     let calculation = s.active().map(|d| {
+
         let c = &d.wb.calc;
+
         let mode = match c.mode {
+
             gridcraft_model::CalcMode::Automatic => "automatic",
+
             gridcraft_model::CalcMode::AutomaticExceptTables => "automaticExceptTables",
+
             gridcraft_model::CalcMode::Manual => "manual",
+
         };
+
         json!({"mode": mode, "iterative": c.iterative, "maxIterations": c.max_iterations, "maxChange": c.max_change})
+
     });
+
     Ok(json!({"calculation": calculation}))
+
 }
 
 /// File › Export › Convert Workbook to Database: streams an `.xlsx` into a SQLite `.db` (the sheets
+
 /// never need to fit in memory as a workbook) and, unless `open` is false, opens the result.
+
 fn import_xlsx_to_db(s: &mut Session, p: &Json) -> Result<Json> {
+
     let path = str_param(p, "path").ok_or_else(|| bad("file.importXlsxToDb", "missing `path`"))?.to_string();
+
     let out = match str_param(p, "out") {
+
         Some(o) => o.to_string(),
+
         None => std::path::Path::new(&path).with_extension("db").to_string_lossy().into_owned(),
+
     };
+
     if !crate::dbfile::is_db_path(&out) {
+
         return Err(bad("file.importXlsxToDb", "`out` must end in .db, .sqlite or .sqlite3"));
+
     }
+
     if std::path::Path::new(&out) == std::path::Path::new(&path) {
+
         return Err(bad("file.importXlsxToDb", "`out` must be a different file than `path`"));
+
     }
+
     let (tables, warnings) = crate::dbfile::import_xlsx(&path, &out)?;
+
     let mut result = json!({
+
         "out": out,
+
         "tables": tables.iter().map(|(sheet, rows, columns)| json!({"sheet": sheet, "rows": rows, "columns": columns})).collect::<Vec<_>>(),
+
         "warnings": warnings,
+
     });
+
     if bool_param(p, "open").unwrap_or(true) {
+
         let opened = open(s, &json!({"path": out}))?;
+
         if let Some(map) = result.as_object_mut() {
+
             map.insert("opened".into(), opened);
+
         }
+
     }
+
     Ok(result)
+
 }
 
 fn activate_window(s: &mut Session, p: &Json) -> Result<Json> {
-    let i = u32_param(p, "index").ok_or_else(|| bad("window.activate", "missing `index`"))? as usize;
-    if i >= s.documents().len() {
-        return Err(bad("window.activate", "no such window"));
-    }
-    s.set_active(i);
+
+    let id = match u32_param(p, "index").filter(|_| p.get("window").is_none_or(Json::is_null) && p.get("doc").is_none_or(Json::is_null)) {
+
+        Some(i) => {
+
+            let uid = s.documents().get(i as usize).map(|d| d.uid).ok_or_else(|| bad("window.activate", "no such window"))?;
+
+            s.doc_window(uid).ok_or_else(|| bad("window.activate", "no such window"))?
+
+        }
+
+        None if p.get("window").is_none_or(Json::is_null) && p.get("doc").is_none_or(Json::is_null) => {
+
+            return Err(bad("window.activate", "missing `window`"));
+
+        }
+
+        None => super::extra::window_param(s, "window.activate", p)?,
+
+    };
+
+    s.unhide_window(id);
+
     ok()
+
 }
+
+fn close_window(s: &mut Session, p: &Json) -> Result<Json> {
+
+    let id = super::extra::window_param(s, "window.close", p)?;
+
+    let doc = s.window(id).map(|w| w.doc_uid).unwrap_or_default();
+
+    if s.windows().iter().filter(|w| w.doc_uid == doc).count() > 1 {
+
+        s.close_window(id);
+
+        return Ok(json!({"closed": true, "document": false}));
+
+    }
+
+    let force = bool_param(p, "force").unwrap_or(false);
+
+    let d = s.documents().iter().find(|d| d.uid == doc).ok_or(crate::EngineError::NoDocument)?;
+
+    if d.is_dirty() && !force {
+
+        let title = d.display_title();
+
+        s.activate_window(id);
+
+        s.ui_requests.push(crate::UiRequest::Dialog("saveChanges".into(), json!({"title": title})));
+
+        return Ok(json!({"closed": false, "dirty": true}));
+
+    }
+
+    s.close_window(id);
+
+    Ok(json!({"closed": true, "document": true}))
+
+}
+

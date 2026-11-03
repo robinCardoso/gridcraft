@@ -262,7 +262,7 @@ pub(crate) fn write_totals(sh: &mut gridcraft_model::Sheet, ti: usize) {
         let c = CellRef::new(row, t.range.start.col + i as u32);
         if let Some(code) = col.totals.subtotal_code() {
             let f = format!("=SUBTOTAL({code},{}[{}])", t.name, col.name);
-            sh.set_cell(c, Cell { formula: Some(std::sync::Arc::new(Formula::new(&f))), value: gridcraft_core::Value::Empty, style: sh.style_id(c) });
+            sh.set_cell(c, Cell { formula: Some(std::sync::Arc::new(Formula::new(&f))), value: gridcraft_core::Value::Empty, style: sh.style_id(c), py: None });
         } else if let Some(l) = &col.totals_label {
             sh.set_value(c, gridcraft_core::Value::text(l.as_str()));
         } else {
@@ -394,14 +394,14 @@ pub(crate) fn auto_expand_tables(cx: &mut crate::cmd::Ctx) {
                         if let Some(formula) = new_formula {
                             shm.set_cell(
                                 target_cell,
-                                Cell { value: gridcraft_core::Value::Empty, formula: Some(std::sync::Arc::new(formula)), style },
+                                Cell { value: gridcraft_core::Value::Empty, formula: Some(std::sync::Arc::new(formula)), style, py: None },
                             );
                             new_touched.push(target_cell);
                         } else if shm.style_id(target_cell) != style {
                             if let Some(cl) = shm.cells.get_mut(target_cell) {
                                 cl.style = style;
                             } else {
-                                shm.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula: None, style });
+                                shm.set_cell(target_cell, Cell { value: gridcraft_core::Value::Empty, formula: None, style, py: None });
                             }
                         }
                     }

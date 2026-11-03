@@ -1233,7 +1233,7 @@ impl PassHost<'_> {
     ) -> Option<Arc<Vec<u32>>> {
         self.note_eq_hit();
         let key = apply_col_norm(&self.cell_value(sheet, at), norm);
-        let hit = gridcraft_functions::lookup_equal(needle, &key, false);
+        let hit = gridcraft_core::compare(needle, &key) == std::cmp::Ordering::Equal;
         Some(Arc::new(if hit { vec![0] } else { vec![] }))
     }
 
@@ -2103,7 +2103,7 @@ impl Calc {
         }
         if !needed.is_empty() {
             if needed.len() > 1_000 {
-                let active = wb.active_sheet;
+                let active = wb.active_sheet();
                 needed.retain(|k| {
                     k.0 == active || wb.sheet(k.0).and_then(|s| s.cell(k.1)).is_some_and(|c| c.formula.as_ref().is_some_and(|f| f.array.is_some()))
                 });
@@ -2322,7 +2322,7 @@ impl Calc {
             // Row-major order is a good topological guess; on-demand evaluation fixes the rest.
             // M2 (docs/plano-desempenho-calculo.md): active/scoped sheet formulas are sorted first
             // within the pass (earlier `compute` + write-back at end of the round — no parity split).
-            let target_sheet = scope_sheet.or(Some(wb.active_sheet));
+            let target_sheet = scope_sheet.or(Some(wb.active_sheet()));
             dirty.sort_by_key(|(s, c)| (target_sheet.is_some_and(|ts| *s != ts), *s, c.row, c.col));
             if let Some(hooks) = self.hooks.as_ref()
                 && hooks.cancelled()

@@ -364,12 +364,15 @@ impl<'h> Evaluator<'h> {
         if let Value::Error(e) = needle {
             return Value::Error(*e);
         }
-        let trimmed = self.trim(area);
+        let cells = u64::from(area.range.height()) * u64::from(area.range.width());
+        let trimmed = if cells > FULL_SIZE_CELLS { self.trim(area) } else { area.range };
         let (h, w) = (trimmed.height() as usize, trimmed.width() as usize);
         if h == 0 || w == 0 {
             return Value::Error(CellError::Value);
         }
-        if (h == 1 || w == 1)
+        let is_blank = matches!(needle, Value::Empty) || matches!(needle, Value::Text(s) if s.is_empty());
+        if !is_blank
+            && (h == 1 || w == 1)
             && let Some(positions) = self.host.equality_positions(area.sheet, trimmed, needle, norm)
         {
             let len = h * w;
@@ -406,7 +409,7 @@ impl<'h> Evaluator<'h> {
                 let Ev::R(areas) = self.eval(e) else { return None };
                 let [area] = areas.as_slice() else { return None };
                 let (h, w) = (area.range.height(), area.range.width());
-                if w == 1 || h == 1 { Some(*area) } else { None }
+                if (w == 1 && h > 1) || (h == 1 && w > 1) { Some(*area) } else { None }
             }
             _ => None,
         }

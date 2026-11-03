@@ -138,7 +138,7 @@ fn read_workbook_from_cells(conn: &Connection, max_rows: u32) -> Result<(Workboo
                 if load_formulas { formula_text.as_deref().filter(|s| !s.is_empty()).map(|s| std::sync::Arc::new(Formula::new(s))) } else { None };
             let at = CellRef::new(row, col);
             if at.is_valid() {
-                sh.set_cell(at, Cell { value, formula, style: StyleId::DEFAULT });
+                sh.set_cell(at, Cell { value, formula, style: StyleId::DEFAULT, py: None });
             }
         }
 
@@ -261,7 +261,7 @@ pub fn read_workbook(path: &Path, max_rows: u32) -> Result<(Workbook, Vec<String
                 let at = CellRef::new(r, c);
                 if at.is_valid() {
                     let value = sh.value(at);
-                    sh.set_cell(at, Cell { value, formula: Some(Arc::new(Formula::new(&text))), style: StyleId::DEFAULT });
+                    sh.set_cell(at, Cell { value, formula: Some(Arc::new(Formula::new(&text))), style: StyleId::DEFAULT, py: None });
                 }
             }
         }

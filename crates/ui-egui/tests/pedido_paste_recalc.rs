@@ -8,8 +8,8 @@ use serde_json::json;
 
 fn xlsm_path() -> Option<std::path::PathBuf> {
     const CANDIDATES: &[&str] = &[
-        r"c:\Users\Robson\Downloads\10 LISTA SC para Outros.xlsm",
         r"c:\Users\Robson\source\grid-excel\10 LISTA SC para Outros.xlsm",
+        r"c:\Users\Robson\Downloads\10 LISTA SC para Outros.xlsm",
     ];
     CANDIDATES.iter().map(std::path::Path::new).find(|p| p.exists()).map(std::path::Path::to_path_buf)
 }

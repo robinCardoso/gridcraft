@@ -21,6 +21,12 @@ const SPANISH: &[(&str, &str)] = &[
     ("COUNTIF", "CONTAR.SI"),
     ("VLOOKUP", "BUSCARV"),
     ("TODAY", "HOY"),
+    // Financial block (#1986): the loan-schedule and investment staples.
+    ("NPV", "VNA"),
+    ("IRR", "TIR"),
+    ("PMT", "PAGO"),
+    ("PV", "VA"),
+    ("FV", "VF"),
     ("TRUE", "VERDADERO"),
     ("FALSE", "FALSO"),
 ];
@@ -138,8 +144,9 @@ pub fn parse_input(src: &str, locale: FormulaLocale, known_name: impl Fn(&str) -
 /// Prints canonical expressions for editing. Name collisions retain the canonical spelling
 /// so displaying then committing a formula never changes a defined-name reference.
 pub fn print_input(expr: &Expr, locale: FormulaLocale, known_name: impl Fn(&str) -> bool) -> Result<String, ParseError> {
-    // Check before cloning/printing: a flat operator chain can produce a deep AST even
-    // though the parser itself did not recurse deeply.
+    // Check before cloning/printing. A flat operator chain such as A1+A2+… nests on its left
+    // without nesting in the text: cloning, printing and `normalize` follow that left spine in
+    // a loop, so it does not count (Excel accepts 4,096 operands, #916). Other nesting does.
     let mut pending = vec![(expr, 0usize)];
     while let Some((node, depth)) = pending.pop() {
         if depth > parser::MAX_DEPTH {
@@ -148,7 +155,7 @@ pub fn print_input(expr: &Expr, locale: FormulaLocale, known_name: impl Fn(&str)
         match node {
             Expr::Unary(_, child) | Expr::Paren(child) => pending.push((child, depth + 1)),
             Expr::Binary(_, left, right) => {
-                pending.push((left, depth + 1));
+                pending.push((left, depth));
                 pending.push((right, depth + 1));
             }
             Expr::Call(_, args) => pending.extend(args.iter().map(|e| (e, depth + 1))),
@@ -210,7 +217,7 @@ fn normalize(
     if depth > parser::MAX_DEPTH {
         return Err(ParseError { msg: "formula is nested too deeply".into(), pos: 0 });
     }
-    let bound = |name: &str, bindings: &[String]| bindings.iter().rev().any(|n| n.eq_ignore_ascii_case(name)) || known_name(name);
+    let bound = |name: &str, bindings: &[String]| bindings.iter().rev().any(|n| crate::same_name(n, name)) || known_name(name);
     match expr {
         Expr::Bool(value) if display => {
             let alias = match locale {
@@ -289,9 +296,15 @@ fn normalize(
             }
         }
         Expr::Unary(_, child) | Expr::Paren(child) => normalize(child, locale, known_name, bindings, depth + 1, display)?,
-        Expr::Binary(_, left, right) => {
-            normalize(left, locale, known_name, bindings, depth + 1, display)?;
-            normalize(right, locale, known_name, bindings, depth + 1, display)?;
+        Expr::Binary(..) => {
+            // Follow the left spine of a flat chain (A1+A2+...) in a loop: it is not nesting.
+            // Each call leaves indings as it found them, so the order does not matter.
+            let mut node = expr;
+            while let Expr::Binary(_, left, right) = node {
+                normalize(right, locale, known_name, bindings, depth + 1, display)?;
+                node = left;
+            }
+            normalize(node, locale, known_name, bindings, depth, display)?;
         }
         Expr::Array(rows) if display => {
             for row in rows {
