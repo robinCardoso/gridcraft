@@ -451,10 +451,48 @@ fn selection_move(s: &mut Session, p: &Json) -> Result<Json> {
     let Some(sheet) = d.wb.active() else { return Err(EngineError::NoDocument) };
     let sel = &mut d.selection;
     // Extension moves the far corner, not the active cell.
+    // When extending in one axis, check if the other axis has a span (e.g. range A1:F1 jumping down).
+    // In Excel, extending vertically from a multi-column row selection jumps to the data edge of the
+    // columns in the selection (stopping at the closest filled block or active cell's column), rather
+    // than jumping all the way to row 1,048,576 if an empty trailing header column is selected.
     let from = if extend { sel.moving_end() } else { sel.active };
     // Skip hidden rows/columns and step over merged areas.
     let mut to = if jmp {
-        jump(sheet, from, dr.signum(), dc.signum())
+        if extend && dr != 0 && dc == 0 {
+            let cur = sel.current();
+            let col_min = cur.start.col.min(cur.end.col);
+            let col_max = cur.start.col.max(cur.end.col);
+            if col_min < col_max {
+                let from_jump = jump(sheet, from, dr.signum(), 0);
+                let active_jump = jump(sheet, CellRef::new(from.row, sel.active.col), dr.signum(), 0);
+                let target_row = if dr > 0 {
+                    from_jump.row.min(active_jump.row)
+                } else {
+                    from_jump.row.max(active_jump.row)
+                };
+                CellRef::new(target_row, from.col)
+            } else {
+                jump(sheet, from, dr.signum(), dc.signum())
+            }
+        } else if extend && dc != 0 && dr == 0 {
+            let cur = sel.current();
+            let row_min = cur.start.row.min(cur.end.row);
+            let row_max = cur.start.row.max(cur.end.row);
+            if row_min < row_max {
+                let from_jump = jump(sheet, from, 0, dc.signum());
+                let active_jump = jump(sheet, CellRef::new(sel.active.row, from.col), 0, dc.signum());
+                let target_col = if dc > 0 {
+                    from_jump.col.min(active_jump.col)
+                } else {
+                    from_jump.col.max(active_jump.col)
+                };
+                CellRef::new(from.row, target_col)
+            } else {
+                jump(sheet, from, dr.signum(), dc.signum())
+            }
+        } else {
+            jump(sheet, from, dr.signum(), dc.signum())
+        }
     } else {
         let mut t = from.offset_clamped(dr, dc);
         let mut guard = 0;
@@ -1787,5 +1825,39 @@ mod tests {
     #[test]
     fn replace_case_insensitive() {
         assert_eq!(replace_ci("Apple apple APPLE", "apple", "pear"), "pear pear pear");
+    }
+
+    #[test]
+    fn extend_jump_down_respects_filled_columns_when_trailing_col_is_empty() {
+        let mut s = Session::new();
+        s.new_workbook();
+        // Row 1: A1..F1 filled
+        // Rows 2..5: A..D filled, E & F empty
+        s.execute(
+            "range.setValues",
+            json!({
+                "range": "A1",
+                "values": [
+                    ["Ref", "4%", "7%", "12%", "17%", "18%"],
+                    ["1100", 14.0, 13.0, 14.0, null, null],
+                    ["1101", 14.0, 13.0, 14.0, null, null],
+                    ["1102", 14.0, 13.0, 14.0, null, null],
+                    ["1103", 14.0, 13.0, 14.0, null, null]
+                ]
+            }),
+        )
+        .unwrap();
+
+        // Start at A1
+        s.execute("selection.set", json!({"range": "A1"})).unwrap();
+        // Ctrl+Shift+Right -> selects A1:F1
+        s.execute("selection.move", json!({"dr": 0, "dc": 1, "extend": true, "jump": true})).unwrap();
+        let sel = s.doc().unwrap().selection.a1();
+        assert_eq!(sel, "A1:F1");
+
+        // Ctrl+Shift+Down -> must stop at row 5 (A1:F5), not MAX_ROWS (row 1,048,576)
+        s.execute("selection.move", json!({"dr": 1, "dc": 0, "extend": true, "jump": true})).unwrap();
+        let sel2 = s.doc().unwrap().selection.a1();
+        assert_eq!(sel2, "A1:F5");
     }
 }
