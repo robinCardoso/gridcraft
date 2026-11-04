@@ -415,7 +415,7 @@ mod tests {
         set(&mut after, "A1", Cell::value(2.0.into()));
         after.sheet_mut(0).unwrap().comments.insert(
             CellRef::parse("A1").unwrap(),
-            Comment { author: "a".into(), text: "note".into(), replies: vec![], threaded: false, resolved: false, visible: true, dates: vec![] },
+            Comment { author: "a".into(), text: "note".into(), replies: vec![], threaded: false, resolved: false, visible: true, dates: vec![], note_box: None },
         );
         let (rev, _) = before.history_patches(&after).unwrap();
         assert_eq!(rev.cell_count(), 1);

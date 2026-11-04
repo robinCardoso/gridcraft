@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn content_diff_skips_formula_value_churn() {
         let mut s = CellStore::new();
-        s.set(c(0, 0), Cell { value: 1.0.into(), formula: Some(std::sync::Arc::new(crate::cell::Formula::new("=1+1"))), style: Default::default() });
+        s.set(c(0, 0), Cell { value: 1.0.into(), formula: Some(std::sync::Arc::new(crate::cell::Formula::new("=1+1"))), style: Default::default(), py: None });
         let snap = s.clone();
         s.get_mut(c(0, 0)).unwrap().value = 2.0.into();
         assert!(s.content_diff(&snap).is_empty());
