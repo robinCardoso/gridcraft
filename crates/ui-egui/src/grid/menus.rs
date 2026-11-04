@@ -133,6 +133,7 @@ pub(super) fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                 ("Cut", "edit.cut"),
                 ("Copy", "edit.copy"),
                 ("Paste", "edit.paste"),
+                ("Paste as Text", "edit.pasteAsText"),
                 ("Paste Special…", "ui:pasteSpecial"),
                 ("-", ""),
                 ("Insert…", "ui:insertCells"),
@@ -161,12 +162,15 @@ pub(super) fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                 items.insert(i + 2, ("Show Details", "pivot.showDetails"));
             }
             let lang = crate::i18n::current(ui.ctx());
+            let can_paste = app.can_paste_from_host();
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();
                     continue;
                 }
-                if ui.add(egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(190.0, 20.0))).clicked() {
+                let is_paste = matches!(id, "edit.paste" | "edit.pasteAsText" | "ui:pasteSpecial");
+                let enabled = !is_paste || can_paste;
+                if ui.add_enabled(enabled, egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(190.0, 20.0))).clicked() {
                     close = true;
                     match id {
                         "ui:pasteSpecial" => app.open_dialog("pasteSpecial", json!({})),
@@ -194,6 +198,7 @@ pub(super) fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                             app.copy_to_clipboard(ui.ctx(), id);
                         }
                         "edit.paste" => app.paste_from_clipboard(),
+                        "edit.pasteAsText" => app.paste_as_text(),
                         other => app.run_or_alert(other, json!({})),
                     }
                 }
@@ -468,6 +473,7 @@ pub(super) fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool)
                     ("Cut", "edit.cut"),
                     ("Copy", "edit.copy"),
                     ("Paste", "edit.paste"),
+                    ("Paste as Text", "edit.pasteAsText"),
                     ("-", ""),
                     ("Insert", "home.insertRows"),
                     ("Delete", "home.deleteRows"),
@@ -485,6 +491,7 @@ pub(super) fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool)
                     ("Cut", "edit.cut"),
                     ("Copy", "edit.copy"),
                     ("Paste", "edit.paste"),
+                    ("Paste as Text", "edit.pasteAsText"),
                     ("-", ""),
                     ("Insert", "home.insertColumns"),
                     ("Delete", "home.deleteColumns"),
@@ -500,15 +507,18 @@ pub(super) fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool)
                 ]
             };
             if let Some(item) = insert_copied {
-                items.insert(5, item);
+                items.insert(6, item);
             }
             let lang = crate::i18n::current(ui.ctx());
+            let can_paste = app.can_paste_from_host();
             for (label, id) in items {
                 if label == "-" {
                     ui.separator();
                     continue;
                 }
-                if ui.add(egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(180.0, 20.0))).clicked() {
+                let is_paste = matches!(id, "edit.paste" | "edit.pasteAsText" | "ui:pasteSpecial");
+                let enabled = !is_paste || can_paste;
+                if ui.add_enabled(enabled, egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(180.0, 20.0))).clicked() {
                     close = true;
                     match id {
                         "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),
@@ -519,6 +529,7 @@ pub(super) fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool)
                             app.copy_to_clipboard(ui.ctx(), id);
                         }
                         "edit.paste" => app.paste_from_clipboard(),
+                        "edit.pasteAsText" => app.paste_as_text(),
                         other => app.run_or_alert(other, json!({})),
                     }
                 }
@@ -529,6 +540,7 @@ pub(super) fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool)
         app.grid.header_menu = None;
     }
 }
+
 
 /// The context-menu entry for Insert Copied Cells / Insert Cut Cells, when the clipboard holds a
 /// copy or cut of this app: whole rows or columns insert at once, a block asks which way to shift

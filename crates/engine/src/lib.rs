@@ -648,7 +648,8 @@ impl Session {
         }))
     }
     /// Closes a workbook and its windows; the most recently active remaining window comes forward.
-    pub fn close_document(&mut self, i: usize) {
+    /// Returns the removed document so the desktop UI can free heavy books off-thread.
+    pub fn close_document(&mut self, i: usize) -> Option<DocState> {
         if i < self.docs.len() {
             let d = self.docs.remove(i);
             self.groups.retain(|g| g.doc != d.uid);
@@ -662,6 +663,9 @@ impl Session {
             } else if let Some(di) = self.active_window.and_then(|w| self.window(w)).and_then(|w| self.document_index(w.doc_uid)) {
                 self.active = di;
             }
+            Some(d)
+        } else {
+            None
         }
     }
     /// A new blank workbook titled `BookN`.

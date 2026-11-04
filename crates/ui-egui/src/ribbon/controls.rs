@@ -266,13 +266,16 @@ fn combo_popup(
 }
 
 pub(super) fn menu_items(app: &mut SheetApp, ui: &mut Ui, items: &[(&str, &str, serde_json::Value)]) {
+    let menu_id = ui.scope_id().with("menu_items");
+    let mut row_i = 0_i32;
     for (label, id, p) in items {
         if *label == "-" {
             ui.separator();
             continue;
         }
         let lang = app.ui.language;
-        let response = ui.add(egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(220.0, 22.0)));
+        let response = crate::widgets::menu_row(ui, menu_id, row_i, lang.tr(label), true, vec2(220.0, 22.0));
+        row_i += 1;
         if let Some(sequence) = keytip_table::item_letter(app.keytips.prefix().unwrap_or_default(), id) {
             keytip(app, ui, sequence, pos2(response.rect.right() - 10.0, response.rect.center().y));
         }
@@ -281,6 +284,8 @@ pub(super) fn menu_items(app: &mut SheetApp, ui: &mut Ui, items: &[(&str, &str, 
                 app.open_dialog(d, p.clone());
             } else if *id == "edit.paste" {
                 app.paste_from_clipboard();
+            } else if *id == "edit.pasteAsText" {
+                app.paste_as_text();
             } else {
                 act(app, id, p.clone());
             }

@@ -73,6 +73,14 @@ impl SheetApp {
             }
         }
         if id == "file.close" {
+            let force = params.get("force").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            if !force && !self.commit_edit(0, 0, false, false) {
+                return Ok(json!({"closed": false}));
+            }
+            if force {
+                let discard = params.get("discard").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                return self.force_close_active_document(discard);
+            }
             if let Some(res) = self.close_job_deferral() {
                 return res;
             }

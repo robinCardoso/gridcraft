@@ -715,3 +715,16 @@ fn control_requests_route_to_a_window_and_list_windows() {
     let r = call(&mut h, "engine.execute", serde_json::json!({"command": "cell.get", "params": {"cell": "A1"}, "window": 999}));
     assert_eq!(r["ok"], false, "{r}");
 }
+
+#[test]
+fn dont_save_discard_closes_immediately_even_if_idle() {
+    let mut h = harness(Services::default());
+    h.input_mut().events.push(egui::Event::Text("9".into()));
+    h.run_steps(2);
+    let closed = h
+        .state_mut()
+        .run("file.close", serde_json::json!({"force": true, "discard": true}))
+        .expect("discard close");
+    assert_eq!(closed["closed"], serde_json::json!(true));
+    assert!(h.state().session.active().is_none());
+}

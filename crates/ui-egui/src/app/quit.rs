@@ -112,4 +112,57 @@ impl SheetApp {
         }
         self.continue_quit(ctx);
     }
+    /// Forced close after Save, or Don't Save (`discard`). Drops a heavy `DocState` off the UI
+    /// thread when it would hitch the frame (Windows "Not responding" on LISTA-scale books).
+    pub(super) fn force_close_active_document(&mut self, discard: bool) -> Result<serde_json::Value, String> {
+        let Some(d) = self.session.active() else {
+            return Err("no workbook open".into());
+        };
+        let uid = d.uid;
+        // Save then Close: wait for the in-flight save (Fase 2). Don't Save cancels it instead.
+        if !discard && (self.jobs.is_saving(uid) || self.pending_save_uid == Some(uid)) {
+            self.pending_close_uid = Some(uid);
+            return Ok(json!({"closed": false, "pending": true}));
+        }
+        self.jobs.cancel_calculating(uid);
+        self.jobs.cancel_analysis(uid);
+        if discard {
+            self.jobs.cancel_saving(uid);
+            if self.pending_save_uid == Some(uid) {
+                self.pending_save_uid = None;
+            }
+        }
+        if self.pending_close_uid == Some(uid) {
+            self.pending_close_uid = None;
+        }
+        self.calc_status = None;
+        self.selected_object = None;
+        let i = self.session.active_index();
+        let removed = self.session.close_document(i);
+        Self::discard_document_off_ui_thread(removed);
+        self.after_engine();
+        Ok(json!({"closed": true}))
+    }
+
+    /// Frees a closed document. Small books drop inline; large ones (LISTA-scale) hitch Windows
+    /// "Not responding" if `Drop` runs on the interface thread, so native builds hand them to a
+    /// short-lived worker. Wasm has no threads — drop stays synchronous.
+    pub(crate) fn discard_document_off_ui_thread(doc: Option<gridcraft_engine::DocState>) {
+        let Some(doc) = doc else {
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cells: usize = doc.wb.sheets.iter().map(|sh| sh.cells.len()).sum();
+            let heavy = doc.calc.graph.len() >= 50_000 || cells >= 50_000;
+            if heavy {
+                #[allow(clippy::disallowed_methods)]
+                let _ = std::thread::Builder::new().name("gridcraft-doc-drop".into()).spawn(move || {
+                    drop(doc);
+                });
+                return;
+            }
+        }
+        drop(doc);
+    }
 }

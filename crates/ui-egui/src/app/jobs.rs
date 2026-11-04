@@ -55,7 +55,7 @@ impl SheetApp {
         if d.uid != uid || d.is_dirty() {
             return;
         }
-        let _ = self.session.run("file.close", json!({"force": true}));
+        let _ = self.force_close_active_document(false);
         self.after_engine();
     }
 

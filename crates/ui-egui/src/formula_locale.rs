@@ -81,8 +81,75 @@ fn hide_udf_prefix(text: &str, locale: FormulaLocale) -> String {
 
 /// A function's argument hint. The name and separators follow the formula syntax; the argument
 /// names follow the interface language, all of them or none, so a hint never mixes two languages.
+const PORTUGUESE_HELP: &[(&str, &str, &str)] = &[
+    ("SUM", "SOMA(número1; [número2]; ...)", "Soma todos os números em um intervalo de células."),
+    ("AVERAGE", "MÉDIA(número1; [número2]; ...)", "Retorna a média aritmética dos argumentos."),
+    (
+        "IF",
+        "SE(teste_lógico; valor_se_verdadeiro; [valor_se_falso])",
+        "Verifica se uma condição foi satisfeita e retorna um valor se for VERDADEIRO e outro se for FALSO.",
+    ),
+    (
+        "IFS",
+        "SES(teste_lógico1; valor_se_verdadeiro1; ...)",
+        "Verifica se uma ou mais condições foram satisfeitas e retorna o valor correspondente à primeira condição VERDADEIRA.",
+    ),
+    (
+        "IFERROR",
+        "SEERRO(valor; valor_se_erro)",
+        "Retorna um valor especificado se a fórmula resultar em erro; caso contrário, retorna o resultado da fórmula.",
+    ),
+    ("COUNT", "CONT.NÚM(valor1; [valor2]; ...)", "Calcula o número de células em um intervalo que contêm números."),
+    ("COUNTA", "CONT.VALORES(valor1; [valor2]; ...)", "Calcula o número de células não vazias em um intervalo."),
+    ("COUNTIF", "CONT.SE(intervalo; critérios)", "Calcula o número de células que atendem aos critérios determinados."),
+    ("COUNTIFS", "CONT.SES(intervalo_critérios1; critérios1; ...)", "Conta o número de vezes que várias condições são atendidas."),
+    ("SUMIF", "SOMASE(intervalo; critérios; [intervalo_soma])", "Adiciona as células especificadas por um determinado critério ou condição."),
+    (
+        "SUMIFS",
+        "SOMASES(intervalo_soma; intervalo_critérios1; critérios1; ...)",
+        "Soma as células em um intervalo que atendem a múltiplos critérios.",
+    ),
+    (
+        "VLOOKUP",
+        "PROCV(valor_procurado; matriz_tabela; núm_índice_coluna; [procurar_intervalo])",
+        "Procura um valor na primeira coluna à esquerda de uma tabela e retorna um valor na mesma linha de outra coluna especificada.",
+    ),
+    (
+        "XLOOKUP",
+        "PROCX(pesquisa_valor; matriz_pesquisa; matriz_retorno; [se_não_encontrada]; [modo_correspondência]; [modo_pesquisa])",
+        "Pesquisa um intervalo ou matriz e retorna o item correspondente da matriz de retorno.",
+    ),
+    ("MATCH", "CORRESP(valor_procurado; matriz_procurada; [tipo_correspondência])", "Retorna a posição relativa de um item em uma matriz correspondente a um valor especificado."),
+    ("XMATCH", "CORRESPX(pesquisa_valor; matriz_pesquisa; [modo_correspondência]; [modo_pesquisa])", "Retorna a posição relativa de um item em uma matriz ou intervalo de células."),
+    ("INDEX", "ÍNDICE(matriz; núm_linha; [núm_coluna])", "Retorna o valor de um elemento em uma tabela ou matriz, selecionado pelos índices de linha e coluna."),
+    ("CHOOSE", "ESCOLHER(núm_índice; valor1; [valor2]; ...)", "Escolhe um valor ou uma ação a ser executada a partir de uma lista de valores com base em um número de índice."),
+    ("OFFSET", "DESLOC(ref; linhas; cols; [altura]; [largura])", "Retorna uma referência a um intervalo que é um número especificado de linhas e colunas de uma célula ou intervalo."),
+    ("AND", "E(lógico1; [lógico2]; ...)", "Verifica se todos os argumentos são VERDADEIRO e retorna VERDADEIRO se todos forem verdadeiros."),
+    ("OR", "OU(lógico1; [lógico2]; ...)", "Verifica se qualquer um dos argumentos é VERDADEIRO e retorna VERDADEIRO ou FALSO."),
+    ("NOT", "NÃO(lógico)", "Inverte o valor lógico do argumento."),
+    ("TODAY", "HOJE()", "Retorna a data atual formatada como data."),
+    ("NOW", "AGORA()", "Retorna a data e hora atuais formatadas como data e hora."),
+    ("ROUND", "ARRED(número; núm_dígitos)", "Arredonda um número até uma quantidade especificada de dígitos."),
+    ("CONCATENATE", "CONCATENAR(texto1; [texto2]; ...)", "Agrupa várias sequências de caracteres de texto em uma única sequência."),
+    ("LEFT", "ESQUERDA(texto; [núm_caract])", "Retorna os primeiros caracteres à esquerda de uma sequência de texto."),
+    ("RIGHT", "DIREITA(texto; [núm_caract])", "Retorna os últimos caracteres à direita de uma sequência de texto."),
+    ("MID", "EXT.TEXTO(texto; núm_inicial; núm_caract)", "Retorna um número específico de caracteres de uma sequência de texto, a partir da posição especificada."),
+    ("LEN", "NÚM.CARACT(texto)", "Retorna o número de caracteres em uma sequência de texto."),
+    ("UNIQUE", "ÚNICO(matriz; [por_coluna]; [exatamente_uma_vez])", "Retorna uma lista de valores exclusivos em uma lista ou intervalo."),
+    ("FILTER", "FILTRO(matriz; incluir; [se_vazia])", "Filtra um intervalo de dados com base nos critérios definidos."),
+    ("SORT", "CLASSIFICAR(matriz; [índice_ordenação]; [ordem_classificação]; [por_coluna])", "Classifica o conteúdo de um intervalo ou matriz."),
+    ("TRUE", "VERDADEIRO()", "Retorna o valor lógico VERDADEIRO."),
+    ("FALSE", "FALSO()", "Retorna o valor lógico FALSO."),
+];
+
 pub(crate) fn signature(name: &str, locale: FormulaLocale, language: Language) -> Option<String> {
-    let english = crate::formula_bar::function_signature(locale.canonical_name(name))?;
+    let canonical = locale.canonical_name(name);
+    if (locale == FormulaLocale::Pt || language == Language::PtBr)
+        && let Some((_, signature, _)) = PORTUGUESE_HELP.iter().find(|(name, ..)| *name == canonical)
+    {
+        return Some((*signature).into());
+    }
+    let english = crate::formula_bar::function_signature(canonical)?;
     let Some((head, args)) = split_signature(&english) else { return Some(english) };
     let separator = format!("{} ", locale.list_separator());
     let args = match args.iter().map(|arg| translate_argument(arg, language)).collect::<Option<Vec<_>>>() {
@@ -94,7 +161,13 @@ pub(crate) fn signature(name: &str, locale: FormulaLocale, language: Language) -
 
 /// A function's description in the interface language (English while untranslated).
 pub(crate) fn description(name: &str, locale: FormulaLocale, language: Language) -> Option<String> {
-    let english = crate::formula_bar::function_description(locale.canonical_name(name))?;
+    let canonical = locale.canonical_name(name);
+    if (locale == FormulaLocale::Pt || language == Language::PtBr)
+        && let Some((_, _, description)) = PORTUGUESE_HELP.iter().find(|(name, ..)| *name == canonical)
+    {
+        return Some((*description).into());
+    }
+    let english = crate::formula_bar::function_description(canonical)?;
     Some(language.function_description(&english).map_or(english, str::to_string))
 }
 
