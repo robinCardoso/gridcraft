@@ -203,6 +203,20 @@ pub struct Perf {
     last: f64,
 }
 
+pub struct LoadingTask {
+    pub title: String,
+    pub path: String,
+    pub status: String,
+    pub open_params: Option<Json>,
+    pub retry: bool,
+    pub rx: std::sync::mpsc::Receiver<LoadTaskMessage>,
+}
+
+pub enum LoadTaskMessage {
+    Status(String),
+    Done(Box<Result<(gridcraft_engine::DocState, Vec<String>), String>>),
+}
+
 pub struct SheetApp {
     pub session: Session,
     pub ui: UiState,
@@ -215,6 +229,8 @@ pub struct SheetApp {
     pub dialog: Option<dialogs::Dialog>,
     /// The File tab's Backstage view, when open (UI-only; replaces the ribbon, grid and tabs).
     pub backstage: Option<backstage::Backstage>,
+    /// Background task loading a workbook with real-time feedback.
+    pub loading: Option<LoadingTask>,
     pub message: Option<(String, String)>,
     pub toast: Option<(String, f64)>,
     /// Dismissible info bar under the ribbon (open-time notices).

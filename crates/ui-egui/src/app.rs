@@ -38,6 +38,7 @@ impl SheetApp {
             text_box_editor: None,
             dialog: None,
             backstage: None,
+            loading: None,
             message: None,
             toast: None,
             notice: None,
@@ -151,6 +152,7 @@ impl SheetApp {
         updates_ui::tick(self, ctx);
         // Files read asynchronously (web file picker, dropped files).
         self.poll_async_opens();
+        self.poll_loading(ctx);
         self.autosave(ctx);
         self.update_title(ctx);
         self.request_hidden_paint(ctx);
@@ -258,6 +260,7 @@ impl SheetApp {
         macro_ui::question_box(self, &ctx);
         widgets::message_box(self, &ctx);
         widgets::toast(self, &ctx);
+        widgets::loading_modal(self, &ctx);
         // Requests are admitted in `logic`, for the root viewport, so only its pass issues them.
         if ctx.viewport_id() == egui::ViewportId::ROOT {
             control::issue_screenshots(self, &ctx);
