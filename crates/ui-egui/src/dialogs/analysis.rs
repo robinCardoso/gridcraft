@@ -662,16 +662,17 @@ pub(super) fn solver(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, conf
 
 /// Solver Results: the outcome, and keeping or restoring the variable cells.
 pub(super) fn solver_results(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, open: &mut bool) {
+    let lang = app.ui.language;
     let message = d.values.get("message").and_then(Json::as_str).unwrap_or("").to_string();
-    ui.label(message);
+    ui.label(lang.tr(&message));
     let changed = d.values.get("changed").and_then(Json::as_bool).unwrap_or(false);
     let restore = d.values.get("restore").and_then(Json::as_bool).unwrap_or(false);
     if changed {
         ui.add_space(4.0);
-        if ui.radio(!restore, "Keep Solver Solution").clicked() {
+        if ui.radio(!restore, lang.tr("Keep Solver Solution")).clicked() {
             d.values.insert("restore".into(), json!(false));
         }
-        if ui.radio(restore, "Restore Original Values").clicked() {
+        if ui.radio(restore, lang.tr("Restore Original Values")).clicked() {
             d.values.insert("restore".into(), json!(true));
         }
     }
@@ -691,10 +692,10 @@ pub(super) fn solver_results(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dial
     let offered = |key: &str| key != "sensitivityReport" || sensitivity;
     if solved {
         ui.add_space(4.0);
-        ui.label("Reports:");
+        ui.label(lang.tr("Reports:"));
         for (key, label) in [("answerReport", "Answer"), ("sensitivityReport", "Sensitivity"), ("limitsReport", "Limits")] {
             let mut on = offered(key) && d.values.get(key).and_then(Json::as_bool).unwrap_or(false);
-            let check = ui.add_enabled(offered(key), egui::Checkbox::new(&mut on, label)).on_disabled_hover_text(why_not);
+            let check = ui.add_enabled(offered(key), egui::Checkbox::new(&mut on, lang.tr(label))).on_disabled_hover_text(why_not);
             if check.changed() {
                 d.values.insert(key.into(), json!(on));
             }

@@ -149,7 +149,8 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
     let width = match d.name.as_str() {
         "formatCells" => 560.0,
         "about" => 660.0,
-        "insertFunction" | "commandSearch" | "nameManager" | "manageRules" | "journal" | "agents" | "equation" => 520.0,
+        "nameManager" => 640.0,
+        "insertFunction" | "commandSearch" | "manageRules" | "journal" | "agents" | "equation" => 520.0,
         "macros" => 480.0,
         "recommendedCharts" => 600.0,
         "analysisToolPak" => 420.0,
@@ -171,6 +172,7 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
     let window = match d.name.as_str() {
         "insertPicture" => window.default_height(240.0),
         "advancedFilter" => window.default_height(0.0),
+        "nameManager" => window.default_height(420.0).min_height(360.0),
         _ => window,
     };
     let (window, collapsed) = place_window(app, ctx, &mut d, window, window_id);
@@ -334,27 +336,30 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                     }
                 }
                 "saveChanges" => {
-                    ui.label(format!("Do you want to save the changes you made to {}?", d.values.get("title").and_then(Json::as_str).unwrap_or("this workbook")));
+                    let lang = app.ui.language;
+                    let title = d.values.get("title").and_then(Json::as_str).unwrap_or_else(|| lang.tr("this workbook"));
+                    ui.label(lang.tr("Do you want to save the changes you made to {title}?").replace("{title}", title));
                     let quitting = d.values.get("quit").and_then(Json::as_bool) == Some(true);
                     ui.horizontal(|ui| {
                         for (label, answer) in
                             [("Don't Save", crate::SaveAnswer::DontSave), ("Cancel", crate::SaveAnswer::Cancel), ("Save", crate::SaveAnswer::Save)]
                         {
-                            if ui.button(label).clicked() && app.answer_save_changes(answer, quitting, ui.ctx()) {
+                            if ui.button(lang.tr(label)).clicked() && app.answer_save_changes(answer, quitting, ui.ctx()) {
                                 open = false;
                             }
                         }
                     });
                 }
                 "start" => {
-                    ui.heading("Start a new workbook");
+                    let lang = app.ui.language;
+                    ui.heading(lang.tr("Start a new workbook"));
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Blank workbook").clicked() {
+                        if ui.button(lang.tr("Blank workbook")).clicked() {
                             app.run_or_alert("file.new", json!({}));
                             open = false;
                         }
                         for (n, t) in gridcraft_engine::sample::SAMPLES {
-                            if ui.button(*t).clicked() {
+                            if ui.button(lang.tr(t)).clicked() {
                                 app.run_or_alert("file.new", json!({"sample": n}));
                                 open = false;
                             }
