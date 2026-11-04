@@ -302,6 +302,7 @@ pub fn set_current(ctx: &egui::Context, language: Language) {
 
 /// English label → Japanese. Keys are the exact interface strings (command ids, file names and
 /// document text are never translated); anything absent falls back to English.
+#[allow(dead_code)]
 const JAPANESE: &[(&str, &str)] = &[
     ("Paste", "貼り付け"),
     ("Paste Values", "値の貼り付け"),

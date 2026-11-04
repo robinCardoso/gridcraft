@@ -195,6 +195,7 @@ pub struct ZipOut {
 }
 
 impl ZipOut {
+    #[allow(dead_code)]
     pub fn new() -> ZipOut {
         ZipOut::with_level(6)
     }
