@@ -2210,6 +2210,13 @@ impl Calc {
         let dirty = self.dirty_closure(wb, &seeds);
         let t1 = prof_now();
         let n = dirty.len();
+        // Nudge the bar off "0 / …" as soon as the dirty set is known (closure can be huge).
+        if let Some(hooks) = self.hooks.as_ref() {
+            if hooks.cancelled() {
+                return false;
+            }
+            hooks.report(0, n.max(1));
+        }
         // Automatic must cascade the full dirty set — including other sheets. Truncating to the
         // active sheet when n > 1_000 left cross-sheet dependents stale and made formulas on the
         // active sheet that read those sheets look "static" until a tab switch's scoped refill.
@@ -2258,7 +2265,21 @@ impl Calc {
         count > limit
     }
 
+    /// Past this many dirty formulas, finishing the exact BFS can take minutes on dense books
+    /// (e.g. COTACAO!B1/B2 → ~700k dependents): prefer every graph node and start evaluating.
+    const DIRTY_CLOSURE_SHORT_CIRCUIT: usize = 100_000;
+
     fn dirty_closure(&self, _wb: &Workbook, seeds: &[Key]) -> Vec<Key> {
+        // Global scalar edits (filial/UF) fan out to most of the workbook. The exact transitive
+        // walk then spends ~minutes with no progress reports before the first formula runs —
+        // the status bar stays on "Calculando… 1% - 0 / …". Short-circuit to all nodes: a bit
+        // more eval work, but the job starts reporting within milliseconds.
+        if self.graph.len() > Self::DIRTY_CLOSURE_SHORT_CIRCUIT
+            && self.cascade_exceeds(seeds, Self::DIRTY_CLOSURE_SHORT_CIRCUIT)
+        {
+            return self.graph.nodes.keys().copied().collect();
+        }
+
         let mut seen: HashSet<Key> = HashSet::default();
         let mut queue: VecDeque<Key> = VecDeque::new();
         let mut whole_cols_seen: HashSet<(usize, u32)> = HashSet::default();
@@ -2286,6 +2307,43 @@ impl Calc {
             });
         }
         seen.into_iter().collect()
+    }
+
+    /// Direct same-sheet dependents of `seeds` (one hop, capped). Used to refresh the active
+    /// sheet immediately when a huge cascade is deferred to a background job — enough for
+    /// header/L1/first body rows without walking tens of thousands of formulas on the UI thread.
+    pub fn recalc_active_sheet_cascade(&mut self, wb: &mut Workbook, seeds: &[Key], cap: usize) -> bool {
+        if seeds.is_empty() || cap == 0 {
+            return true;
+        }
+        if !self.graph_valid {
+            return self.recalc_keys(wb, seeds);
+        }
+        let sheet = wb.active_sheet;
+        let mut seen: HashSet<Key> = HashSet::default();
+        let mut whole_cols_seen: HashSet<(usize, u32)> = HashSet::default();
+        for &k in seeds {
+            if k.0 == sheet && self.graph.nodes.contains_key(&k) {
+                seen.insert(k);
+            }
+            if k.0 != sheet {
+                continue;
+            }
+            self.graph.dependents_closure(k.0, k.1, &mut whole_cols_seen, |d| {
+                if d.0 == sheet {
+                    seen.insert(d);
+                }
+            });
+        }
+        if seen.is_empty() {
+            return true;
+        }
+        let mut dirty: Vec<Key> = seen.into_iter().collect();
+        dirty.sort_by_key(|(_, c)| (c.row, c.col));
+        if dirty.len() > cap {
+            dirty.truncate(cap);
+        }
+        self.run(wb, dirty, false)
     }
 
     /// Evaluates the dirty set and writes results (and spills) back.

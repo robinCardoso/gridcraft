@@ -382,11 +382,10 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
                     None => d.recalc_cascade = Some(changed.clone()),
                 }
             }
-            // Same-row calculated columns (table touch seeds) must not stay stale while the
-            // workbook-wide job waits — set, clear, delete, or paste-empty of Referencia must
-            // refresh Descricao/Linha immediately (MB006 + Caterpillar / clear leaving INDEX).
-            // `recalc_keys` works with an invalidated graph (no full rebuild on the UI thread).
-            let _ = d.calc.recalc_keys(&mut wb, &changed);
+            // Same-row calculated columns (table touch seeds) and Filial/UF readers on the
+            // active sheet must not stay stale while the workbook-wide job waits.
+            // `recalc_active_sheet_cascade` falls back to `recalc_keys` if the graph is invalid.
+            let _ = d.calc.recalc_active_sheet_cascade(&mut wb, &changed, crate::CASCADE_JOB_CELLS);
         } else if d.defer_structural && (changed.len() > crate::CASCADE_JOB_CELLS || d.calc.cascade_exceeds(&changed, crate::CASCADE_JOB_CELLS)) {
             // A huge cascade (an input cell feeding a big dependency graph) or a huge edit itself
             // (a wide paste: brand-new formulas aren't in the graph yet, so their count is the
@@ -396,7 +395,9 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
             d.recalc_pending = true;
             d.recalc_cascade = Some(changed.clone());
             d.calc.update_nodes(&mut wb, &changed);
-            let _ = d.calc.recalc_keys(&mut wb, &changed);
+            // Pay a capped slice of the active sheet now (Filial/UF → COTACAO header/L1/first
+            // rows) so the edit is visible before the background job starts the rest.
+            let _ = d.calc.recalc_active_sheet_cascade(&mut wb, &changed, crate::CASCADE_JOB_CELLS);
         } else {
             let _ = d.calc.cells_changed(&mut wb, &changed);
         }
